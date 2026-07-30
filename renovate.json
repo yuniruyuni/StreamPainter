@@ -1,0 +1,28 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "dependencyDashboard": false,
+  "dependencyDashboardApproval": false,
+  "prCreation": "immediate",
+  "timezone": "Asia/Tokyo",
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Group minor and patch updates",
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "minor-patch updates"
+    },
+    {
+      "description": "React",
+      "matchPackageNames": ["react", "react-dom", "@types/react", "@types/react-dom"],
+      "groupName": "react"
+    },
+    {
+      "description": "GitHub Actions",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "commitMessagePrefix": "ci(deps):",
+      "addLabels": ["github-actions"]
+    }
+  ]
+}

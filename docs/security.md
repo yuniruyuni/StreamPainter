@@ -1,0 +1,35 @@
+# Security
+
+## Threat model
+
+ローカルWebサービスで主に考慮する対象は次の2つです。
+
+1. LAN上の別端末が描画状態やWebSocketへアクセスすること
+2. ブラウザで開いた悪意あるページがlocalhost WebSocketへ接続すること
+
+同一Windowsユーザー権限で動くネイティブマルウェアからの防御は対象外です。
+
+## Controls
+
+- listenerはIPv4 loopbackの `127.0.0.1` のみにbindする
+- `0.0.0.0` やLANアドレスへ変更する設定を提供しない
+- HTTP `Host` は `127.0.0.1:<port>` または `localhost:<port>` のみ許可する
+- WebSocket `Origin` は同じHTTP originのみ許可する
+- Originが無いWebSocket upgradeも拒否する
+- HTMLに厳格なContent Security Policyを付ける
+- 第三者ライセンスページはscriptを持たず、外部resourceを読み込まない
+- assetsはexe内に埋め込み、外部script・style・imageへ接続しない
+- Browser Sourceから受け付けるアプリメッセージは`ping`だけ
+- 受信WebSocket frameは4 KiBに制限する
+- 遅い接続の送信queueを制限し、UIスレッドへのbackpressureを防ぐ
+
+loopback構成ではBearer tokenは秘密になりにくく、配布・更新も複雑にするため採用しません。
+ブラウザ経由の攻撃はOrigin検証、LAN経由の攻撃はbind先とHost検証で遮断します。
+
+## Operational notes
+
+Windows Firewallで外部受信規則を作る必要はありません。もし実行時に公開ネットワーク向けの
+Firewall許可を求められた場合は拒否して構いません。
+
+他端末からoverlayを見る用途が必要になった場合、listenerを公開するのではなく、認証・TLS・
+rate limitを備えた別製品のrelayとして設計してください。
