@@ -26,10 +26,8 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
-      - name: Check and build embedded overlay
-        run: |
-          bun run check
-          bun run build
+      - name: Check frontend
+        run: bun run check
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -44,8 +42,8 @@ jobs:
       - name: Install cargo-about
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
 
-      - name: Check generated third-party notices
-        run: bun run check:licenses
+      - name: Generate embedded application assets
+        run: bun run prepare:painter
 
       - name: Check Rust formatting
         working-directory: painter

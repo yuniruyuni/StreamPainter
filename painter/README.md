@@ -5,17 +5,19 @@ OBSプロジェクター連携、OBS Browser Source向けローカルWebサー�
 
 ## ビルド
 
-リポジトリ直下でOBS用ページを先に生成します。
+リポジトリ直下でOBS用ページと第三者ライセンスページを先に生成します。
 
 ```powershell
 bun install --frozen-lockfile
-bun run build
+cargo install cargo-about --version 0.9.1 --locked --features cli
+bun run prepare:painter
 cd painter
-cargo build --release
+cargo build --release --locked
 ```
 
-release buildには `client/static/` のHTML/CSS/JavaScriptが埋め込まれるため、配布物は
-`target/release/stream-painter.exe` だけです。
+release buildには `client/static/` のHTML/CSS/JavaScriptと、lockfileから生成したライセンス
+ページが埋め込まれるため、配布物は `target/release/stream-painter.exe` だけです。これらの
+生成物はGit管理しません。
 
 ## 設定
 
@@ -35,6 +37,6 @@ http://127.0.0.1:16873/overlay
 
 ```powershell
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 ```

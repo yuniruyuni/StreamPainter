@@ -28,19 +28,17 @@ Run from the repository root unless noted:
 ```bash
 bun install --frozen-lockfile
 bun run check
-bun run build
-bun run check:licenses
+bun run prepare:painter
 
 cd painter
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings  # run on Windows
-cargo build --release
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings  # run on Windows
+cargo build --release --locked
 ```
 
-Always run the client build before a release Rust build. `client/static/` is generated and embedded
-into the executable by `rust-embed`. When dependency lockfiles change, run
-`bun run generate:licenses`; the generated notice and HTML page are committed and embedded.
+Always run `bun run prepare:painter` before Rust checks or builds. It generates the ignored OBS
+overlay assets and third-party license page; both are embedded into the executable at compile time.
 
 ## Tests
 

@@ -43,6 +43,10 @@ typings/
 /client/static/*
 !/client/static/.gitkeep
 
+# Generated license inventory embedded in the Windows executable
+/THIRD_PARTY_NOTICES.md
+/painter/assets/third-party-licenses.html
+
 # Test coverage
 /coverage/
 

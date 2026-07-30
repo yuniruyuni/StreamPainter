@@ -29,20 +29,22 @@ Cloud Run、外部DB、Twitchログイン、公開Webアプリは使いません
 
 ## ソースからビルド
 
-必要なものは Bun、Rust stable、Visual Studio Build Tools
+必要なものは Bun、Rust stable、`cargo-about 0.9.1`、Visual Studio Build Tools
 （Desktop development with C++）です。
 
 ```powershell
 bun install --frozen-lockfile
 bun run check
-bun run build
+cargo install cargo-about --version 0.9.1 --locked --features cli
+bun run prepare:painter
 cd painter
-cargo test
-cargo build --release
+cargo test --locked
+cargo build --release --locked
 ```
 
-`bun run build` がOBS用ページを生成し、続くrelease buildがその成果物をexeへ埋め込みます。
-配布物は `painter/target/release/stream-painter.exe` です。
+`bun run prepare:painter` がOBS用ページと依存関係のライセンスページを生成します。生成物は
+Git管理せず、続くrelease buildが両方をexeへ埋め込みます。配布物は
+`painter/target/release/stream-painter.exe` です。
 
 詳しい設計と設定は [docs/README.md](docs/README.md) を参照してください。
 開発への参加方法は [CONTRIBUTING.md](CONTRIBUTING.md) にまとめています。
@@ -50,5 +52,5 @@ cargo build --release
 ## ライセンス
 
 StreamPainterは [MIT License](LICENSE) で提供されます。配布バイナリに含まれる依存関係の
-ライセンスは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にまとめ、実行中は
-タスクトレイの「第三者ライセンス...」からも確認できます。
+ライセンスはlockfileからビルド時に生成してexeへ埋め込み、実行中はタスクトレイの
+「第三者ライセンス...」から確認できます。

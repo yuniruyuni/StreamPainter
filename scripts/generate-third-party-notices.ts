@@ -66,12 +66,10 @@ interface IndexedDocument {
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(scriptDir, "..");
 const cargoAboutVersion = "0.9.1";
-const checkOnly = process.argv.includes("--check");
 const htmlOutput = join(
   projectRoot,
   "painter/assets/third-party-licenses.html",
 );
-const markdownOutput = join(projectRoot, "THIRD_PARTY_NOTICES.md");
 
 const allowedNpmLicenseIdentifiers = new Set([
   "0BSD",
@@ -517,79 +515,7 @@ ${authors}    <p><strong>License documents:</strong> ${documentLinks}</p>
 `;
 }
 
-function indentMarkdown(value: string): string {
-  return value
-    .trimEnd()
-    .split("\n")
-    .map((line) => (line.length > 0 ? `    ${line}` : ""))
-    .join("\n");
-}
-
-function renderMarkdown(
-  components: readonly Component[],
-  documents: readonly IndexedDocument[],
-  lockHashes: { bun: string; cargo: string },
-): string {
-  const componentSections = components
-    .map((component) => {
-      const documentLinks = component.documents
-        .map((document) => `[${document.name}](#license-text-${document.hash})`)
-        .join(" / ");
-      const authors =
-        component.authors.length > 0
-          ? `\n- Authors: ${component.authors.join(", ")}`
-          : "";
-      return `### ${component.name} ${component.version}
-
-- Ecosystem: ${component.ecosystem}
-- Declared license: ${component.license}
-- Source: ${component.source}${authors}
-- License documents: ${documentLinks}`;
-    })
-    .join("\n\n");
-
-  const documentSections = documents
-    .map(
-      (document) => `<a id="license-text-${document.hash}"></a>
-## ${[...document.names].sort(compareText).join(" / ")}
-
-Used by: ${[...document.componentNames].sort(compareText).join(", ")}
-
-${indentMarkdown(document.text)}`,
-    )
-    .join("\n\n");
-
-  return `# Third-Party Notices
-
-This file is generated. Do not edit it by hand.
-
-It covers production npm dependencies bundled into the OBS Browser Source and
-Cargo dependencies included in the Windows x86-64 MSVC application. Build,
-development, test, compiler, operating-system, OBS Studio, and Bun toolchain
-components are not distributed in the StreamPainter binary and are outside
-this inventory.
-
-- Bun lock SHA-256: \`${lockHashes.bun}\`
-- Cargo.lock SHA-256: \`${lockHashes.cargo}\`
-- Cargo scanner: \`cargo-about ${cargoAboutVersion}\`
-
-## Component index
-
-${componentSections}
-
-# License texts
-
-${documentSections}
-`;
-}
-
-function verifyOrWrite(path: string, content: string): void {
-  if (checkOnly) {
-    if (!existsSync(path) || readFileSync(path, "utf8") !== content) {
-      throw new Error(`${path} is stale. Run: bun run generate:licenses`);
-    }
-    return;
-  }
+function writeOutput(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, content);
 }
@@ -607,11 +533,7 @@ const projectLicense = normalizeText(
   readFileSync(join(projectRoot, "LICENSE"), "utf8"),
 );
 
-verifyOrWrite(
-  markdownOutput,
-  renderMarkdown(components, documents, lockHashes),
-);
-verifyOrWrite(
+writeOutput(
   htmlOutput,
   renderHtml(components, documents, lockHashes, projectLicense),
 );

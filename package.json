@@ -8,12 +8,12 @@
   "scripts": {
     "build": "bun run --cwd client build",
     "check": "bun run check:type && bun run check:lint && bun run check:test",
-    "check:licenses": "bun scripts/generate-third-party-notices.ts --check",
     "check:lint": "biome check client scripts",
     "check:test": "bun run --cwd client check:test",
     "check:type": "bun run --cwd client check:type",
     "fix:lint": "biome check --write client scripts",
-    "generate:licenses": "bun scripts/generate-third-party-notices.ts"
+    "generate:licenses": "bun scripts/generate-third-party-notices.ts",
+    "prepare:painter": "bun run build && bun run generate:licenses"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16"

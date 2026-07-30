@@ -16,30 +16,26 @@ StreamPainterは、Windows上で動作するローカル完結型アプリケー
 ```bash
 bun install --frozen-lockfile
 bun run check
-bun run build
+cargo install cargo-about --version 0.9.1 --locked --features cli
+bun run prepare:painter
 
 cd painter
 cargo fmt --check
-cargo test
+cargo test --locked
 ```
 
 Windows固有コードは、Windows上で次も実行してください。
 
 ```powershell
 cd painter
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
 
-依存関係またはlockfileを変更した場合は、`cargo-about 0.9.1` を用意して通知ファイルを更新します。
-
-```bash
-bun run generate:licenses
-bun run check:licenses
-```
-
-生成された `THIRD_PARTY_NOTICES.md` と
-`painter/assets/third-party-licenses.html` も変更に含めてください。
+`bun run prepare:painter` はOBS用ページを生成するとともに、現在のlockfileとインストール済み
+依存関係を検査してexeへ埋め込むライセンスページを生成します。これらの生成物はGit管理しない
+ため、変更へ含めないでください。CIもクリーンなcheckoutから同じ生成を行ってからRustを検証・
+ビルドします。
 
 ## ライセンス
 

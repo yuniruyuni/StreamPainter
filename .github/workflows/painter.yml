@@ -9,6 +9,9 @@ on:
     paths:
       - "client/**"
       - "painter/**"
+      - "scripts/**"
+      - "about.toml"
+      - "LICENSE"
       - "package.json"
       - "bun.lock"
       - ".github/workflows/painter.yml"
@@ -17,6 +20,9 @@ on:
     paths:
       - "client/**"
       - "painter/**"
+      - "scripts/**"
+      - "about.toml"
+      - "LICENSE"
       - "package.json"
       - "bun.lock"
       - ".github/workflows/painter.yml"
@@ -35,11 +41,10 @@ jobs:
         with:
           bun-version: 1.3.12
 
-      - name: Build embedded OBS overlay
+      - name: Install and check frontend dependencies
         run: |
           bun install --frozen-lockfile
           bun run check
-          bun run build
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -50,6 +55,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: painter
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: Generate embedded application assets
+        run: bun run prepare:painter
 
       - name: Format check
         working-directory: painter
