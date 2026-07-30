@@ -14,6 +14,7 @@ on:
       - "LICENSE"
       - "package.json"
       - "bun.lock"
+      - ".gitattributes"
       - ".github/workflows/painter.yml"
   pull_request:
     branches: [main, develop]
@@ -25,6 +26,7 @@ on:
       - "LICENSE"
       - "package.json"
       - "bun.lock"
+      - ".gitattributes"
       - ".github/workflows/painter.yml"
 
 jobs:
