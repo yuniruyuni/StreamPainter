@@ -2,11 +2,14 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -233,30 +236,38 @@ function cargoAboutOutput(): CargoAboutOutput {
     );
   }
 
-  const result = Bun.spawnSync({
-    cmd: [
-      "cargo",
-      "about",
-      "generate",
-      "--format",
-      "json",
-      "--manifest-path",
-      join(projectRoot, "painter/Cargo.toml"),
-      "--config",
-      join(projectRoot, "about.toml"),
-      "--frozen",
-      "--fail",
-    ],
-    cwd: projectRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (result.exitCode !== 0) {
-    throw new Error(new TextDecoder().decode(result.stderr));
+  const outputDirectory = mkdtempSync(
+    join(tmpdir(), "stream-painter-cargo-about-"),
+  );
+  const outputPath = join(outputDirectory, "licenses.json");
+  try {
+    const result = Bun.spawnSync({
+      cmd: [
+        "cargo",
+        "about",
+        "generate",
+        "--format",
+        "json",
+        "--output-file",
+        outputPath,
+        "--manifest-path",
+        join(projectRoot, "painter/Cargo.toml"),
+        "--config",
+        join(projectRoot, "about.toml"),
+        "--frozen",
+        "--fail",
+      ],
+      cwd: projectRoot,
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) {
+      throw new Error(new TextDecoder().decode(result.stderr));
+    }
+    return readJson<CargoAboutOutput>(outputPath);
+  } finally {
+    rmSync(outputDirectory, { recursive: true, force: true });
   }
-  return JSON.parse(
-    new TextDecoder().decode(result.stdout),
-  ) as CargoAboutOutput;
 }
 
 function collectCargoComponents(): Component[] {
