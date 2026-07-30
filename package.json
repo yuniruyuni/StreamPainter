@@ -13,7 +13,7 @@
     "check:type": "bun run --cwd client check:type",
     "fix:lint": "biome check --write client scripts",
     "generate:licenses": "bun scripts/generate-third-party-notices.ts",
-    "prepare:painter": "bun run build && bun run generate:licenses"
+    "prepare:painter": "bun run build && cargo fetch --locked --manifest-path painter/Cargo.toml && bun run generate:licenses"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16"
