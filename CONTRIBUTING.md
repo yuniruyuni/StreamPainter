@@ -38,6 +38,9 @@ cargo build --release --locked
 ため、変更へ含めないでください。CIもクリーンなcheckoutから同じ生成を行ってからRustを検証・
 ビルドします。
 
+`bun.lock`と`painter/Cargo.lock`は、Pull Request時に`bun audit`とRustSecの`cargo audit`で
+検査します。同じ監査は既知の脆弱性データ更新を拾うため毎週自動実行します。
+
 ## ライセンス
 
 コントリビューションは、リポジトリの [MIT License](LICENSE) の下で提供されます。第三者の

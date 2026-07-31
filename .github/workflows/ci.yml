@@ -59,6 +59,3 @@ jobs:
       - name: Run platform-independent Rust tests
         working-directory: painter
         run: cargo test --locked
-
-      - name: Audit frontend dependencies
-        run: bun audit
