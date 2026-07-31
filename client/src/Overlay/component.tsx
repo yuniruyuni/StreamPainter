@@ -48,25 +48,27 @@ export const OverlayApp: React.FC = () => {
       layers.setItems(state.items);
       switch (effect.kind) {
         case "none":
-          return;
+          return true;
         case "active":
           schedule(() => {
             layers.beginActive(effect.stroke);
             layers.appendActive(effect.stroke);
           });
-          return;
+          return true;
         case "bake":
           schedule(() => layers.bake(effect.stroke));
-          return;
+          return true;
         case "cancel":
           schedule(() => layers.cancelActive(effect.strokeId));
-          return;
+          return true;
         case "preview":
           schedule(() => layers.renderActive());
-          return;
+          return true;
         case "rebuild":
           schedule(() => layers.rebuild(state.items));
-          return;
+          return true;
+        case "resync":
+          return false;
       }
     });
 

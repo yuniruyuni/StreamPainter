@@ -31,8 +31,8 @@ use tracing::{info, warn};
 use crate::config::{StampConfig, MAX_STAMP_FILE_BYTES};
 use crate::engine::canvas_engine::SharedItems;
 use crate::protocol::{
-    CanvasItem, OverlayClientMessage, OverlayControlMessage, PainterMessage, Stroke, MAX_ITEMS,
-    MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
+    CanvasItem, OverlayClientMessage, OverlayControlMessage, OverlayEvent, PainterMessage, Stroke,
+    MAX_ITEMS, MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
 };
 
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
@@ -590,22 +590,19 @@ impl HubState {
         if trimmed || force_snapshot {
             self.snapshot()
         } else {
-            serde_json::to_string(&outbound).ok()
+            serde_json::to_string(&OverlayEvent {
+                rev: self.revision,
+                event: &outbound,
+            })
+            .ok()
         }
     }
 
     fn snapshot(&self) -> Option<String> {
-        let strokes = self
-            .items
-            .iter()
-            .filter_map(CanvasItem::as_stroke)
-            .cloned()
-            .collect();
         serde_json::to_string(&OverlayControlMessage::Snapshot {
             protocol_version: PROTOCOL_VERSION,
             rev: self.revision,
             fade_after_ms: None,
-            strokes,
             items: self.items.clone(),
         })
         .ok()
@@ -808,20 +805,19 @@ mod tests {
 
         let (_, mut receiver) = hub.subscribe().await.unwrap();
         let snapshot = receiver.recv().await.unwrap();
+        assert!(!snapshot.contains("\"strokes\""));
         let message: OverlayControlMessage = serde_json::from_str(&snapshot).unwrap();
         match message {
-            OverlayControlMessage::Snapshot {
-                rev,
-                strokes,
-                items,
-                ..
-            } => {
+            OverlayControlMessage::Snapshot { rev, items, .. } => {
                 assert_eq!(rev, 3);
-                assert_eq!(strokes.len(), 1);
-                assert!(strokes[0].done);
-                assert_eq!(strokes[0].ended_at, Some(1234.0));
                 assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], CanvasItem::Stroke { .. }));
+                match &items[0] {
+                    CanvasItem::Stroke { stroke } => {
+                        assert!(stroke.done);
+                        assert_eq!(stroke.ended_at, Some(1234.0));
+                    }
+                    _ => panic!("expected stroke"),
+                }
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
@@ -844,6 +840,7 @@ mod tests {
         .await;
         let event = receiver.recv().await.unwrap();
         assert!(event.contains("\"type\":\"stroke_begin\""));
+        assert!(event.contains("\"rev\":1"));
     }
 
     #[tokio::test]
@@ -894,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_preserves_shape_and_stamp_order_in_v2_snapshot() {
+    async fn hub_preserves_shape_and_stamp_order_in_v3_snapshot() {
         let hub = test_hub();
         let shape = ShapeItem {
             item_id: "shape-1".into(),
@@ -948,12 +945,10 @@ mod tests {
         match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
             OverlayControlMessage::Snapshot {
                 protocol_version,
-                strokes,
                 items,
                 ..
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
-                assert!(strokes.is_empty());
                 assert!(matches!(items[0], CanvasItem::Shape { .. }));
                 assert!(matches!(items[1], CanvasItem::Stamp { .. }));
             }

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { Brush, Stroke } from "~/protocol";
-import { MAX_STROKES } from "~/protocol";
+import type {
+  Brush,
+  CanvasItem,
+  PaintEvent,
+  RevisionedPaintEvent,
+  Stroke,
+} from "~/protocol";
+import { MAX_STROKES, PROTOCOL_VERSION } from "~/protocol";
 import { OverlayState } from "./state";
 
 const brush: Brush = {
@@ -21,26 +27,48 @@ function doneStroke(id: string): Stroke {
   };
 }
 
+function strokeItem(id: string): CanvasItem {
+  return { kind: "stroke", ...doneStroke(id) };
+}
+
+function synchronizedState(items: CanvasItem[] = [], rev = 0): OverlayState {
+  const state = new OverlayState();
+  expect(
+    state.apply({
+      type: "snapshot",
+      protocolVersion: PROTOCOL_VERSION,
+      rev,
+      fadeAfterMs: null,
+      items,
+    }).kind,
+  ).toBe("rebuild");
+  return state;
+}
+
+function applyNext(state: OverlayState, event: PaintEvent) {
+  return state.apply({
+    ...event,
+    rev: state.rev + 1,
+  } as RevisionedPaintEvent);
+}
+
 describe("OverlayState", () => {
   test("snapshot は状態を置換し rebuild を返す", () => {
-    const state = new OverlayState();
-    const effect = state.apply({
-      type: "snapshot",
-      rev: 3,
-      fadeAfterMs: null,
-      strokes: [doneStroke("s1")],
-    });
-    expect(effect.kind).toBe("rebuild");
+    const state = synchronizedState([strokeItem("s1")], 3);
     expect(state.strokes).toHaveLength(1);
     expect(state.rev).toBe(3);
   });
 
   test("begin → points → end のライフサイクル", () => {
-    const state = new OverlayState();
-    const begin = state.apply({ type: "stroke_begin", strokeId: "s1", brush });
+    const state = synchronizedState();
+    const begin = applyNext(state, {
+      type: "stroke_begin",
+      strokeId: "s1",
+      brush,
+    });
     expect(begin.kind).toBe("active");
 
-    const points = state.apply({
+    const points = applyNext(state, {
       type: "stroke_points",
       strokeId: "s1",
       pts: [
@@ -51,7 +79,7 @@ describe("OverlayState", () => {
     expect(points.kind).toBe("active");
     expect(state.activeStrokes()[0]?.pts).toHaveLength(2);
 
-    const end = state.apply({
+    const end = applyNext(state, {
       type: "stroke_end",
       strokeId: "s1",
       endedAt: 1234,
@@ -62,17 +90,18 @@ describe("OverlayState", () => {
   });
 
   test("未知の strokeId への points は none", () => {
-    const state = new OverlayState();
-    const effect = state.apply({
+    const state = synchronizedState();
+    const effect = applyNext(state, {
       type: "stroke_points",
       strokeId: "unknown",
       pts: [[0, 0, 0.5, 0]],
     });
     expect(effect.kind).toBe("none");
+    expect(state.rev).toBe(1);
   });
 
   test("図形は preview 更新後に確定される", () => {
-    const state = new OverlayState();
+    const state = synchronizedState();
     const shape = {
       itemId: "shape-1",
       shape: "arrow" as const,
@@ -82,9 +111,11 @@ describe("OverlayState", () => {
       done: false,
       endedAt: null,
     };
-    expect(state.apply({ type: "shape_begin", shape }).kind).toBe("preview");
+    expect(applyNext(state, { type: "shape_begin", shape }).kind).toBe(
+      "preview",
+    );
     expect(
-      state.apply({
+      applyNext(state, {
         type: "shape_update",
         itemId: "shape-1",
         end: [0.8, 0.7],
@@ -92,7 +123,7 @@ describe("OverlayState", () => {
     ).toBe("preview");
     expect(state.items[0]).toMatchObject({ end: [0.8, 0.7], done: false });
     expect(
-      state.apply({
+      applyNext(state, {
         type: "shape_end",
         itemId: "shape-1",
         endedAt: 123,
@@ -101,16 +132,10 @@ describe("OverlayState", () => {
     expect(state.items[0]).toMatchObject({ done: true, endedAt: 123 });
   });
 
-  test("v2 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
-    const state = new OverlayState();
-    state.apply({
-      type: "snapshot",
-      protocolVersion: 2,
-      rev: 4,
-      fadeAfterMs: null,
-      strokes: [doneStroke("legacy-copy")],
-      items: [
-        { kind: "stroke", ...doneStroke("s1") },
+  test("v3 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
+    const state = synchronizedState(
+      [
+        strokeItem("s1"),
         {
           kind: "stamp",
           itemId: "stamp-item-1",
@@ -123,82 +148,96 @@ describe("OverlayState", () => {
           endedAt: 200,
         },
       ],
-    });
+      4,
+    );
     expect(state.items).toHaveLength(2);
     expect(state.strokes.map((stroke) => stroke.strokeId)).toEqual(["s1"]);
-    expect(state.apply({ type: "undo" }).kind).toBe("rebuild");
+    expect(applyNext(state, { type: "undo" }).kind).toBe("rebuild");
     expect(state.items).toHaveLength(1);
     expect(state.items[0]?.kind).toBe("stroke");
   });
 
   test("undo は最後の確定ストロークを削除し rebuild", () => {
-    const state = new OverlayState();
-    state.apply({
-      type: "snapshot",
-      rev: 1,
-      fadeAfterMs: null,
-      strokes: [doneStroke("s1"), doneStroke("s2")],
-    });
-    const effect = state.apply({ type: "undo" });
+    const state = synchronizedState([strokeItem("s1"), strokeItem("s2")], 1);
+    const effect = applyNext(state, { type: "undo" });
     expect(effect.kind).toBe("rebuild");
-    expect(state.strokes.map((s) => s.strokeId)).toEqual(["s1"]);
+    expect(state.strokes.map((stroke) => stroke.strokeId)).toEqual(["s1"]);
   });
 
   test("確定ストロークがなければ undo は none", () => {
-    const state = new OverlayState();
-    expect(state.apply({ type: "undo" }).kind).toBe("none");
+    const state = synchronizedState();
+    expect(applyNext(state, { type: "undo" }).kind).toBe("none");
   });
 
   test("clear は全消去して rebuild", () => {
-    const state = new OverlayState();
-    state.apply({
-      type: "snapshot",
-      rev: 1,
-      fadeAfterMs: null,
-      strokes: [doneStroke("s1")],
-    });
-    expect(state.apply({ type: "clear" }).kind).toBe("rebuild");
+    const state = synchronizedState([strokeItem("s1")], 1);
+    expect(applyNext(state, { type: "clear" }).kind).toBe("rebuild");
     expect(state.strokes).toHaveLength(0);
   });
 
   test("eraser の cancel は rebuild になる", () => {
-    const state = new OverlayState();
-    state.apply({
+    const state = synchronizedState();
+    applyNext(state, {
       type: "stroke_begin",
       strokeId: "e1",
       brush: { ...brush, tool: "eraser" },
     });
-    expect(state.apply({ type: "stroke_cancel", strokeId: "e1" }).kind).toBe(
-      "rebuild",
-    );
+    expect(
+      applyNext(state, { type: "stroke_cancel", strokeId: "e1" }).kind,
+    ).toBe("rebuild");
   });
 
   test("pen の cancel は active layer の破棄を指示する", () => {
-    const state = new OverlayState();
-    state.apply({ type: "stroke_begin", strokeId: "s1", brush });
-    expect(state.apply({ type: "stroke_cancel", strokeId: "s1" })).toEqual({
-      kind: "cancel",
-      strokeId: "s1",
-    });
+    const state = synchronizedState();
+    applyNext(state, { type: "stroke_begin", strokeId: "s1", brush });
+    expect(applyNext(state, { type: "stroke_cancel", strokeId: "s1" })).toEqual(
+      {
+        kind: "cancel",
+        strokeId: "s1",
+      },
+    );
   });
 
   test("ローカルハブと同じ規則でトリムする (本数上限)", () => {
-    const state = new OverlayState();
-    state.apply({
-      type: "snapshot",
-      rev: 1,
-      fadeAfterMs: null,
-      strokes: Array.from({ length: MAX_STROKES }, (_, i) =>
-        doneStroke(`s${i}`),
+    const state = synchronizedState(
+      Array.from({ length: MAX_STROKES }, (_, index) =>
+        strokeItem(`s${index}`),
       ),
-    });
-    const effect = state.apply({
+      1,
+    );
+    const effect = applyNext(state, {
       type: "stroke_begin",
       strokeId: "new",
       brush,
     });
-    expect(effect.kind).toBe("rebuild"); // 古い確定ストロークが落ちた
+    expect(effect.kind).toBe("rebuild");
     expect(state.strokes).toHaveLength(MAX_STROKES);
-    expect(state.strokes.some((s) => s.strokeId === "s0")).toBe(false);
+    expect(state.strokes.some((stroke) => stroke.strokeId === "s0")).toBe(
+      false,
+    );
+  });
+
+  test("未対応protocol versionは再同期を要求する", () => {
+    const state = new OverlayState();
+    expect(
+      state.apply({
+        type: "snapshot",
+        protocolVersion: PROTOCOL_VERSION + 1,
+        rev: 1,
+        fadeAfterMs: null,
+        items: [],
+      }).kind,
+    ).toBe("resync");
+  });
+
+  test("増分revisionの欠落は再同期を要求する", () => {
+    const state = synchronizedState([], 10);
+    expect(
+      state.apply({
+        type: "clear",
+        rev: 12,
+      }).kind,
+    ).toBe("resync");
+    expect(state.rev).toBe(10);
   });
 });

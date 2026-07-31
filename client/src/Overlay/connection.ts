@@ -14,7 +14,7 @@ export interface OverlayConnection {
 
 export function connectOverlay(
   url: string,
-  onMessage: (msg: ServerToOverlayMessage) => void,
+  onMessage: (msg: ServerToOverlayMessage) => boolean,
 ): OverlayConnection {
   let ws: WebSocket | null = null;
   let closed = false;
@@ -74,9 +74,13 @@ export function connectOverlay(
       if (socket !== ws) return;
       lastReceived = Date.now();
       try {
-        onMessage(JSON.parse(String(event.data)) as ServerToOverlayMessage);
+        const keepConnection = onMessage(
+          JSON.parse(String(event.data)) as ServerToOverlayMessage,
+        );
+        if (!keepConnection) scheduleReconnect(socket);
       } catch (e) {
         console.warn("overlay: failed to handle message", e);
+        scheduleReconnect(socket);
       }
     };
 
