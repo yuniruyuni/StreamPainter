@@ -334,6 +334,13 @@ impl App {
 
     /// OBSプロジェクターを検出し、表示追従とZ-orderを同期する。
     fn poll_projector(&mut self, hwnd: HWND) {
+        // TrackPopupMenu や設定画面が独自のメッセージループを回している間に
+        // overlay を Topmost 帯の先頭へ移すと、StreamPainter 自身の UI を覆う。
+        // UI が閉じた直後または次回 timer で改めて同期する。
+        if projector::foreground_ui_active() {
+            return;
+        }
+
         let projector = projector::find_projector(&self.monitor, hwnd);
         let visible = projector.is_some();
 
@@ -362,21 +369,21 @@ impl App {
         }
     }
 
-    /// 右クリックメニュー (描画モード中のみ呼ばれる)
-    fn show_menu(&mut self, hwnd: HWND) {
-        match menu::show(hwnd, &self.tool, &self.color, &self.stamps) {
-            Some(MenuAction::SelectTool(tool)) => {
+    /// popup が閉じた後に選択結果を反映する。true はアプリ終了要求。
+    fn apply_menu_action(&mut self, action: MenuAction) -> bool {
+        match action {
+            MenuAction::SelectTool(tool) => {
                 info!("tool: {tool:?}");
                 self.tool = tool;
             }
-            Some(MenuAction::SelectColor(color)) => {
+            MenuAction::SelectColor(color) => {
                 self.color = color.to_string();
                 // 色を選んだ = 描く意図なので、消しゴム中ならペンに戻す
                 if matches!(&self.tool, DrawTool::Eraser | DrawTool::Stamp(_)) {
                     self.tool = DrawTool::Pen;
                 }
             }
-            Some(MenuAction::Undo) => {
+            MenuAction::Undo => {
                 let msgs = self.engine.undo();
                 if !msgs.is_empty() {
                     self.web.send_all(msgs);
@@ -384,7 +391,7 @@ impl App {
                     self.render();
                 }
             }
-            Some(MenuAction::Clear) => {
+            MenuAction::Clear => {
                 let msgs = self.engine.clear();
                 if !msgs.is_empty() {
                     self.web.send_all(msgs);
@@ -392,11 +399,9 @@ impl App {
                     self.render();
                 }
             }
-            Some(MenuAction::Exit) => unsafe {
-                let _ = DestroyWindow(hwnd);
-            },
-            None => {}
+            MenuAction::Exit => return true,
         }
+        false
     }
 
     // ローカルエコーは描画モード中のみ表示する。パススルー中は overlay
@@ -680,75 +685,125 @@ unsafe extern "system" fn window_proc(
     if app_ptr.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
-    let app = unsafe { &mut *app_ptr };
 
     match msg {
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_TOGGLE => {
-            app.toggle_mode(hwnd);
+            // popup menu の内部ループへ届いた hotkey は、メニューを閉じずに背後の
+            // overlay 状態だけ変えることになるため無視する。
+            if !projector::foreground_ui_active() {
+                unsafe { &mut *app_ptr }.toggle_mode(hwnd);
+            }
             LRESULT(0)
         }
         // パススルー中は「処理済み」にせず DefWindowProc に流す (握りつぶすと
         // 下のウィンドウへ届かない)。描画モード中のみ自分で処理する
-        WM_POINTERDOWN if app.draw_mode => {
+        WM_POINTERDOWN => {
+            if !unsafe { &*app_ptr }.draw_mode {
+                return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            }
             // wparam の HIWORD にボタン種別フラグが入る (POINTER_MESSAGE_FLAG_*)
             let flags = ((wparam.0 >> 16) & 0xffff) as u32;
             if flags & POINTER_MESSAGE_FLAG_SECONDBUTTON != 0 {
-                if !app.engine.is_drawing() {
-                    app.show_menu(hwnd);
+                // TrackPopupMenu は内部でメッセージをdispatchする。App の可変参照を
+                // popup 表示中まで保持せず、入力値を複製して閉じた後に取り直す。
+                let menu_input = {
+                    let app = unsafe { &*app_ptr };
+                    (!app.engine.is_drawing())
+                        .then(|| (app.tool.clone(), app.color.clone(), app.stamps.clone()))
+                };
+                if let Some((tool, color, stamps)) = menu_input {
+                    let action = menu::show(hwnd, &tool, &color, &stamps);
+                    let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+                    if current == app_ptr {
+                        let exit = action.is_some_and(|action| {
+                            unsafe { &mut *app_ptr }.apply_menu_action(action)
+                        });
+                        if exit {
+                            unsafe {
+                                let _ = DestroyWindow(hwnd);
+                            }
+                        } else {
+                            // popup が消えたので overlay > projector の順を即時復元する。
+                            unsafe { &mut *app_ptr }.poll_projector(hwnd);
+                        }
+                    }
                 }
             } else if flags & POINTER_MESSAGE_FLAG_FIRSTBUTTON != 0 {
-                app.on_pointer_down(hwnd, lparam);
+                unsafe { &mut *app_ptr }.on_pointer_down(hwnd, lparam);
             }
             LRESULT(0)
         }
-        WM_POINTERUPDATE if app.engine.is_drawing() => {
-            app.on_pointer_update(hwnd, lparam);
-            LRESULT(0)
+        WM_POINTERUPDATE => {
+            if unsafe { &*app_ptr }.engine.is_drawing() {
+                unsafe { &mut *app_ptr }.on_pointer_update(hwnd, lparam);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
-        WM_POINTERUP if app.engine.is_drawing() => {
-            app.on_pointer_up(hwnd);
-            LRESULT(0)
+        WM_POINTERUP => {
+            if unsafe { &*app_ptr }.engine.is_drawing() {
+                unsafe { &mut *app_ptr }.on_pointer_up(hwnd);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_TRAY => {
-            match tray::on_message(hwnd, (lparam.0 & 0xffff) as u32) {
-                Some(TrayCommand::ToggleMode) => app.toggle_mode(hwnd),
+            // tray popup も内部メッセージループを持つため、先に結果だけ取得する。
+            let command = tray::on_message(hwnd, (lparam.0 & 0xffff) as u32);
+            let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+            if current != app_ptr {
+                return LRESULT(0);
+            }
+            match command {
+                Some(TrayCommand::ToggleMode) => {
+                    unsafe { &mut *app_ptr }.toggle_mode(hwnd);
+                    unsafe { &mut *app_ptr }.poll_projector(hwnd);
+                }
                 Some(TrayCommand::Settings) => {
-                    app.set_draw_mode(hwnd, false);
+                    unsafe { &mut *app_ptr }.set_draw_mode(hwnd, false);
                     if let Err(error) = settings::open(hwnd) {
                         warn!("settings: {error:#}");
                         crate::win::message_box(&format!("設定画面を開けません:\n{error:#}"));
                     }
+                    unsafe { &mut *app_ptr }.poll_projector(hwnd);
                 }
                 Some(TrayCommand::Licenses) => {
-                    app.set_draw_mode(hwnd, false);
-                    if let Err(error) = crate::win::open_url(hwnd, app.web.licenses_url()) {
+                    let licenses_url = {
+                        let app = unsafe { &mut *app_ptr };
+                        app.set_draw_mode(hwnd, false);
+                        app.web.licenses_url().to_owned()
+                    };
+                    if let Err(error) = crate::win::open_url(hwnd, &licenses_url) {
                         warn!("licenses: {error:#}");
                         crate::win::message_box(&format!(
                             "第三者ライセンスを開けません:\n{error:#}"
                         ));
                     }
+                    unsafe { &mut *app_ptr }.poll_projector(hwnd);
                 }
                 Some(TrayCommand::Exit) => unsafe {
                     let _ = DestroyWindow(hwnd);
                 },
-                None => {}
+                None => unsafe { &mut *app_ptr }.poll_projector(hwnd),
             }
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == FLUSH_TIMER_ID => {
-            app.on_flush_timer();
+            unsafe { &mut *app_ptr }.on_flush_timer();
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == PROJECTOR_TIMER_ID => {
-            app.poll_projector(hwnd);
+            unsafe { &mut *app_ptr }.poll_projector(hwnd);
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == PENDING_TIMER_ID => {
-            app.on_pending_timer(hwnd);
+            unsafe { &mut *app_ptr }.on_pending_timer(hwnd);
             LRESULT(0)
         }
         WM_OBS_RESULT => {
-            app.on_obs_result(hwnd, wparam.0 != 0);
+            unsafe { &mut *app_ptr }.on_obs_result(hwnd, wparam.0 != 0);
             LRESULT(0)
         }
         WM_DESTROY => {

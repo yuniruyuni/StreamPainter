@@ -13,6 +13,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK, SW_SHOWNORMAL};
 
 pub fn message_box(text: &str) {
+    let _foreground_ui = projector::ForegroundUiGuard::new();
     unsafe {
         MessageBoxW(
             None,

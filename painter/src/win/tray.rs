@@ -72,6 +72,8 @@ pub fn on_message(hwnd: HWND, lparam_low: u32) -> Option<TrayCommand> {
     if lparam_low != WM_RBUTTONUP && lparam_low != WM_LBUTTONUP && lparam_low != WM_CONTEXTMENU {
         return None;
     }
+    // overlay / OBS projector の定期的な Z-order 再構成よりトレイメニューを上に保つ。
+    let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();
     unsafe {
         let menu = CreatePopupMenu().ok()?;
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, w!("描画モード切替 (F9)"));

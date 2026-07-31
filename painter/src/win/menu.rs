@@ -85,6 +85,9 @@ pub fn show(
     color: &str,
     stamps: &[StampConfig],
 ) -> Option<MenuAction> {
+    // TrackPopupMenu の内部メッセージループ中に通常の projector timer が動いても、
+    // overlay をこの popup より前へ移動させない。
+    let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();
     unsafe {
         let root = CreatePopupMenu().ok()?;
         append(root, checked(tool == &DrawTool::Pen), ID_TOOL_PEN, "ペン");

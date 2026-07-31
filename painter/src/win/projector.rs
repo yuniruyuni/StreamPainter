@@ -5,6 +5,10 @@
 //! みなす。ウィンドウタイトルはロケール依存 (「全画面プロジェクター」/
 //! "Fullscreen Projector") のため判定に使わない。
 
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::rc::Rc;
+
 use windows::core::{Result as WindowsResult, BOOL};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::System::Threading::{
@@ -19,6 +23,39 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::win::monitor::Monitor;
 
 const OBS_EXE_NAMES: [&str; 3] = ["obs64.exe", "obs32.exe", "obs.exe"];
+
+thread_local! {
+    /// Win32 の popup menu / dialog は独自のメッセージループを持つ。同じ UI
+    /// スレッドでこれらが開いている間は overlay を Topmost 帯の先頭へ移さない。
+    static FOREGROUND_UI_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// StreamPainter 自身のメニューやダイアログを overlay より前に保つためのガード。
+///
+/// UI は Win32 UI スレッドだけで扱うため thread-local とし、`Rc` marker で別スレッドへ
+/// 移動できないようにする。ネストした MessageBox なども depth で扱う。
+pub struct ForegroundUiGuard {
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl ForegroundUiGuard {
+    pub fn new() -> Self {
+        FOREGROUND_UI_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self {
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for ForegroundUiGuard {
+    fn drop(&mut self) {
+        FOREGROUND_UI_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+pub fn foreground_ui_active() -> bool {
+    FOREGROUND_UI_DEPTH.with(|depth| depth.get() != 0)
+}
 
 /// --detect 診断モード: モニタと全画面級ウィンドウの一覧を出力する
 pub fn print_diagnosis() {
@@ -98,6 +135,13 @@ pub struct ZOrderGuard {
 
 impl ZOrderGuard {
     pub fn enforce(&mut self, projector: Option<HWND>, overlay: HWND) -> WindowsResult<()> {
+        // TrackPopupMenu / MessageBox / 設定画面より後から overlay を Topmost 帯の
+        // 先頭へ動かすと、StreamPainter 自身の UI を覆ってしまう。UI が閉じた後の
+        // 次回 poll で最新状態へ再同期する。
+        if foreground_ui_active() {
+            return Ok(());
+        }
+
         if self.projector != projector {
             self.restore();
             self.projector = projector;
@@ -337,5 +381,34 @@ mod tests {
             .expect("enforce existing Topmost Z-order");
         drop(guard);
         assert!(is_topmost(projector.0));
+    }
+
+    #[test]
+    fn foreground_ui_suspends_z_order_changes_until_it_closes() {
+        let projector = TestWindow::new(false);
+        let overlay = TestWindow::new(true);
+        let mut z_order = ZOrderGuard::default();
+
+        {
+            let _foreground_ui = ForegroundUiGuard::new();
+            z_order
+                .enforce(Some(projector.0), overlay.0)
+                .expect("suppressed enforcement succeeds");
+            assert!(!is_topmost(projector.0));
+
+            {
+                let _nested_ui = ForegroundUiGuard::new();
+                assert!(foreground_ui_active());
+            }
+            assert!(foreground_ui_active());
+        }
+
+        assert!(!foreground_ui_active());
+        z_order
+            .enforce(Some(projector.0), overlay.0)
+            .expect("enforcement resumes");
+        assert!(is_topmost(projector.0));
+        drop(z_order);
+        assert!(!is_topmost(projector.0));
     }
 }

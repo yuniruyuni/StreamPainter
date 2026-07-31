@@ -77,6 +77,8 @@ struct SettingsState {
     selected_stamp: Option<usize>,
     new_stamp_files: Vec<PathBuf>,
     saved: bool,
+    /// 設定画面を overlay より前に保つ。WM_NCDESTROY で state と一緒に解放する。
+    _foreground_ui: crate::win::projector::ForegroundUiGuard,
 }
 
 impl Drop for SettingsState {
@@ -210,6 +212,7 @@ pub fn open(owner: HWND) -> Result<()> {
             selected_stamp: None,
             new_stamp_files: Vec::new(),
             saved: false,
+            _foreground_ui: crate::win::projector::ForegroundUiGuard::new(),
         });
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
