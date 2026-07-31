@@ -18,6 +18,8 @@ pub const MAX_STAMPS: usize = 32;
 pub const MAX_STAMP_FILE_BYTES: u64 = 5 * 1024 * 1024;
 pub const MAX_STAMP_DIMENSION: u32 = 2048;
 pub const MAX_STAMP_PIXELS: u64 = 4_194_304;
+/// 全スタンプをRGBAへ展開した場合に約64 MiBとなる上限。
+pub const MAX_TOTAL_STAMP_PIXELS: u64 = 16_777_216;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -576,31 +578,43 @@ impl Config {
             anyhow::bail!("ブラシ幅には 0 より大きく 1 以下の値を指定してください");
         }
 
-        if self.stamps.len() > MAX_STAMPS {
-            anyhow::bail!("登録できるスタンプは最大 {MAX_STAMPS} 個です");
-        }
-        let mut ids = std::collections::HashSet::new();
-        for stamp in &self.stamps {
-            validate_stamp_id(&stamp.id)?;
-            if !ids.insert(&stamp.id) {
-                anyhow::bail!("スタンプ ID が重複しています: {}", stamp.id);
-            }
-            let name = stamp.name.trim();
-            if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-                anyhow::bail!("スタンプ名は 1〜64 文字で指定してください");
-            }
-            validate_stamp_dimensions(stamp.width_px, stamp.height_px)?;
-            if !stamp.default_height_n.is_finite()
-                || !(0.01..=1.0).contains(&stamp.default_height_n)
-            {
-                anyhow::bail!("スタンプの表示サイズは 1〜100% で指定してください");
-            }
-            if !stamp.opacity.is_finite() || !(0.0..=1.0).contains(&stamp.opacity) {
-                anyhow::bail!("スタンプの不透明度は 0〜100% で指定してください");
-            }
-        }
+        validate_stamp_catalog(&self.stamps)?;
         Ok(())
     }
+}
+
+pub fn validate_stamp_catalog(stamps: &[StampConfig]) -> Result<()> {
+    if stamps.len() > MAX_STAMPS {
+        anyhow::bail!("登録できるスタンプは最大 {MAX_STAMPS} 個です");
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut total_pixels = 0_u64;
+    for stamp in stamps {
+        validate_stamp_id(&stamp.id)?;
+        if !ids.insert(&stamp.id) {
+            anyhow::bail!("スタンプ ID が重複しています: {}", stamp.id);
+        }
+        let name = stamp.name.trim();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            anyhow::bail!("スタンプ名は 1〜64 文字で指定してください");
+        }
+        validate_stamp_dimensions(stamp.width_px, stamp.height_px)?;
+        total_pixels = total_pixels
+            .checked_add(u64::from(stamp.width_px) * u64::from(stamp.height_px))
+            .ok_or_else(|| anyhow!("スタンプ画像の合計ピクセル数が大きすぎます"))?;
+        if !stamp.default_height_n.is_finite() || !(0.01..=1.0).contains(&stamp.default_height_n) {
+            anyhow::bail!("スタンプの表示サイズは 1〜100% で指定してください");
+        }
+        if !stamp.opacity.is_finite() || !(0.0..=1.0).contains(&stamp.opacity) {
+            anyhow::bail!("スタンプの不透明度は 0〜100% で指定してください");
+        }
+    }
+    if total_pixels > MAX_TOTAL_STAMP_PIXELS {
+        anyhow::bail!(
+            "登録するスタンプ画像は合計 {MAX_TOTAL_STAMP_PIXELS} ピクセル以下にしてください"
+        );
+    }
+    Ok(())
 }
 
 fn validate_stamp_id(stamp_id: &str) -> Result<()> {
@@ -732,6 +746,25 @@ mod tests {
         config.stamps[0].id = "safe-id".into();
         config.stamps[0].width_px = MAX_STAMP_DIMENSION + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn stamp_validation_bounds_total_decoded_memory() {
+        let mut config = Config::default();
+        for index in 0..5 {
+            config.stamps.push(StampConfig {
+                id: format!("stamp-{index}"),
+                name: format!("stamp {index}"),
+                width_px: 2048,
+                height_px: 2048,
+                default_height_n: 0.15,
+                opacity: 1.0,
+            });
+        }
+        assert!(config.validate().is_err());
+
+        config.stamps.pop();
+        config.validate().unwrap();
     }
 
     #[test]
