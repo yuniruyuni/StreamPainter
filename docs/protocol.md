@@ -27,30 +27,30 @@ JSONフィールドはcamelCase、`type`値はsnake_caseです。
 ```json
 {
   "type": "snapshot",
-  "protocolVersion": 2,
+  "protocolVersion": 4,
   "rev": 12,
   "fadeAfterMs": null,
-  "strokes": [],
   "items": []
 }
 ```
 
 `items` は描画順を保つ完全な履歴で、`kind` が `stroke`、`shape`、`stamp` のいずれかです。
-`strokes` はprotocol v1クライアントとの互換用で、`items`内のストロークだけを複製します。
-v2 overlayは`items`で手元の状態を全置換し、その後、以下の増分イベントを順番に適用します。
+overlayは`protocolVersion`が対応版と一致することを確認し、`items`で手元の状態を全置換します。
+その後、以下の増分イベントを`rev`の連番どおりに適用します。
 
 ```json
-{"type":"stroke_begin","strokeId":"...","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true}}
-{"type":"stroke_points","strokeId":"...","pts":[[0.1,0.2,0.5,0]]}
-{"type":"stroke_end","strokeId":"...","endedAt":1785380000000}
-{"type":"stroke_cancel","strokeId":"..."}
-{"type":"shape_begin","shape":{"itemId":"...","shape":"arrow","style":{"color":"#ff4d6d","opacity":1,"widthN":0.005},"start":[0.1,0.2],"end":[0.1,0.2],"done":false,"endedAt":null}}
-{"type":"shape_update","itemId":"...","end":[0.8,0.7]}
-{"type":"shape_end","itemId":"...","endedAt":1785380000000}
-{"type":"shape_cancel","itemId":"..."}
-{"type":"stamp_add","stamp":{"itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
-{"type":"undo"}
-{"type":"clear"}
+{"type":"stroke_begin","rev":13,"strokeId":"...","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":false}}
+{"type":"stroke_points","rev":14,"strokeId":"...","pts":[[0.1,0.2,1,0]]}
+{"type":"stroke_end","rev":15,"strokeId":"...","endedAt":1785380000000}
+{"type":"stroke_cancel","rev":16,"strokeId":"..."}
+{"type":"shape_begin","rev":17,"shape":{"itemId":"...","shape":"arrow","style":{"color":"#ff4d6d","opacity":1,"widthN":0.005},"start":[0.1,0.2],"end":[0.1,0.2],"done":false,"endedAt":null}}
+{"type":"shape_update","rev":18,"itemId":"...","end":[0.8,0.7]}
+{"type":"shape_end","rev":19,"itemId":"...","endedAt":1785380000000}
+{"type":"shape_cancel","rev":20,"itemId":"..."}
+{"type":"stamp_add","rev":21,"stamp":{"itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
+{"type":"undo","rev":22}
+{"type":"redo","rev":23,"item":{"kind":"stamp","itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
+{"type":"clear","rev":24}
 ```
 
 図形の`shape`は`line`、`arrow`、`rectangle`、`ellipse`です。スタンプの画像は同じoriginの
@@ -75,6 +75,9 @@ overlayは15秒ごとに次を送ります。
 
 30秒間応答がなければoverlayは接続を閉じ、1秒から30秒の指数backoffと±20% jitterで
 再接続します。
+
+`protocolVersion`が一致しない場合、または増分イベントの`rev`が欠落・重複した場合も接続を
+閉じ、再接続直後のsnapshotから状態を復旧します。
 
 ## Limits and recovery
 

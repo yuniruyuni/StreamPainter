@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { connectOverlay } from "./connection";
+import { RenderQueue } from "./render-queue";
 import { OverlayLayers } from "./renderer/layers";
 import { OverlayState } from "./state";
 
@@ -17,8 +18,19 @@ export const OverlayApp: React.FC = () => {
 
     const state = new OverlayState();
     const layers = new OverlayLayers(baked, active);
+    let scheduled = false;
+    let animationFrame: number | null = null;
+    const pending = new RenderQueue();
+
+    function cancelScheduledRender() {
+      if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+      animationFrame = null;
+      scheduled = false;
+      pending.clear();
+    }
 
     function size() {
+      cancelScheduledRender();
       const dpr = window.devicePixelRatio || 1;
       layers.resize(
         Math.round(window.innerWidth * dpr),
@@ -28,17 +40,36 @@ export const OverlayApp: React.FC = () => {
     }
     size();
 
-    // 受信はキューに溜め、requestAnimationFrame でまとめて反映する
-    let scheduled = false;
-    const pending: (() => void)[] = [];
-    function schedule(task: () => void) {
-      pending.push(task);
+    // 受信は上限付き・集約可能なキューに溜め、1フレームでまとめて反映する。
+    function schedule(effect: Parameters<RenderQueue["enqueue"]>[0]) {
+      pending.enqueue(effect);
       if (scheduled) return;
       scheduled = true;
-      requestAnimationFrame(() => {
+      animationFrame = requestAnimationFrame(() => {
         scheduled = false;
-        const tasks = pending.splice(0, pending.length);
-        for (const t of tasks) t();
+        animationFrame = null;
+        for (const queued of pending.drain()) {
+          switch (queued.kind) {
+            case "active":
+              layers.beginActive(queued.stroke);
+              layers.appendActive(queued.stroke);
+              break;
+            case "bake":
+              layers.bake(queued.stroke);
+              break;
+            case "bake_item":
+              layers.bakeItem(queued.item);
+              break;
+            case "cancel":
+              layers.cancelActive(queued.strokeId);
+              break;
+            case "preview":
+              break;
+            case "rebuild":
+              layers.rebuild(state.items);
+              break;
+          }
+        }
         layers.renderActive();
       });
     }
@@ -48,31 +79,35 @@ export const OverlayApp: React.FC = () => {
       layers.setItems(state.items);
       switch (effect.kind) {
         case "none":
-          return;
+          return true;
         case "active":
-          schedule(() => {
-            layers.beginActive(effect.stroke);
-            layers.appendActive(effect.stroke);
-          });
-          return;
+          schedule(effect);
+          return true;
         case "bake":
-          schedule(() => layers.bake(effect.stroke));
-          return;
+          schedule(effect);
+          return true;
+        case "bake_item":
+          schedule(effect);
+          return true;
         case "cancel":
-          schedule(() => layers.cancelActive(effect.strokeId));
-          return;
+          schedule(effect);
+          return true;
         case "preview":
-          schedule(() => layers.renderActive());
-          return;
+          schedule(effect);
+          return true;
         case "rebuild":
-          schedule(() => layers.rebuild(state.items));
-          return;
+          schedule(effect);
+          return true;
+        case "resync":
+          cancelScheduledRender();
+          return false;
       }
     });
 
     window.addEventListener("resize", size);
     return () => {
       window.removeEventListener("resize", size);
+      cancelScheduledRender();
       conn.close();
     };
   }, []);

@@ -12,6 +12,8 @@ mod win;
 
 #[cfg(windows)]
 fn main() {
+    let _logging = win::logging::init();
+
     // 診断モード: モニタとウィンドウの一覧を表示して終了する
     if std::env::args().any(|a| a == "--detect") {
         win::projector::print_diagnosis();
@@ -25,11 +27,21 @@ fn main() {
         return;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let _single_instance = match win::single_instance::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            tracing::info!("another StreamPainter instance is already running");
+            win::message_box_info(
+                "StreamPainterは既に起動しています。\nタスクトレイを確認してください。",
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!("single-instance guard: {e:#}");
+            win::message_box(&format!("多重起動の確認に失敗しました:\n{e:#}"));
+            std::process::exit(1);
+        }
+    };
 
     if let Err(e) = win::app::run() {
         tracing::error!("fatal: {e:#}");

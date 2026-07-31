@@ -92,6 +92,10 @@ export class OverlayLayers {
     this.renderActive();
   }
 
+  bakeItem(item: CanvasItem): void {
+    this.compositeItem(context2d(this.baked), item);
+  }
+
   beginActive(stroke: Stroke): void {
     if (this.actives.has(stroke.strokeId)) return;
     let scratch: HTMLCanvasElement | null = null;

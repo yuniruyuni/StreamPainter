@@ -1,0 +1,30 @@
+name: 機能提案
+description: StreamPainterの改善案を提案します
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい問題
+      description: 機能そのものではなく、現在困っている状況を説明してください。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する動作
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: 製品境界の確認
+      options:
+        - label: ローカル完結・Windows向けOBSオーバーレイという現在の製品境界を確認しました。
+          required: true

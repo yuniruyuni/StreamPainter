@@ -16,7 +16,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::info;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -102,28 +101,20 @@ async fn open_async(settings: &ObsSettings, x: i32, y: i32, width: i32, height: 
             "monitorIndex": index,
         })
     };
-    let result = request(
+    request(
         &mut sink,
         &mut stream,
         "OpenVideoMixProjector",
         open(settings.view),
         "2",
     )
-    .await;
-    if result.is_err() && settings.view == ProjectorView::Preview {
-        // 非スタジオモードでは PREVIEW を開けないことがあるため PROGRAM で再試行
-        info!("preview projector unavailable; falling back to program");
-        request(
-            &mut sink,
-            &mut stream,
-            "OpenVideoMixProjector",
-            open(ProjectorView::Program),
-            "3",
-        )
-        .await?;
-    } else {
-        result?;
-    }
+    .await
+    .with_context(|| match settings.view {
+        ProjectorView::Program => "OBSのProgramプロジェクターを開けませんでした",
+        ProjectorView::Preview => {
+            "OBSのPreviewプロジェクターを開けませんでした (OBSのスタジオモードを確認)"
+        }
+    })?;
     Ok(())
 }
 

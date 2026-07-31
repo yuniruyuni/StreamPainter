@@ -13,7 +13,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_NOREPEAT, VK_F9};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_F9,
+};
 use windows::Win32::UI::Input::Pointer::EnableMouseInPointer;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -21,10 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, IDC_CROSS, LWA_ALPHA, MSG,
     POINTER_MESSAGE_FLAG_FIRSTBUTTON, POINTER_MESSAGE_FLAG_SECONDBUTTON, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_DESTROY,
-    WM_HOTKEY, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config;
@@ -41,6 +43,8 @@ use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
 
 const HOTKEY_TOGGLE: i32 = 1;
+/// 現在はポインタ種別を区別しないため、マウス相当の一定入力として扱う。
+const POINTER_PRESSURE: f64 = 1.0;
 /// 20ms バッチ (50 msg/s)
 const FLUSH_TIMER_ID: usize = 1;
 const FLUSH_INTERVAL_MS: u32 = 20;
@@ -51,18 +55,24 @@ const PROJECTOR_INTERVAL_MS: u32 = 2000;
 const PENDING_TIMER_ID: usize = 3;
 const PENDING_INTERVAL_MS: u32 = 250;
 const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RENDERER_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// obs-websocket 要求スレッドからの結果通知 (wparam: 成功=1)
 const WM_OBS_RESULT: u32 = WM_APP + 2;
 struct App {
     engine: CanvasEngine,
     web: LocalServerHandle,
-    renderer: Renderer,
+    overlay_hwnd: HWND,
+    renderer: Option<Renderer>,
+    content_local: Rect,
+    last_renderer_recovery: Option<std::time::Instant>,
     tool: DrawTool,
     stamps: Vec<crate::config::StampConfig>,
     color: String,
     width_n: f64,
     /// content rect (スクリーン座標)。入力の正規化に使う
     content_screen: Rect,
+    configured_screen: usize,
+    canvas_aspect: (f64, f64),
     monitor: Monitor,
     draw_mode: bool,
     local_echo: bool,
@@ -76,6 +86,8 @@ struct App {
     close_projector: bool,
     /// F9 → プロジェクターを開いて描画モードに入る、の完了待ち (開始時刻)
     pending_draw: Option<std::time::Instant>,
+    /// F9を確保できない場合もトレイ操作だけで継続する。
+    hotkey_registered: bool,
     /// 現在のプロジェクターを自分が obs-websocket で開いたか
     /// (手動で開かれたものは F9 オフでも閉じない)
     projector_opened_by_us: bool,
@@ -97,17 +109,24 @@ pub fn run() -> Result<()> {
     }
 
     let monitors = monitor::enumerate();
-    let (screen_index, mon) = match monitors.get(config.screen).copied() {
-        Some(monitor) => (config.screen, monitor),
-        None if !monitors.is_empty() => {
-            warn!(
-                "screen index {} が見つかりません (モニタ数: {}) — プライマリを使用します",
-                config.screen,
-                monitors.len()
-            );
-            (0, monitors[0])
+    let (screen_index, mon) = match select_monitor(&monitors, config.screen) {
+        Some((screen_index, monitor)) => {
+            if screen_index != config.screen {
+                warn!(
+                    "screen index {} が見つかりません (モニタ数: {}) — プライマリを使用します",
+                    config.screen,
+                    monitors.len()
+                );
+            }
+            (screen_index, monitor)
         }
-        None => return Err(anyhow!("利用可能なモニターが見つかりません")),
+        None => {
+            warn!(
+                "screen index {} が見つかりません (モニタ数: 0)",
+                config.screen
+            );
+            return Err(anyhow!("利用可能なモニターが見つかりません"));
+        }
     };
     info!(
         "monitor {}: {}x{} at ({},{})",
@@ -139,7 +158,11 @@ pub fn run() -> Result<()> {
     };
 
     let engine = CanvasEngine::new();
-    let web = local_server::spawn(config.local_server_port, &config.stamps)?;
+    let web = local_server::spawn(
+        config.local_server_port,
+        &config.stamps,
+        engine.shared_items(),
+    )?;
     debug_assert_eq!(web.overlay_url(), config.overlay_url());
 
     let hwnd = create_overlay_window(mon.x, mon.y, mon.width, mon.height)?;
@@ -154,12 +177,17 @@ pub fn run() -> Result<()> {
     let mut app = Box::new(App {
         engine,
         web,
-        renderer,
+        overlay_hwnd: hwnd,
+        renderer: Some(renderer),
+        content_local,
+        last_renderer_recovery: None,
         tool: DrawTool::Pen,
         stamps: config.stamps.clone(),
         color: config.brush.color.clone(),
         width_n: config.brush.width_n,
         content_screen,
+        configured_screen: config.screen,
+        canvas_aspect: (aw, ah),
         monitor: mon,
         draw_mode: false,
         local_echo: config.local_echo,
@@ -168,6 +196,7 @@ pub fn run() -> Result<()> {
         obs,
         close_projector: config.close_projector,
         pending_draw: None,
+        hotkey_registered: false,
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
     });
@@ -176,29 +205,39 @@ pub fn run() -> Result<()> {
     // Present などの一時コストをここで消化する (初回 F9 の体感遅延対策)
     {
         let t = std::time::Instant::now();
-        app.renderer.rebuild_baked(&[])?;
-        app.renderer.draw_frame(&[], false)?;
+        let renderer = app.renderer.as_mut().expect("renderer was initialized");
+        renderer.rebuild_baked(&[])?;
+        renderer.draw_frame(&[], false)?;
         info!("renderer warmup: {:?}", t.elapsed());
     }
 
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
-        RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, MOD_NOREPEAT, VK_F9.0 as u32)
-            .context("RegisterHotKey F9 (他のアプリが使用中?)")?;
-        tray::add(hwnd)?;
+        let app_ref = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
+        app_ref.hotkey_registered =
+            match RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, MOD_NOREPEAT, VK_F9.0 as u32) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        "F9 global hotkey is unavailable ({error}); \
+                         use the task tray to toggle draw mode"
+                    );
+                    false
+                }
+            };
+        tray::add(hwnd, app_ref.hotkey_registered)?;
         // 初期状態はパススルー
         set_transparent(hwnd, true);
         SetTimer(Some(hwnd), PROJECTOR_TIMER_ID, PROJECTOR_INTERVAL_MS, None);
         // 追従モードでは初回検知が終わるまで隠しておく (poll_projector が表示する)。
         // 追従しない場合も、OBSプロジェクターがあればZ-orderだけは同期する。
-        let app_ref = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
         if !app_ref.follow_projector {
             app_ref.projector_visible = true;
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         app_ref.poll_projector(hwnd);
     }
-    info!("ready — F9 で描画モードを切り替えます");
+    info!("ready — 描画モードはF9またはタスクトレイから切り替えられます");
 
     unsafe {
         let mut msg = MSG::default();
@@ -285,6 +324,14 @@ fn now_ms() -> f64 {
         .as_millis() as f64
 }
 
+fn select_monitor(monitors: &[Monitor], configured: usize) -> Option<(usize, Monitor)> {
+    monitors
+        .get(configured)
+        .copied()
+        .map(|monitor| (configured, monitor))
+        .or_else(|| monitors.first().copied().map(|monitor| (0, monitor)))
+}
+
 impl App {
     /// 現在のツール・色から Brush を組み立てる (テストページと同じマッピング)
     fn current_brush(&self) -> Option<Brush> {
@@ -294,22 +341,21 @@ impl App {
                 color: self.color.clone(),
                 opacity: 1.0,
                 width_n: self.width_n,
-                // M2 はマウスのみ (p=0.5 固定) のため実質無効。M3 でペン筆圧を有効化する
-                pressure_width: true,
+                pressure_width: false,
             }),
             DrawTool::Marker => Some(Brush {
                 tool: Tool::Marker,
                 color: self.color.clone(),
                 opacity: 0.5,
                 width_n: self.width_n * 3.0,
-                pressure_width: true,
+                pressure_width: false,
             }),
             DrawTool::Eraser => Some(Brush {
                 tool: Tool::Eraser,
                 color: "#000000".into(),
                 opacity: 1.0,
                 width_n: self.width_n * 3.0,
-                pressure_width: true,
+                pressure_width: false,
             }),
             DrawTool::Line
             | DrawTool::Arrow
@@ -370,7 +416,7 @@ impl App {
     }
 
     /// popup が閉じた後に選択結果を反映する。true はアプリ終了要求。
-    fn apply_menu_action(&mut self, action: MenuAction) -> bool {
+    fn apply_menu_action(&mut self, hwnd: HWND, action: MenuAction) -> bool {
         match action {
             MenuAction::SelectTool(tool) => {
                 info!("tool: {tool:?}");
@@ -391,7 +437,18 @@ impl App {
                     self.render();
                 }
             }
+            MenuAction::Redo => {
+                let msgs = self.engine.redo();
+                if !msgs.is_empty() {
+                    self.web.send_all(msgs);
+                    self.rebuild();
+                    self.render();
+                }
+            }
             MenuAction::Clear => {
+                if !crate::win::confirm(hwnd, "すべての描画を消去しますか？") {
+                    return false;
+                }
                 let msgs = self.engine.clear();
                 if !msgs.is_empty() {
                     self.web.send_all(msgs);
@@ -411,10 +468,16 @@ impl App {
             return;
         }
         let items = self.engine.shared_items();
-        let items = items.lock().unwrap().clone();
+        let items = items.lock().unwrap();
         let visible = if self.local_echo { &items[..] } else { &[] };
-        if let Err(e) = self.renderer.draw_frame(visible, self.draw_mode) {
-            warn!("draw_frame: {e:#}");
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.draw_frame(visible, self.draw_mode));
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("draw_frame", error);
         }
     }
 
@@ -423,10 +486,160 @@ impl App {
             return;
         }
         let items = self.engine.shared_items();
-        let items = items.lock().unwrap().clone();
-        if let Err(e) = self.renderer.rebuild_baked(&items) {
-            warn!("rebuild_baked: {e:#}");
+        let items = items.lock().unwrap();
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.rebuild_baked(&items));
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("rebuild_baked", error);
         }
+    }
+
+    fn bake_last_done(&mut self) {
+        if !self.local_echo {
+            return;
+        }
+        let items = self.engine.shared_items();
+        let items = items.lock().unwrap();
+        let Some(item) = items.iter().rfind(|item| item.is_done()) else {
+            return;
+        };
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.bake_item(item));
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("bake_item", error);
+        }
+    }
+
+    /// GPUデバイス喪失などの描画失敗時に、完全履歴から描画資源を作り直す。
+    fn recover_renderer(&mut self, operation: &str, error: anyhow::Error) {
+        let now = std::time::Instant::now();
+        if self
+            .last_renderer_recovery
+            .is_some_and(|last| now.duration_since(last) < RENDERER_RECOVERY_INTERVAL)
+        {
+            return;
+        }
+        self.last_renderer_recovery = Some(now);
+        warn!("{operation}: {error:#}; recreating graphics resources");
+
+        // 同じHWNDに複数のDirectComposition targetを作らないよう先に破棄する。
+        self.renderer.take();
+        match self.create_renderer_from_history() {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                info!("graphics resources recovered");
+            }
+            Err(recovery_error) => {
+                warn!("graphics resource recovery failed: {recovery_error:#}");
+            }
+        }
+    }
+
+    fn create_renderer_from_history(&self) -> anyhow::Result<Renderer> {
+        let items = {
+            let shared = self.engine.shared_items();
+            let snapshot = shared.lock().unwrap().clone();
+            snapshot
+        };
+        let mut renderer = Renderer::new(
+            self.overlay_hwnd,
+            self.monitor.width as u32,
+            self.monitor.height as u32,
+            self.content_local,
+            &self.stamps,
+        )?;
+        if self.local_echo {
+            renderer.rebuild_baked(&items)?;
+        } else {
+            renderer.rebuild_baked(&[])?;
+        }
+        if self.draw_mode {
+            let visible = if self.local_echo { &items[..] } else { &[] };
+            renderer.draw_frame(visible, true)?;
+        } else {
+            renderer.clear_frame()?;
+        }
+        Ok(renderer)
+    }
+
+    /// 解像度変更・モニタ増減に合わせてウィンドウ、座標変換、GPU資源を更新する。
+    fn on_display_change(&mut self, hwnd: HWND) {
+        let monitors = monitor::enumerate();
+        let Some((actual_index, next_monitor)) = select_monitor(&monitors, self.configured_screen)
+        else {
+            warn!("display configuration changed; no monitor is available");
+            self.set_draw_mode(hwnd, false);
+            self.projector_visible = false;
+            let _ = self.projector_z_order.enforce(None, hwnd);
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            return;
+        };
+
+        if next_monitor == self.monitor {
+            self.poll_projector(hwnd);
+            return;
+        }
+
+        let (aspect_width, aspect_height) = self.canvas_aspect;
+        let content_local = content_rect(
+            next_monitor.width as f64,
+            next_monitor.height as f64,
+            aspect_width,
+            aspect_height,
+        );
+        let content_screen = Rect {
+            x: content_local.x + next_monitor.x as f64,
+            y: content_local.y + next_monitor.y as f64,
+            ..content_local
+        };
+        let positioned = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                next_monitor.x,
+                next_monitor.y,
+                next_monitor.width,
+                next_monitor.height,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            )
+        };
+        if let Err(error) = positioned {
+            warn!("failed to resize overlay after display change: {error}");
+            return;
+        }
+
+        info!(
+            "display changed; monitor {} is now {}x{} at ({},{})",
+            actual_index, next_monitor.width, next_monitor.height, next_monitor.x, next_monitor.y
+        );
+        self.monitor = next_monitor;
+        self.content_local = content_local;
+        self.content_screen = content_screen;
+        self.projector_visible = false;
+        self.projector_opened_by_us = false;
+        self.renderer.take();
+        self.last_renderer_recovery = None;
+        match self.create_renderer_from_history() {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                info!("graphics resources resized for the new display");
+            }
+            Err(error) => {
+                self.last_renderer_recovery = Some(std::time::Instant::now());
+                warn!("failed to recreate graphics resources after display change: {error:#}");
+            }
+        }
+        self.poll_projector(hwnd);
     }
 
     /// F9 / トレイからの切替。プロジェクター未表示なら obs-websocket で開く
@@ -546,8 +759,15 @@ impl App {
         let after_style = t.elapsed();
         if self.draw_mode {
             self.render();
-        } else if let Err(e) = self.renderer.clear_frame() {
-            warn!("clear_frame: {e:#}");
+        } else {
+            let result = self
+                .renderer
+                .as_mut()
+                .ok_or_else(|| anyhow!("renderer is unavailable"))
+                .and_then(Renderer::clear_frame);
+            if let Err(error) = result {
+                self.recover_renderer("clear_frame", error);
+            }
         }
         info!(
             "draw mode: {} (style: {:?}, total: {:?})",
@@ -580,7 +800,7 @@ impl App {
                 let Some(brush) = self.current_brush() else {
                     return;
                 };
-                self.engine.begin(brush, u, v, 0.5, now_ms())
+                self.engine.begin(brush, u, v, POINTER_PRESSURE, now_ms())
             }
             DrawTool::Line => {
                 self.engine
@@ -620,8 +840,11 @@ impl App {
                     now_ms(),
                 );
                 self.web.send_all(msgs);
-                let _ = self.engine.take_rebuild_required();
-                self.rebuild();
+                if self.engine.take_rebuild_required() {
+                    self.rebuild();
+                } else {
+                    self.bake_last_done();
+                }
                 self.render();
                 return;
             }
@@ -641,7 +864,7 @@ impl App {
             return;
         }
         let (u, v) = self.pointer_uv(lparam);
-        let msgs = self.engine.move_to(u, v, 0.5, now_ms());
+        let msgs = self.engine.move_to(u, v, POINTER_PRESSURE, now_ms());
         let trimmed = self.engine.take_rebuild_required();
         if !msgs.is_empty() {
             // 総点数上限による強制確定
@@ -649,7 +872,11 @@ impl App {
             unsafe {
                 let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
             }
-            self.rebuild();
+            if trimmed {
+                self.rebuild();
+            } else {
+                self.bake_last_done();
+            }
         } else if trimmed {
             self.rebuild();
         }
@@ -665,7 +892,11 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
         }
-        self.rebuild();
+        if self.engine.take_rebuild_required() {
+            self.rebuild();
+        } else {
+            self.bake_last_done();
+        }
         self.render();
     }
 
@@ -708,15 +939,22 @@ unsafe extern "system" fn window_proc(
                 // popup 表示中まで保持せず、入力値を複製して閉じた後に取り直す。
                 let menu_input = {
                     let app = unsafe { &*app_ptr };
-                    (!app.engine.is_drawing())
-                        .then(|| (app.tool.clone(), app.color.clone(), app.stamps.clone()))
+                    (!app.engine.is_drawing()).then(|| {
+                        (
+                            app.tool.clone(),
+                            app.color.clone(),
+                            app.stamps.clone(),
+                            app.engine.can_undo(),
+                            app.engine.can_redo(),
+                        )
+                    })
                 };
-                if let Some((tool, color, stamps)) = menu_input {
-                    let action = menu::show(hwnd, &tool, &color, &stamps);
+                if let Some((tool, color, stamps, can_undo, can_redo)) = menu_input {
+                    let action = menu::show(hwnd, &tool, &color, &stamps, can_undo, can_redo);
                     let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
                     if current == app_ptr {
                         let exit = action.is_some_and(|action| {
-                            unsafe { &mut *app_ptr }.apply_menu_action(action)
+                            unsafe { &mut *app_ptr }.apply_menu_action(hwnd, action)
                         });
                         if exit {
                             unsafe {
@@ -751,7 +989,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_TRAY => {
             // tray popup も内部メッセージループを持つため、先に結果だけ取得する。
-            let command = tray::on_message(hwnd, (lparam.0 & 0xffff) as u32);
+            let command = tray::on_message(
+                hwnd,
+                (lparam.0 & 0xffff) as u32,
+                unsafe { &*app_ptr }.hotkey_registered,
+            );
             let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
             if current != app_ptr {
                 return LRESULT(0);
@@ -766,6 +1008,17 @@ unsafe extern "system" fn window_proc(
                     if let Err(error) = settings::open(hwnd) {
                         warn!("settings: {error:#}");
                         crate::win::message_box(&format!("設定画面を開けません:\n{error:#}"));
+                    }
+                    unsafe { &mut *app_ptr }.poll_projector(hwnd);
+                }
+                Some(TrayCommand::Logs) => {
+                    unsafe { &mut *app_ptr }.set_draw_mode(hwnd, false);
+                    let result = crate::win::logging::log_directory()
+                        .ok_or_else(|| anyhow!("ログフォルダーを取得できません"))
+                        .and_then(|path| crate::win::open_path(hwnd, &path));
+                    if let Err(error) = result {
+                        warn!("logs: {error:#}");
+                        crate::win::message_box(&format!("ログフォルダーを開けません:\n{error:#}"));
                     }
                     unsafe { &mut *app_ptr }.poll_projector(hwnd);
                 }
@@ -802,12 +1055,21 @@ unsafe extern "system" fn window_proc(
             unsafe { &mut *app_ptr }.on_pending_timer(hwnd);
             LRESULT(0)
         }
+        WM_DISPLAYCHANGE => {
+            unsafe { &mut *app_ptr }.on_display_change(hwnd);
+            LRESULT(0)
+        }
         WM_OBS_RESULT => {
             unsafe { &mut *app_ptr }.on_obs_result(hwnd, wparam.0 != 0);
             LRESULT(0)
         }
         WM_DESTROY => {
             tray::remove(hwnd);
+            if unsafe { &*app_ptr }.hotkey_registered {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
+                }
+            }
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(app_ptr));
@@ -816,5 +1078,28 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_monitor(x: i32, primary: bool) -> Monitor {
+        Monitor {
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary,
+        }
+    }
+
+    #[test]
+    fn monitor_selection_falls_back_to_the_first_monitor() {
+        let monitors = [test_monitor(0, true), test_monitor(1920, false)];
+        assert_eq!(select_monitor(&monitors, 1), Some((1, monitors[1])));
+        assert_eq!(select_monitor(&monitors, 9), Some((0, monitors[0])));
+        assert_eq!(select_monitor(&[], 0), None);
     }
 }

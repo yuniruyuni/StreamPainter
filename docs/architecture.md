@@ -19,8 +19,10 @@ local-web thread (single-thread Tokio runtime)
 OBS Browser Source / Canvas 2D
 ```
 
-UIスレッドからハブへの送信はunbounded channelへの短いenqueueだけです。HTTP、JSON送信、
-遅いBrowser Sourceを待つ処理はUIスレッドで行いません。
+UIスレッドからハブへの送信は上限1,024件のchannelへの短いenqueueだけです。HTTP、JSON送信、
+遅いBrowser Sourceを待つ処理はUIスレッドで行いません。万一入力上限へ達した場合は、
+個別イベントを欠落させたままにせず、UI側の完全なCanvas状態へ世代付きで置換して全接続を
+snapshot再同期します。完全履歴の複製はこの異常復旧時だけ発生します。
 
 ## ローカルハブ
 
@@ -35,7 +37,11 @@ UIスレッドからハブへの送信はunbounded channelへの短いenqueueだ
 
 CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000点に制限します。古い確定
 アイテムを削除する必要が生じた場合は増分ではなくsnapshotを送り、全クライアントを再同期
-します。互換用の`strokes` snapshotも併記するため、旧overlayは従来ツールを表示できます。
+します。増分イベントにはrevisionを付け、欠落を検出したoverlayは再接続snapshotで復旧します。
+
+ローカルDirect2DとBrowser SourceのCanvas 2Dは、通常の確定操作では新しい1項目だけを
+bakedレイヤーへ追記します。全履歴の再構築はUndo、Clear、上限トリム、再接続snapshot、
+キャンバスのリサイズ時に限定します。
 
 ## Web assets
 

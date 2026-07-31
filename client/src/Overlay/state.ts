@@ -8,7 +8,12 @@ import type {
   StampItem,
   Stroke,
 } from "~/protocol";
-import { MAX_ITEMS, MAX_STROKE_POINTS, MAX_TOTAL_POINTS } from "~/protocol";
+import {
+  MAX_ITEMS,
+  MAX_STROKE_POINTS,
+  MAX_TOTAL_POINTS,
+  PROTOCOL_VERSION,
+} from "~/protocol";
 
 function canvasItemId(item: CanvasItem): string {
   return item.kind === "stroke" ? item.strokeId : item.itemId;
@@ -19,16 +24,19 @@ export type RenderEffect =
   | { kind: "none" }
   | { kind: "active"; stroke: Stroke }
   | { kind: "bake"; stroke: Stroke }
+  | { kind: "bake_item"; item: CanvasItem }
   | { kind: "cancel"; strokeId: string }
   | { kind: "preview" }
-  | { kind: "rebuild" };
+  | { kind: "rebuild" }
+  | { kind: "resync" };
 
 export class OverlayState {
   items: CanvasItem[] = [];
   fadeAfterMs: number | null = null;
   rev = 0;
+  private synchronized = false;
 
-  /** v1 のテスト・呼び出し側向けの読み取り互換ビュー。 */
+  /** ストロークだけを必要とする描画処理向けの読み取りビュー。 */
   get strokes(): Stroke[] {
     return this.items
       .filter(
@@ -39,16 +47,27 @@ export class OverlayState {
   }
 
   apply(msg: ServerToOverlayMessage): RenderEffect {
-    switch (msg.type) {
-      case "snapshot": {
-        this.items =
-          msg.items !== undefined
-            ? msg.items
-            : msg.strokes.map((stroke) => ({ kind: "stroke", ...stroke }));
-        this.fadeAfterMs = msg.fadeAfterMs;
-        this.rev = msg.rev;
-        return { kind: "rebuild" };
+    if (msg.type === "pong") return { kind: "none" };
+
+    if (msg.type === "snapshot") {
+      if (msg.protocolVersion !== PROTOCOL_VERSION) {
+        this.synchronized = false;
+        return { kind: "resync" };
       }
+      this.items = msg.items;
+      this.fadeAfterMs = msg.fadeAfterMs;
+      this.rev = msg.rev;
+      this.synchronized = true;
+      return { kind: "rebuild" };
+    }
+
+    if (!this.synchronized || msg.rev !== this.rev + 1) {
+      this.synchronized = false;
+      return { kind: "resync" };
+    }
+    this.rev = msg.rev;
+
+    switch (msg.type) {
       case "stroke_begin": {
         if (this.items.some((item) => canvasItemId(item) === msg.strokeId)) {
           return { kind: "none" };
@@ -113,7 +132,7 @@ export class OverlayState {
         if (!shape) return { kind: "none" };
         shape.done = true;
         shape.endedAt = msg.endedAt;
-        return { kind: "rebuild" };
+        return { kind: "bake_item", item: shape };
       }
       case "shape_cancel": {
         const index = this.items.findIndex(
@@ -131,9 +150,9 @@ export class OverlayState {
           return { kind: "none" };
         }
         const stamp: StampItem = { ...msg.stamp, done: true };
-        this.items.push({ kind: "stamp", ...stamp });
-        this.trim();
-        return { kind: "rebuild" };
+        const item: CanvasItem = { kind: "stamp", ...stamp };
+        this.items.push(item);
+        return this.trim() ? { kind: "rebuild" } : { kind: "bake_item", item };
       }
       case "undo": {
         let index = -1;
@@ -147,13 +166,25 @@ export class OverlayState {
         this.items.splice(index, 1);
         return { kind: "rebuild" };
       }
+      case "redo": {
+        if (
+          !msg.item.done ||
+          this.items.some(
+            (existing) => canvasItemId(existing) === canvasItemId(msg.item),
+          )
+        ) {
+          return { kind: "none" };
+        }
+        this.items.push(msg.item);
+        return this.trim()
+          ? { kind: "rebuild" }
+          : { kind: "bake_item", item: msg.item };
+      }
       case "clear": {
         if (this.items.length === 0) return { kind: "none" };
         this.items = [];
         return { kind: "rebuild" };
       }
-      case "pong":
-        return { kind: "none" };
       default:
         // JSON は実行時には将来版の type を含み得る。
         return { kind: "none" };

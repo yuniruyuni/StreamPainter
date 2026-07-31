@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{bail, Context, Result};
@@ -28,12 +29,14 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::config::{StampConfig, MAX_STAMP_FILE_BYTES};
+use crate::engine::canvas_engine::SharedItems;
 use crate::protocol::{
-    CanvasItem, OverlayClientMessage, OverlayControlMessage, PainterMessage, Stroke, MAX_ITEMS,
-    MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
+    CanvasItem, OverlayClientMessage, OverlayControlMessage, OverlayEvent, PainterMessage, Stroke,
+    MAX_ITEMS, MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
 };
 
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
+const HUB_INPUT_QUEUE_CAPACITY: usize = 1024;
 const THIRD_PARTY_LICENSES_HTML: &str = include_str!("../../assets/third-party-licenses.html");
 
 #[derive(RustEmbed)]
@@ -44,6 +47,8 @@ struct OverlayAssets;
 /// Win32 UI スレッドからローカルハブへ描画イベントを渡すハンドル。
 pub struct LocalServerHandle {
     hub: HubHandle,
+    source_items: SharedItems,
+    recovery: Arc<HubRecovery>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
     overlay_url: String,
@@ -51,15 +56,37 @@ pub struct LocalServerHandle {
 }
 
 impl LocalServerHandle {
-    pub fn send(&self, message: PainterMessage) {
-        if self.hub.tx.send(HubCommand::Apply(message)).is_err() {
-            warn!("local overlay hub is not running");
+    /// `true` は同じバッチの後続イベントを送ってよいことを表す。
+    fn enqueue(&self, message: PainterMessage) -> bool {
+        let generation = self.recovery.generation.load(Ordering::Acquire);
+        match self.hub.tx.try_send(HubCommand::Apply {
+            generation,
+            message,
+        }) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("local overlay hub is not running");
+                false
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // イベントを1件だけ落とすとハブの状態が恒久的に壊れる。完全状態を退避し、
+                // ハブ側で古い世代の待機イベントを無視してsnapshotへ置換する。
+                let generation = self.recovery.generation.fetch_add(1, Ordering::AcqRel) + 1;
+                let items = self.source_items.lock().unwrap().clone();
+                *self.recovery.snapshot.lock().unwrap() = Some((generation, items));
+                warn!(
+                    "local overlay hub input queue was full; scheduled snapshot recovery generation {generation}"
+                );
+                false
+            }
         }
     }
 
     pub fn send_all(&self, messages: Vec<PainterMessage>) {
         for message in messages {
-            self.send(message);
+            if !self.enqueue(message) {
+                break;
+            }
         }
     }
 
@@ -84,7 +111,11 @@ impl Drop for LocalServerHandle {
 }
 
 /// アセットを検証してから同期的にポートを確保するため、ポート競合は起動時に報告される。
-pub fn spawn(port: u16, stamps: &[StampConfig]) -> Result<LocalServerHandle> {
+pub fn spawn(
+    port: u16,
+    stamps: &[StampConfig],
+    source_items: SharedItems,
+) -> Result<LocalServerHandle> {
     if port == 0 {
         bail!("local_server_port に 0 は指定できません");
     }
@@ -127,14 +158,16 @@ pub fn spawn(port: u16, stamps: &[StampConfig]) -> Result<LocalServerHandle> {
         })
         .collect();
 
-    let (hub_tx, hub_rx) = mpsc::unbounded_channel();
+    let (hub_tx, hub_rx) = mpsc::channel(HUB_INPUT_QUEUE_CAPACITY);
     let hub = HubHandle { tx: hub_tx };
+    let recovery = Arc::new(HubRecovery::default());
     let web_state = WebState {
         hub: hub.clone(),
         port,
         stamp_paths: Arc::new(stamp_paths),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let recovery_for_thread = Arc::clone(&recovery);
 
     let thread = std::thread::Builder::new()
         .name("local-web".into())
@@ -157,7 +190,7 @@ pub fn spawn(port: u16, stamps: &[StampConfig]) -> Result<LocalServerHandle> {
                         return;
                     }
                 };
-                let hub_task = tokio::spawn(run_hub(hub_rx));
+                let hub_task = tokio::spawn(run_hub(hub_rx, Arc::clone(&recovery_for_thread)));
                 let app = router(web_state);
                 tokio::select! {
                     result = async { axum::serve(listener, app).await } => {
@@ -177,6 +210,8 @@ pub fn spawn(port: u16, stamps: &[StampConfig]) -> Result<LocalServerHandle> {
     info!("OBS Browser Source URL: {overlay_url}");
     Ok(LocalServerHandle {
         hub,
+        source_items,
+        recovery,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
         overlay_url,
@@ -345,7 +380,7 @@ fn plain_response(status: StatusCode, content_type: &'static str, body: &'static
 
 #[derive(Clone)]
 struct HubHandle {
-    tx: mpsc::UnboundedSender<HubCommand>,
+    tx: mpsc::Sender<HubCommand>,
 }
 
 impl HubHandle {
@@ -353,23 +388,33 @@ impl HubHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(HubCommand::Subscribe { reply: reply_tx })
+            .await
             .ok()?;
         reply_rx.await.ok()
     }
 
     fn unsubscribe(&self, id: u64) {
-        let _ = self.tx.send(HubCommand::Unsubscribe { id });
+        let _ = self.tx.try_send(HubCommand::Unsubscribe { id });
     }
 }
 
 enum HubCommand {
-    Apply(PainterMessage),
+    Apply {
+        generation: u64,
+        message: PainterMessage,
+    },
     Subscribe {
         reply: oneshot::Sender<(u64, mpsc::Receiver<String>)>,
     },
     Unsubscribe {
         id: u64,
     },
+}
+
+#[derive(Default)]
+struct HubRecovery {
+    generation: AtomicU64,
+    snapshot: Mutex<Option<(u64, Vec<CanvasItem>)>>,
 }
 
 struct Subscriber {
@@ -530,6 +575,19 @@ impl HubState {
                 // v1 client の stroke 履歴を誤って 1 本戻さないよう snapshot を送る。
                 (PainterMessage::Undo {}, removed_non_stroke)
             }
+            PainterMessage::Redo { item } => {
+                if !item.is_done()
+                    || self
+                        .items
+                        .iter()
+                        .any(|existing| existing.item_id() == item.item_id())
+                {
+                    return None;
+                }
+                self.total_points += item.point_count();
+                self.items.push(item.clone());
+                (PainterMessage::Redo { item }, false)
+            }
             PainterMessage::Clear {} => {
                 if self.items.is_empty() {
                     return None;
@@ -545,25 +603,30 @@ impl HubState {
         if trimmed || force_snapshot {
             self.snapshot()
         } else {
-            serde_json::to_string(&outbound).ok()
+            serde_json::to_string(&OverlayEvent {
+                rev: self.revision,
+                event: &outbound,
+            })
+            .ok()
         }
     }
 
     fn snapshot(&self) -> Option<String> {
-        let strokes = self
-            .items
-            .iter()
-            .filter_map(CanvasItem::as_stroke)
-            .cloned()
-            .collect();
         serde_json::to_string(&OverlayControlMessage::Snapshot {
             protocol_version: PROTOCOL_VERSION,
             rev: self.revision,
             fade_after_ms: None,
-            strokes,
             items: self.items.clone(),
         })
         .ok()
+    }
+
+    fn replace_items(&mut self, items: Vec<CanvasItem>) -> Option<String> {
+        self.total_points = items.iter().map(CanvasItem::point_count).sum();
+        self.items = items;
+        self.trim();
+        self.revision = self.revision.saturating_add(1);
+        self.snapshot()
     }
 
     fn trim(&mut self) -> bool {
@@ -588,14 +651,31 @@ impl HubState {
     }
 }
 
-async fn run_hub(mut commands: mpsc::UnboundedReceiver<HubCommand>) {
+async fn run_hub(mut commands: mpsc::Receiver<HubCommand>, recovery: Arc<HubRecovery>) {
     let mut state = HubState::default();
     let mut subscribers: Vec<Subscriber> = Vec::new();
     let mut next_subscriber_id = 1_u64;
+    let mut generation = 0_u64;
 
     while let Some(command) = commands.recv().await {
+        let pending_recovery = recovery.snapshot.lock().unwrap().take();
+        if let Some((recovery_generation, items)) = pending_recovery {
+            if recovery_generation >= generation {
+                generation = recovery_generation;
+                if let Some(snapshot) = state.replace_items(items) {
+                    subscribers
+                        .retain(|subscriber| subscriber.tx.try_send(snapshot.clone()).is_ok());
+                }
+            }
+        }
         match command {
-            HubCommand::Apply(message) => {
+            HubCommand::Apply {
+                generation: message_generation,
+                message,
+            } => {
+                if message_generation != generation {
+                    continue;
+                }
                 let Some(text) = state.apply(message) else {
                     continue;
                 };
@@ -685,9 +765,19 @@ mod tests {
     }
 
     fn test_hub() -> HubHandle {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_hub(rx));
+        let (tx, rx) = mpsc::channel(HUB_INPUT_QUEUE_CAPACITY);
+        tokio::spawn(run_hub(rx, Arc::new(HubRecovery::default())));
         HubHandle { tx }
+    }
+
+    async fn apply(hub: &HubHandle, message: PainterMessage) {
+        hub.tx
+            .send(HubCommand::Apply {
+                generation: 0,
+                message,
+            })
+            .await
+            .unwrap();
     }
 
     fn available_port() -> u16 {
@@ -701,41 +791,46 @@ mod tests {
     #[tokio::test]
     async fn new_subscriber_receives_current_snapshot() {
         let hub = test_hub();
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::StrokeBegin {
+        apply(
+            &hub,
+            PainterMessage::StrokeBegin {
                 stroke_id: "s1".into(),
                 brush: brush(),
-            }))
-            .unwrap();
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::StrokePoints {
+            },
+        )
+        .await;
+        apply(
+            &hub,
+            PainterMessage::StrokePoints {
                 stroke_id: "s1".into(),
                 pts: vec![(0.1, 0.2, 0.5, 0.0)],
-            }))
-            .unwrap();
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::StrokeEnd {
+            },
+        )
+        .await;
+        apply(
+            &hub,
+            PainterMessage::StrokeEnd {
                 stroke_id: "s1".into(),
                 ended_at: 1234.0,
-            }))
-            .unwrap();
+            },
+        )
+        .await;
 
         let (_, mut receiver) = hub.subscribe().await.unwrap();
         let snapshot = receiver.recv().await.unwrap();
+        assert!(!snapshot.contains("\"strokes\""));
         let message: OverlayControlMessage = serde_json::from_str(&snapshot).unwrap();
         match message {
-            OverlayControlMessage::Snapshot {
-                rev,
-                strokes,
-                items,
-                ..
-            } => {
+            OverlayControlMessage::Snapshot { rev, items, .. } => {
                 assert_eq!(rev, 3);
-                assert_eq!(strokes.len(), 1);
-                assert!(strokes[0].done);
-                assert_eq!(strokes[0].ended_at, Some(1234.0));
                 assert_eq!(items.len(), 1);
-                assert!(matches!(items[0], CanvasItem::Stroke { .. }));
+                match &items[0] {
+                    CanvasItem::Stroke { stroke } => {
+                        assert!(stroke.done);
+                        assert_eq!(stroke.ended_at, Some(1234.0));
+                    }
+                    _ => panic!("expected stroke"),
+                }
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
@@ -748,18 +843,68 @@ mod tests {
         let initial = receiver.recv().await.unwrap();
         assert!(initial.contains("\"type\":\"snapshot\""));
 
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::StrokeBegin {
+        apply(
+            &hub,
+            PainterMessage::StrokeBegin {
                 stroke_id: "s1".into(),
                 brush: brush(),
-            }))
-            .unwrap();
+            },
+        )
+        .await;
         let event = receiver.recv().await.unwrap();
         assert!(event.contains("\"type\":\"stroke_begin\""));
+        assert!(event.contains("\"rev\":1"));
     }
 
     #[tokio::test]
-    async fn hub_preserves_shape_and_stamp_order_in_v2_snapshot() {
+    async fn full_input_queue_recovers_from_the_shared_canvas_snapshot() {
+        let source_items = Arc::new(Mutex::new(vec![CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: "latest".into(),
+                stamp_id: "stamp-1".into(),
+                center: (0.5, 0.5),
+                width_n: 0.1,
+                height_n: 0.2,
+                opacity: 1.0,
+                done: true,
+                ended_at: Some(10.0),
+            },
+        }]));
+        let recovery = Arc::new(HubRecovery::default());
+        let (tx, rx) = mpsc::channel(1);
+        let hub = HubHandle { tx };
+        let server = LocalServerHandle {
+            hub: hub.clone(),
+            source_items,
+            recovery: Arc::clone(&recovery),
+            shutdown: None,
+            thread: None,
+            overlay_url: String::new(),
+            licenses_url: String::new(),
+        };
+
+        // 1件目で容量を使い切り、2件目は完全状態による復旧へ切り替わる。
+        server.send_all(vec![PainterMessage::StrokeBegin {
+            stroke_id: "stale".into(),
+            brush: brush(),
+        }]);
+        server.send_all(vec![PainterMessage::Clear {}]);
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
+
+        tokio::spawn(run_hub(rx, recovery));
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        let snapshot = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
+            OverlayControlMessage::Snapshot { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].item_id(), "latest");
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_preserves_shape_and_stamp_order_in_v4_snapshot() {
         let hub = test_hub();
         let shape = ShapeItem {
             item_id: "shape-1".into(),
@@ -774,23 +919,26 @@ mod tests {
             done: false,
             ended_at: None,
         };
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::ShapeBegin { shape }))
-            .unwrap();
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::ShapeUpdate {
+        apply(&hub, PainterMessage::ShapeBegin { shape }).await;
+        apply(
+            &hub,
+            PainterMessage::ShapeUpdate {
                 item_id: "shape-1".into(),
                 end: (0.8, 0.7),
-            }))
-            .unwrap();
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::ShapeEnd {
+            },
+        )
+        .await;
+        apply(
+            &hub,
+            PainterMessage::ShapeEnd {
                 item_id: "shape-1".into(),
                 ended_at: 10.0,
-            }))
-            .unwrap();
-        hub.tx
-            .send(HubCommand::Apply(PainterMessage::StampAdd {
+            },
+        )
+        .await;
+        apply(
+            &hub,
+            PainterMessage::StampAdd {
                 stamp: StampItem {
                     item_id: "stamp-item-1".into(),
                     stamp_id: "stamp-1".into(),
@@ -801,22 +949,50 @@ mod tests {
                     done: true,
                     ended_at: Some(20.0),
                 },
-            }))
-            .unwrap();
+            },
+        )
+        .await;
 
         let (_, mut receiver) = hub.subscribe().await.unwrap();
         let snapshot = receiver.recv().await.unwrap();
         match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
             OverlayControlMessage::Snapshot {
                 protocol_version,
-                strokes,
                 items,
                 ..
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
-                assert!(strokes.is_empty());
                 assert!(matches!(items[0], CanvasItem::Shape { .. }));
                 assert!(matches!(items[1], CanvasItem::Stamp { .. }));
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_restores_a_redone_item() {
+        let hub = test_hub();
+        let item = CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: "stamp-item-1".into(),
+                stamp_id: "stamp-1".into(),
+                center: (0.5, 0.5),
+                width_n: 0.1,
+                height_n: 0.2,
+                opacity: 1.0,
+                done: true,
+                ended_at: Some(20.0),
+            },
+        };
+        apply(&hub, PainterMessage::Redo { item }).await;
+
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        let snapshot = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
+            OverlayControlMessage::Snapshot { rev, items, .. } => {
+                assert_eq!(rev, 1);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].item_id(), "stamp-item-1");
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
@@ -886,7 +1062,8 @@ mod tests {
     #[tokio::test]
     async fn running_server_streams_events_and_rejects_foreign_origins() {
         let port = available_port();
-        let server = spawn(port, &[]).unwrap();
+        let source_items = Arc::new(Mutex::new(Vec::new()));
+        let server = spawn(port, &[], Arc::clone(&source_items)).unwrap();
         let url = format!("ws://127.0.0.1:{port}/ws");
 
         let mut http = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -939,10 +1116,20 @@ mod tests {
             .unwrap()
             .contains("\"type\":\"snapshot\""));
 
-        server.send(PainterMessage::StrokeBegin {
+        let begin = PainterMessage::StrokeBegin {
             stroke_id: "integration".into(),
             brush: brush(),
+        };
+        source_items.lock().unwrap().push(CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: "integration".into(),
+                brush: brush(),
+                pts: Vec::new(),
+                done: false,
+                ended_at: None,
+            },
         });
+        server.send_all(vec![begin]);
         let event = socket.next().await.unwrap().unwrap();
         assert!(event
             .into_text()

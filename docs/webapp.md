@@ -10,9 +10,11 @@
 - `baked`: 確定したストローク・図形・スタンプを描画順に焼き込む下層
 - `active`: 描画中ストロークと図形プレビューを表示する上層
 
-WebSocketイベントはいったんqueueへ積み、`requestAnimationFrame`ごとにまとめて描画します。
-Reactはマウントと接続ライフサイクルにだけ使い、ストローク受信ごとのReact renderは
-行いません。
+WebSocketイベントはいったん上限128件のqueueへ積み、`requestAnimationFrame`ごとにまとめて
+描画します。同じストロークの連続更新と図形previewは最新1件へ集約し、上限を超える場合は
+最新CanvasItem状態からの1回の再構築へ置換します。このため、OBSが非表示のBrowser Sourceの
+フレーム更新を抑制しても、描画待ちqueueは無制限に増えません。Reactはマウントと接続
+ライフサイクルにだけ使い、ストローク受信ごとのReact renderは行いません。
 
 ペンとマーカーはストロークごとのscratch canvasへ不透明に描画してからopacity付きで合成し、
 線の重なり部分だけが濃くなることを防ぎます。消しゴムは`destination-out`でbaked層へ作用します。

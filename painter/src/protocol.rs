@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub type Point = (f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
@@ -129,13 +129,6 @@ impl CanvasItem {
             Self::Shape { .. } | Self::Stamp { .. } => 0,
         }
     }
-
-    pub fn as_stroke(&self) -> Option<&Stroke> {
-        match self {
-            Self::Stroke { stroke } => Some(stroke),
-            Self::Shape { .. } | Self::Stamp { .. } => None,
-        }
-    }
 }
 
 /// Win32 入力層 → ローカル WebSocket ハブ → OBS overlay。
@@ -184,7 +177,19 @@ pub enum PainterMessage {
         stamp: StampItem,
     },
     Undo {},
+    Redo {
+        item: CanvasItem,
+    },
     Clear {},
+}
+
+/// ハブが確定したrevisionを内部描画イベントへ付与した、overlay向け増分イベント。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayEvent<'a> {
+    pub rev: u64,
+    #[serde(flatten)]
+    pub event: &'a PainterMessage,
 }
 
 /// ローカルハブ → OBS overlay の接続管理メッセージ。
@@ -193,15 +198,10 @@ pub enum PainterMessage {
 pub enum OverlayControlMessage {
     #[serde(rename_all = "camelCase")]
     Snapshot {
-        #[serde(default = "protocol_version")]
         protocol_version: u32,
         rev: u64,
         fade_after_ms: Option<f64>,
-        /// v1 クライアント用。items 内のストロークだけを複製する。
-        #[serde(default)]
-        strokes: Vec<Stroke>,
-        /// v2 クライアント用の完全な描画履歴。
-        #[serde(default)]
+        /// 描画順を保つ完全な描画履歴。
         items: Vec<CanvasItem>,
     },
     Pong {
@@ -218,10 +218,6 @@ pub enum OverlayClientMessage {
     },
     #[serde(other)]
     Unknown,
-}
-
-fn protocol_version() -> u32 {
-    PROTOCOL_VERSION
 }
 
 #[cfg(test)]
@@ -300,25 +296,45 @@ mod tests {
     #[test]
     fn overlay_message_roundtrips_snapshot() {
         let msg: OverlayControlMessage = serde_json::from_str(
-            r##"{"type":"snapshot","rev":3,"fadeAfterMs":null,"strokes":[{"strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
+            r##"{"type":"snapshot","protocolVersion":4,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
         )
         .unwrap();
         match msg {
             OverlayControlMessage::Snapshot {
                 protocol_version,
                 rev,
-                strokes,
                 items,
                 ..
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(rev, 3);
-                assert_eq!(strokes.len(), 1);
-                assert_eq!(strokes[0].stroke_id, "s1");
-                assert!(items.is_empty());
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].item_id(), "s1");
             }
             OverlayControlMessage::Pong { .. } => panic!("unexpected pong"),
         }
+    }
+
+    #[test]
+    fn overlay_event_flattens_revision_into_the_paint_event() {
+        let message = PainterMessage::StrokeEnd {
+            stroke_id: "s1".into(),
+            ended_at: 1234.0,
+        };
+        let json = serde_json::to_value(OverlayEvent {
+            rev: 7,
+            event: &message,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "stroke_end",
+                "strokeId": "s1",
+                "endedAt": 1234.0,
+                "rev": 7,
+            })
+        );
     }
 
     #[test]

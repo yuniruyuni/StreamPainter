@@ -1096,7 +1096,13 @@ fn add_stamp(hwnd: HWND, state: &mut SettingsState) -> Result<()> {
         return refresh_stamp_list(hwnd, state, selected);
     };
     let (stamp, path) = config::import_stamp(&source)?;
-    state.stamps.push(stamp);
+    let mut updated_stamps = state.stamps.clone();
+    updated_stamps.push(stamp);
+    if let Err(error) = config::validate_stamp_catalog(&updated_stamps) {
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
+    state.stamps = updated_stamps;
     state.new_stamp_files.push(path);
     let selected = state.stamps.len() - 1;
     refresh_stamp_list(hwnd, state, Some(selected))

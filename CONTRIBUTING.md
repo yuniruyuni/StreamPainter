@@ -12,6 +12,7 @@ StreamPainterは、Windows上で動作するローカル完結型アプリケー
 ## 開発と検証
 
 リポジトリ直下で次を実行します。
+Rustはルートの`rust-toolchain.toml`で1.94.1、Bunは`package.json`で1.3.12に固定しています。
 
 ```bash
 bun install --frozen-lockfile
@@ -36,6 +37,20 @@ cargo build --release --locked
 依存関係を検査してexeへ埋め込むライセンスページを生成します。これらの生成物はGit管理しない
 ため、変更へ含めないでください。CIもクリーンなcheckoutから同じ生成を行ってからRustを検証・
 ビルドします。
+
+`bun.lock`と`painter/Cargo.lock`は、Pull Request時に`bun audit`とRustSecの`cargo audit`で
+検査します。同じ監査は既知の脆弱性データ更新を拾うため毎週自動実行します。
+
+## リリース（メンテナー向け）
+
+1. `painter/Cargo.toml`のバージョンと`CHANGELOG.md`を更新してmainへ反映する。
+2. 同じバージョンの`vX.Y.Z`タグを作成し、originへpushする。
+3. Release workflowが全検証、Windows release build、SHA-256生成、GitHub Release公開を
+   完了したことを確認する。
+
+タグとCargoのバージョンが一致しない場合、または検証・asset uploadのいずれかが失敗した
+場合はReleaseを公開しません。公開後の同じタグ・assetの上書きは行わず、新しい修正版として
+バージョンを上げてください。Windowsコード署名は現在のフローには含まれません。
 
 ## ライセンス
 
