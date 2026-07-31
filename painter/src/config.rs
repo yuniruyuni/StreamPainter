@@ -1,11 +1,18 @@
 //! 設定ファイル。%APPDATA%/StreamPainter/config/config.toml
 
-use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::fs::File;
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use tracing::info;
+use tracing::warn;
 
 pub const MAX_STAMPS: usize = 32;
 pub const MAX_STAMP_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -183,6 +190,161 @@ fn stamps_dir_from_config_path(config_path: &Path) -> Result<PathBuf> {
     Ok(app_dir.join("stamps"))
 }
 
+fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("failed to resolve configuration file name"))?;
+    let mut suffixed = file_name.to_os_string();
+    suffixed.push(suffix);
+    Ok(path.with_file_name(suffixed))
+}
+
+fn backup_path(path: &Path) -> Result<PathBuf> {
+    sibling_with_suffix(path, ".bak")
+}
+
+fn read_validated_config(path: &Path) -> Result<Config> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let config: Config =
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("invalid configuration in {}", path.display()))?;
+    Ok(config)
+}
+
+fn load_config_file(path: &Path) -> Result<Config> {
+    match read_validated_config(path) {
+        Ok(config) => Ok(config),
+        Err(primary_error) => {
+            let backup = backup_path(path)?;
+            if !backup.exists() {
+                return Err(primary_error);
+            }
+            warn!(
+                "failed to load {}; trying backup {}: {primary_error:#}",
+                path.display(),
+                backup.display()
+            );
+            read_validated_config(&backup).with_context(|| {
+                format!(
+                    "failed to load both {} and its backup; primary error: {primary_error:#}",
+                    path.display()
+                )
+            })
+        }
+    }
+}
+
+fn write_synced(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_config_file(temporary: &Path, destination: &Path, backup: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{
+            MoveFileExW, ReplaceFileW, MOVEFILE_WRITE_THROUGH, REPLACEFILE_WRITE_THROUGH,
+        },
+    };
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let temporary_wide = wide(temporary);
+    let destination_wide = wide(destination);
+
+    if destination.exists() {
+        // ReplaceFileW は既存 backup を上書きしないため、置換前に古い世代だけを除く。
+        if backup.exists() {
+            std::fs::remove_file(backup)
+                .with_context(|| format!("failed to replace {}", backup.display()))?;
+        }
+        let backup_wide = wide(backup);
+        unsafe {
+            ReplaceFileW(
+                PCWSTR(destination_wide.as_ptr()),
+                PCWSTR(temporary_wide.as_ptr()),
+                PCWSTR(backup_wide.as_ptr()),
+                REPLACEFILE_WRITE_THROUGH,
+                None,
+                None,
+            )
+        }
+        .with_context(|| format!("failed to atomically replace {}", destination.display()))?;
+    } else {
+        unsafe {
+            MoveFileExW(
+                PCWSTR(temporary_wide.as_ptr()),
+                PCWSTR(destination_wide.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .with_context(|| format!("failed to atomically create {}", destination.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(temporary: &Path, destination: &Path, backup: &Path) -> Result<()> {
+    if destination.exists() {
+        let backup_temporary =
+            sibling_with_suffix(backup, &format!(".{}.tmp", uuid::Uuid::now_v7()))?;
+        std::fs::copy(destination, &backup_temporary).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                destination.display(),
+                backup_temporary.display()
+            )
+        })?;
+        File::open(&backup_temporary)
+            .and_then(|file| file.sync_all())
+            .with_context(|| format!("failed to flush {}", backup_temporary.display()))?;
+        std::fs::rename(&backup_temporary, backup)
+            .with_context(|| format!("failed to replace {}", backup.display()))?;
+    }
+    std::fs::rename(temporary, destination)
+        .with_context(|| format!("failed to atomically replace {}", destination.display()))?;
+    if let Some(parent) = destination.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("failed to flush {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("failed to resolve configuration directory"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let temporary = sibling_with_suffix(path, &format!(".{}.tmp", uuid::Uuid::now_v7()))?;
+    write_synced(&temporary, contents)?;
+    let backup = backup_path(path)?;
+    let result = replace_config_file(&temporary, path, &backup);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(windows)]
 pub fn config_path() -> Result<PathBuf> {
     use known_folders::{get_known_folder_path, KnownFolder};
@@ -337,13 +499,13 @@ pub fn load() -> Result<Config> {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::copy(&legacy_path, &path).with_context(|| {
+                let legacy = std::fs::read(&legacy_path).with_context(|| {
                     format!(
-                        "failed to migrate {} to {}",
-                        legacy_path.display(),
-                        path.display()
+                        "failed to read legacy configuration {}",
+                        legacy_path.display()
                     )
                 })?;
+                write_atomically(&path, &legacy)?;
                 info!(
                     "migrated legacy config from {} to {}",
                     legacy_path.display(),
@@ -353,34 +515,20 @@ pub fn load() -> Result<Config> {
         }
     }
     if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, TEMPLATE)?;
+        write_atomically(&path, TEMPLATE.as_bytes())?;
         return Ok(Config::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let config: Config =
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-    config
-        .validate()
-        .with_context(|| format!("invalid configuration in {}", path.display()))?;
-    Ok(config)
+    load_config_file(&path)
 }
 
 /// 検証済みの設定を保存する。設定画面からの書き込み経路はここに集約する。
 pub fn save(config: &Config) -> Result<()> {
     config.validate()?;
     let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
     let body = toml::to_string_pretty(config).context("failed to serialize configuration")?;
     let text =
         format!("# StreamPainter 設定 — 通常はタスクトレイの「設定...」から編集します。\n{body}");
-    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    write_atomically(&path, text.as_bytes())?;
     Ok(())
 }
 
@@ -685,5 +833,49 @@ local_server_port = 18080
             ..Config::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn atomic_write_keeps_the_previous_file_as_backup() {
+        let directory =
+            std::env::temp_dir().join(format!("stream-painter-config-{}", uuid::Uuid::now_v7()));
+        let path = directory.join("config.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&path, b"previous").unwrap();
+
+        write_atomically(&path, b"current").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"current");
+        assert_eq!(
+            std::fs::read(backup_path(&path).unwrap()).unwrap(),
+            b"previous"
+        );
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_primary_configuration_falls_back_to_backup() {
+        let directory =
+            std::env::temp_dir().join(format!("stream-painter-config-{}", uuid::Uuid::now_v7()));
+        let path = directory.join("config.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&path, "this is not toml").unwrap();
+        let expected = Config {
+            local_server_port: 18_080,
+            ..Config::default()
+        };
+        std::fs::write(
+            backup_path(&path).unwrap(),
+            toml::to_string_pretty(&expected).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(load_config_file(&path).unwrap(), expected);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
