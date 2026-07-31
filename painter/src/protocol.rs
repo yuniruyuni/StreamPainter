@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 pub type Point = (f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const MAX_STROKES: usize = 500;
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
 pub const MAX_POINTS_PER_MESSAGE: usize = 512;
@@ -41,6 +42,102 @@ pub struct Stroke {
     pub ended_at: Option<f64>,
 }
 
+/// キャンバス内の正規化座標 [u, v]。
+pub type Position = (f64, f64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeKind {
+    Line,
+    Arrow,
+    Rectangle,
+    Ellipse,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineStyle {
+    pub color: String,
+    pub opacity: f64,
+    pub width_n: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShapeItem {
+    pub item_id: String,
+    pub shape: ShapeKind,
+    pub style: LineStyle,
+    pub start: Position,
+    pub end: Position,
+    pub done: bool,
+    pub ended_at: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StampItem {
+    pub item_id: String,
+    pub stamp_id: String,
+    pub center: Position,
+    /// キャンバス幅・高さに対する正規化表示サイズ。
+    pub width_n: f64,
+    pub height_n: f64,
+    pub opacity: f64,
+    pub done: bool,
+    pub ended_at: Option<f64>,
+}
+
+/// 描画順を保つ単一の履歴。v1 の Stroke は互換 snapshot 用にも残す。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CanvasItem {
+    Stroke {
+        #[serde(flatten)]
+        stroke: Stroke,
+    },
+    Shape {
+        #[serde(flatten)]
+        shape: ShapeItem,
+    },
+    Stamp {
+        #[serde(flatten)]
+        stamp: StampItem,
+    },
+}
+
+impl CanvasItem {
+    pub fn item_id(&self) -> &str {
+        match self {
+            Self::Stroke { stroke } => &stroke.stroke_id,
+            Self::Shape { shape } => &shape.item_id,
+            Self::Stamp { stamp } => &stamp.item_id,
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        match self {
+            Self::Stroke { stroke } => stroke.done,
+            Self::Shape { shape } => shape.done,
+            Self::Stamp { stamp } => stamp.done,
+        }
+    }
+
+    pub fn point_count(&self) -> usize {
+        match self {
+            Self::Stroke { stroke } => stroke.pts.len(),
+            Self::Shape { .. } | Self::Stamp { .. } => 0,
+        }
+    }
+
+    pub fn as_stroke(&self) -> Option<&Stroke> {
+        match self {
+            Self::Stroke { stroke } => Some(stroke),
+            Self::Shape { .. } | Self::Stamp { .. } => None,
+        }
+    }
+}
+
 /// Win32 入力層 → ローカル WebSocket ハブ → OBS overlay。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -64,6 +161,28 @@ pub enum PainterMessage {
     StrokeCancel {
         stroke_id: String,
     },
+    #[serde(rename_all = "camelCase")]
+    ShapeBegin {
+        shape: ShapeItem,
+    },
+    #[serde(rename_all = "camelCase")]
+    ShapeUpdate {
+        item_id: String,
+        end: Position,
+    },
+    #[serde(rename_all = "camelCase")]
+    ShapeEnd {
+        item_id: String,
+        ended_at: f64,
+    },
+    #[serde(rename_all = "camelCase")]
+    ShapeCancel {
+        item_id: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    StampAdd {
+        stamp: StampItem,
+    },
     Undo {},
     Clear {},
 }
@@ -74,9 +193,16 @@ pub enum PainterMessage {
 pub enum OverlayControlMessage {
     #[serde(rename_all = "camelCase")]
     Snapshot {
+        #[serde(default = "protocol_version")]
+        protocol_version: u32,
         rev: u64,
         fade_after_ms: Option<f64>,
+        /// v1 クライアント用。items 内のストロークだけを複製する。
+        #[serde(default)]
         strokes: Vec<Stroke>,
+        /// v2 クライアント用の完全な描画履歴。
+        #[serde(default)]
+        items: Vec<CanvasItem>,
     },
     Pong {
         t: f64,
@@ -92,6 +218,10 @@ pub enum OverlayClientMessage {
     },
     #[serde(other)]
     Unknown,
+}
+
+fn protocol_version() -> u32 {
+    PROTOCOL_VERSION
 }
 
 #[cfg(test)]
@@ -174,13 +304,46 @@ mod tests {
         )
         .unwrap();
         match msg {
-            OverlayControlMessage::Snapshot { rev, strokes, .. } => {
+            OverlayControlMessage::Snapshot {
+                protocol_version,
+                rev,
+                strokes,
+                items,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(rev, 3);
                 assert_eq!(strokes.len(), 1);
                 assert_eq!(strokes[0].stroke_id, "s1");
+                assert!(items.is_empty());
             }
             OverlayControlMessage::Pong { .. } => panic!("unexpected pong"),
         }
+    }
+
+    #[test]
+    fn canvas_items_are_internally_tagged_and_flattened() {
+        let item = CanvasItem::Shape {
+            shape: ShapeItem {
+                item_id: "shape-1".into(),
+                shape: ShapeKind::Arrow,
+                style: LineStyle {
+                    color: "#ffffff".into(),
+                    opacity: 0.8,
+                    width_n: 0.01,
+                },
+                start: (0.1, 0.2),
+                end: (0.8, 0.7),
+                done: true,
+                ended_at: Some(42.0),
+            },
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["kind"], "shape");
+        assert_eq!(json["itemId"], "shape-1");
+        assert_eq!(json["shape"], "arrow");
+        assert!(json.get("shape_item").is_none());
+        assert_eq!(serde_json::from_value::<CanvasItem>(json).unwrap(), item);
     }
 
     #[test]

@@ -7,8 +7,8 @@
 
 ページは2枚のCanvas 2Dを画面全体に重ねます。
 
-- `baked`: 確定ストロークを焼き込む下層
-- `active`: 描画中ストロークを表示する上層
+- `baked`: 確定したストローク・図形・スタンプを描画順に焼き込む下層
+- `active`: 描画中ストロークと図形プレビューを表示する上層
 
 WebSocketイベントはいったんqueueへ積み、`requestAnimationFrame`ごとにまとめて描画します。
 Reactはマウントと接続ライフサイクルにだけ使い、ストローク受信ごとのReact renderは
@@ -16,6 +16,8 @@ Reactはマウントと接続ライフサイクルにだけ使い、ストロー
 
 ペンとマーカーはストロークごとのscratch canvasへ不透明に描画してからopacity付きで合成し、
 線の重なり部分だけが濃くなることを防ぎます。消しゴムは`destination-out`でbaked層へ作用します。
+直線・矢印・四角形・楕円はCanvas 2D primitivesで描き、スタンプPNGは同一originから遅延取得
+して画像キャッシュへ保持します。画像のロード完了時は現在のCanvasItem履歴を再構築します。
 
 ## Reconnect
 

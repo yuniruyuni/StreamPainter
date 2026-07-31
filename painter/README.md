@@ -30,6 +30,7 @@ http://127.0.0.1:16873/overlay
 
 保存先の `%APPDATA%\StreamPainter\config\config.toml` は自動管理されるため、直接編集する必要は
 ありません。通常起動できない場合は `stream-painter.exe --settings` で設定画面だけを開けます。
+ユーザー登録のPNGスタンプは同じ画面で管理し、`%APPDATA%\StreamPainter\stamps`へコピーされます。
 
 設定項目の詳細は [../docs/painter.md](../docs/painter.md) を参照してください。
 

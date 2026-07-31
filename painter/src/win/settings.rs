@@ -4,10 +4,12 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::c_void;
+use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use anyhow::{anyhow, Context, Result};
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
@@ -16,6 +18,10 @@ use windows::Win32::Graphics::Gdi::{
     COLOR_WINDOW, DEFAULT_CHARSET, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::Dialogs::{
+    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -27,13 +33,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
     CBS_HASSTRINGS, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EN_CHANGE, ES_AUTOHSCROLL, ES_NUMBER,
-    ES_PASSWORD, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_OK, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_NCDESTROY,
-    WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT,
-    WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    ES_PASSWORD, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT,
+    LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_NCDESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, StampConfig, MAX_STAMPS};
 use crate::win::monitor::{self, Monitor};
 
 const CLASS_NAME: PCWSTR = w!("stream-painter-settings");
@@ -53,16 +61,31 @@ const ID_PROJECTOR_VIEW: i32 = 109;
 const ID_CLOSE_PROJECTOR: i32 = 110;
 const ID_BRUSH_COLOR: i32 = 111;
 const ID_BRUSH_WIDTH: i32 = 112;
+const ID_STAMP_LIST: i32 = 113;
+const ID_STAMP_ADD: i32 = 114;
+const ID_STAMP_REMOVE: i32 = 115;
+const ID_STAMP_NAME: i32 = 116;
+const ID_STAMP_SIZE: i32 = 117;
+const ID_STAMP_OPACITY: i32 = 118;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct SettingsState {
     monitors: Vec<Monitor>,
     font: Option<HFONT>,
+    stamps: Vec<StampConfig>,
+    selected_stamp: Option<usize>,
+    new_stamp_files: Vec<PathBuf>,
+    saved: bool,
 }
 
 impl Drop for SettingsState {
     fn drop(&mut self) {
+        if !self.saved {
+            for path in self.new_stamp_files.drain(..) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         if let Some(font) = self.font.take() {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(font.0));
@@ -152,7 +175,7 @@ pub fn open(owner: HWND) -> Result<()> {
 
         let dpi = GetDpiForWindow(owner).max(96);
         let window_width = scale(680, dpi);
-        let window_height = scale(625, dpi);
+        let window_height = scale(820, dpi);
         let mut owner_rect = RECT::default();
         let (x, y) = if GetWindowRect(owner, &mut owner_rect).is_ok() {
             (
@@ -183,6 +206,10 @@ pub fn open(owner: HWND) -> Result<()> {
         let state = Box::new(SettingsState {
             monitors,
             font: None,
+            stamps: config.stamps.clone(),
+            selected_stamp: None,
+            new_stamp_files: Vec::new(),
+            saved: false,
         });
         let state_ptr = Box::into_raw(state);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -515,12 +542,108 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         create_label(
             hwnd,
             font,
+            &format!("登録スタンプ（最大 {MAX_STAMPS} 個、PNGのみ）"),
+            label_x,
+            s(468),
+            s(280),
+            row_height,
+        )?;
+        create_listbox(hwnd, font, ID_STAMP_LIST, label_x, s(494), s(285), s(132))?;
+        create_button(
+            hwnd,
+            font,
+            ID_STAMP_ADD,
+            "PNGを追加...",
+            label_x,
+            s(634),
+            s(130),
+            s(30),
+            false,
+        )?;
+        create_button(
+            hwnd,
+            font,
+            ID_STAMP_REMOVE,
+            "選択を削除",
+            s(160),
+            s(634),
+            s(130),
+            s(30),
+            false,
+        )?;
+
+        create_label(hwnd, font, "スタンプ名", s(330), s(494), s(130), row_height)?;
+        create_edit(
+            hwnd,
+            font,
+            ID_STAMP_NAME,
+            "",
+            s(330),
+            s(518),
+            s(310),
+            row_height,
+            ES_AUTOHSCROLL,
+        )?;
+        create_label(
+            hwnd,
+            font,
+            "表示サイズ（キャンバス高の%）",
+            s(330),
+            s(554),
+            s(220),
+            row_height,
+        )?;
+        create_edit(
+            hwnd,
+            font,
+            ID_STAMP_SIZE,
+            "",
+            s(550),
+            s(551),
+            s(90),
+            row_height,
+            ES_AUTOHSCROLL | ES_NUMBER,
+        )?;
+        create_label(
+            hwnd,
+            font,
+            "不透明度（%）",
+            s(330),
+            s(590),
+            s(150),
+            row_height,
+        )?;
+        create_edit(
+            hwnd,
+            font,
+            ID_STAMP_OPACITY,
+            "",
+            s(550),
+            s(587),
+            s(90),
+            row_height,
+            ES_AUTOHSCROLL | ES_NUMBER,
+        )?;
+        create_label(
+            hwnd,
+            font,
+            "右クリックメニューの「スタンプ」から選び、クリック位置へ配置します。",
+            s(330),
+            s(626),
+            s(310),
+            s(40),
+        )?;
+        refresh_stamp_list(hwnd, state, (!state.stamps.is_empty()).then_some(0))?;
+
+        create_label(
+            hwnd,
+            font,
             concat!(
                 "保存した設定は StreamPainter の再起動後に反映されます。\n",
                 "ポートを変えた場合は、OBS Browser Source のURLも上記URLへ変更してください。"
             ),
             label_x,
-            s(478),
+            s(688),
             s(620),
             s(48),
         )?;
@@ -531,7 +654,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_SAVE,
             "保存",
             s(430),
-            s(548),
+            s(748),
             s(100),
             s(32),
             true,
@@ -542,7 +665,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_CANCEL,
             "キャンセル",
             s(540),
-            s(548),
+            s(748),
             s(100),
             s(32),
             false,
@@ -678,6 +801,36 @@ unsafe fn create_combo(
     }
 }
 
+unsafe fn create_listbox(
+    parent: HWND,
+    font: HFONT,
+    id: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<HWND> {
+    unsafe {
+        create_control(
+            parent,
+            font,
+            w!("LISTBOX"),
+            "",
+            Some(id),
+            WS_EX_CLIENTEDGE,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_VSCROLL
+                | WINDOW_STYLE((LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32),
+            x,
+            y,
+            width,
+            height,
+        )
+    }
+}
+
 unsafe fn create_checkbox(
     parent: HWND,
     font: HFONT,
@@ -792,13 +945,206 @@ fn selected(hwnd: HWND, id: i32) -> Result<usize> {
     Ok(selected as usize)
 }
 
-fn read_config(hwnd: HWND, monitor_count: usize) -> Result<Config> {
+fn set_control_text(hwnd: HWND, id: i32, text: &str) -> Result<()> {
+    let control = control(hwnd, id)?;
+    unsafe {
+        SetWindowTextW(control, &HSTRING::from(text))
+            .with_context(|| format!("設定項目 {id} を更新できません"))?;
+    }
+    Ok(())
+}
+
+fn selected_stamp_index(hwnd: HWND) -> Result<Option<usize>> {
+    let list = control(hwnd, ID_STAMP_LIST)?;
+    let selected = unsafe { SendMessageW(list, LB_GETCURSEL, None, None) }.0;
+    Ok((selected >= 0).then_some(selected as usize))
+}
+
+fn refresh_stamp_list(
+    hwnd: HWND,
+    state: &mut SettingsState,
+    selected: Option<usize>,
+) -> Result<()> {
+    let list = control(hwnd, ID_STAMP_LIST)?;
+    unsafe {
+        SendMessageW(list, LB_RESETCONTENT, None, None);
+    }
+    for stamp in &state.stamps {
+        let label = HSTRING::from(format!(
+            "{}  ({}×{})",
+            stamp.name, stamp.width_px, stamp.height_px
+        ));
+        unsafe {
+            SendMessageW(
+                list,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(label.as_ptr() as isize)),
+            );
+        }
+    }
+    let selected = selected.filter(|index| *index < state.stamps.len());
+    if let Some(index) = selected {
+        unsafe {
+            SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None);
+        }
+    }
+    state.selected_stamp = selected;
+    load_stamp_editor(hwnd, state)
+}
+
+fn load_stamp_editor(hwnd: HWND, state: &SettingsState) -> Result<()> {
+    if let Some(stamp) = state
+        .selected_stamp
+        .and_then(|index| state.stamps.get(index))
+    {
+        set_control_text(hwnd, ID_STAMP_NAME, &stamp.name)?;
+        set_control_text(
+            hwnd,
+            ID_STAMP_SIZE,
+            &format!("{:.0}", stamp.default_height_n * 100.0),
+        )?;
+        set_control_text(
+            hwnd,
+            ID_STAMP_OPACITY,
+            &format!("{:.0}", stamp.opacity * 100.0),
+        )?;
+    } else {
+        set_control_text(hwnd, ID_STAMP_NAME, "")?;
+        set_control_text(hwnd, ID_STAMP_SIZE, "")?;
+        set_control_text(hwnd, ID_STAMP_OPACITY, "")?;
+    }
+    Ok(())
+}
+
+fn commit_stamp_editor(hwnd: HWND, state: &mut SettingsState) -> Result<()> {
+    let Some(index) = state.selected_stamp else {
+        return Ok(());
+    };
+    let Some(stamp) = state.stamps.get_mut(index) else {
+        state.selected_stamp = None;
+        return Ok(());
+    };
+    let name = control_text(hwnd, ID_STAMP_NAME)?.trim().to_owned();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        anyhow::bail!("スタンプ名は 1〜64 文字で指定してください");
+    }
+    let size_percent = control_text(hwnd, ID_STAMP_SIZE)?
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| anyhow!("スタンプの表示サイズには 1〜100 の数値を指定してください"))?;
+    if !size_percent.is_finite() || !(1.0..=100.0).contains(&size_percent) {
+        anyhow::bail!("スタンプの表示サイズには 1〜100 を指定してください");
+    }
+    let opacity_percent = control_text(hwnd, ID_STAMP_OPACITY)?
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| anyhow!("スタンプの不透明度には 0〜100 の数値を指定してください"))?;
+    if !opacity_percent.is_finite() || !(0.0..=100.0).contains(&opacity_percent) {
+        anyhow::bail!("スタンプの不透明度には 0〜100 を指定してください");
+    }
+    stamp.name = name;
+    stamp.default_height_n = size_percent / 100.0;
+    stamp.opacity = opacity_percent / 100.0;
+    Ok(())
+}
+
+fn choose_png(hwnd: HWND) -> Result<Option<PathBuf>> {
+    let filter: Vec<u16> = "PNG画像 (*.png)\0*.png\0\0".encode_utf16().collect();
+    let title = HSTRING::from("登録するPNGスタンプを選択");
+    let mut filename = vec![0u16; 32_768];
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(filename.as_mut_ptr()),
+        nMaxFile: filename.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        lpstrDefExt: w!("png"),
+        ..Default::default()
+    };
+    if unsafe { GetOpenFileNameW(&mut dialog) }.as_bool() {
+        let length = filename
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(filename.len());
+        return Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(
+            &filename[..length],
+        ))));
+    }
+    let error = unsafe { CommDlgExtendedError() };
+    if error.0 != 0 {
+        anyhow::bail!(
+            "ファイル選択ダイアログでエラーが発生しました: 0x{:x}",
+            error.0
+        );
+    }
+    Ok(None)
+}
+
+fn add_stamp(hwnd: HWND, state: &mut SettingsState) -> Result<()> {
+    commit_stamp_editor(hwnd, state)?;
+    if state.stamps.len() >= MAX_STAMPS {
+        anyhow::bail!("登録できるスタンプは最大 {MAX_STAMPS} 個です");
+    }
+    let Some(source) = choose_png(hwnd)? else {
+        let selected = state.selected_stamp;
+        return refresh_stamp_list(hwnd, state, selected);
+    };
+    let (stamp, path) = config::import_stamp(&source)?;
+    state.stamps.push(stamp);
+    state.new_stamp_files.push(path);
+    let selected = state.stamps.len() - 1;
+    refresh_stamp_list(hwnd, state, Some(selected))
+}
+
+fn remove_stamp(hwnd: HWND, state: &mut SettingsState) -> Result<()> {
+    commit_stamp_editor(hwnd, state)?;
+    let Some(index) = state.selected_stamp else {
+        return Ok(());
+    };
+    if index >= state.stamps.len() {
+        return Ok(());
+    }
+    let removed = state.stamps.remove(index);
+    if let Ok(path) = config::stamp_path(&removed.id) {
+        if let Some(new_index) = state
+            .new_stamp_files
+            .iter()
+            .position(|new_path| new_path == &path)
+        {
+            let _ = std::fs::remove_file(&path);
+            state.new_stamp_files.remove(new_index);
+        }
+    }
+    let next = (!state.stamps.is_empty()).then(|| index.min(state.stamps.len() - 1));
+    refresh_stamp_list(hwnd, state, next)
+}
+
+fn change_stamp_selection(hwnd: HWND, state: &mut SettingsState) -> Result<()> {
+    let newly_selected = selected_stamp_index(hwnd)?;
+    let old_selected = state.selected_stamp;
+    if let Err(error) = commit_stamp_editor(hwnd, state) {
+        if let Some(index) = old_selected {
+            let list = control(hwnd, ID_STAMP_LIST)?;
+            unsafe {
+                SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None);
+            }
+        }
+        return Err(error);
+    }
+    refresh_stamp_list(hwnd, state, newly_selected)
+}
+
+fn read_config(hwnd: HWND, state: &mut SettingsState) -> Result<Config> {
+    commit_stamp_editor(hwnd, state)?;
     let port = control_text(hwnd, ID_PORT)?
         .trim()
         .parse::<u16>()
         .map_err(|_| anyhow!("ローカルサーバーのポートには 1〜65535 を指定してください"))?;
     let screen = selected(hwnd, ID_MONITOR)?;
-    if screen >= monitor_count {
+    if screen >= state.monitors.len() {
         anyhow::bail!("選択したモニターが見つかりません");
     }
     let projector_view = match selected(hwnd, ID_PROJECTOR_VIEW)? {
@@ -827,6 +1173,7 @@ fn read_config(hwnd: HWND, monitor_count: usize) -> Result<Config> {
                 .parse()
                 .map_err(|_| anyhow!("ブラシ幅には数値を指定してください"))?,
         },
+        stamps: state.stamps.clone(),
     };
     config.validate()?;
     Ok(config)
@@ -849,7 +1196,7 @@ fn show_error(hwnd: HWND, error: &anyhow::Error) {
     unsafe {
         MessageBoxW(
             Some(hwnd),
-            &HSTRING::from(format!("設定を保存できません:\n{error:#}")),
+            &HSTRING::from(format!("設定を更新できません:\n{error:#}")),
             w!("StreamPainter 設定"),
             MB_OK | MB_ICONERROR,
         );
@@ -871,15 +1218,53 @@ unsafe extern "system" fn window_proc(
                 update_overlay_url(hwnd);
                 return LRESULT(0);
             }
-            if id == ID_SAVE {
+            if id == ID_STAMP_LIST && notification == LBN_SELCHANGE {
                 let state_ptr =
-                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const SettingsState;
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
                 let result = unsafe {
                     state_ptr
-                        .as_ref()
+                        .as_mut()
                         .ok_or_else(|| anyhow!("設定画面の状態がありません"))
-                        .and_then(|state| read_config(hwnd, state.monitors.len()))
-                        .and_then(|config| config::save(&config))
+                        .and_then(|state| change_stamp_selection(hwnd, state))
+                };
+                if let Err(error) = result {
+                    show_error(hwnd, &error);
+                }
+                return LRESULT(0);
+            }
+            if id == ID_STAMP_ADD || id == ID_STAMP_REMOVE {
+                let state_ptr =
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+                let result = unsafe {
+                    state_ptr
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("設定画面の状態がありません"))
+                        .and_then(|state| {
+                            if id == ID_STAMP_ADD {
+                                add_stamp(hwnd, state)
+                            } else {
+                                remove_stamp(hwnd, state)
+                            }
+                        })
+                };
+                if let Err(error) = result {
+                    show_error(hwnd, &error);
+                }
+                return LRESULT(0);
+            }
+            if id == ID_SAVE {
+                let state_ptr =
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+                let result = unsafe {
+                    state_ptr
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("設定画面の状態がありません"))
+                        .and_then(|state| {
+                            let config = read_config(hwnd, state)?;
+                            config::save(&config)?;
+                            state.saved = true;
+                            Ok(())
+                        })
                 };
                 match result {
                     Ok(()) => unsafe {

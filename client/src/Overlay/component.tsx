@@ -23,7 +23,7 @@ export const OverlayApp: React.FC = () => {
       layers.resize(
         Math.round(window.innerWidth * dpr),
         Math.round(window.innerHeight * dpr),
-        state.strokes,
+        state.items,
       );
     }
     size();
@@ -45,6 +45,7 @@ export const OverlayApp: React.FC = () => {
 
     const conn = connectOverlay(`ws://${location.host}/ws`, (msg) => {
       const effect = state.apply(msg);
+      layers.setItems(state.items);
       switch (effect.kind) {
         case "none":
           return;
@@ -60,8 +61,11 @@ export const OverlayApp: React.FC = () => {
         case "cancel":
           schedule(() => layers.cancelActive(effect.strokeId));
           return;
+        case "preview":
+          schedule(() => layers.renderActive());
+          return;
         case "rebuild":
-          schedule(() => layers.rebuild(state.strokes));
+          schedule(() => layers.rebuild(state.items));
           return;
       }
     });

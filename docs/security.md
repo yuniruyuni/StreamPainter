@@ -18,7 +18,10 @@
 - Originが無いWebSocket upgradeも拒否する
 - HTMLに厳格なContent Security Policyを付ける
 - 第三者ライセンスページはscriptを持たず、外部resourceを読み込まない
-- assetsはexe内に埋め込み、外部script・style・imageへ接続しない
+- Web assetsはexe内に埋め込み、外部script・style・imageへ接続しない
+- スタンプは静止PNGだけを管理ディレクトリへコピーし、生成IDと固定Content-Typeで配信する
+- スタンプに任意URL・任意ファイルパス・SVGを登録できない
+- スタンプの個数、ファイルサイズ、縦横寸法、総ピクセル数を制限する
 - Browser Sourceから受け付けるアプリメッセージは`ping`だけ
 - 受信WebSocket frameは4 KiBに制限する
 - 遅い接続の送信queueを制限し、UIスレッドへのbackpressureを防ぐ

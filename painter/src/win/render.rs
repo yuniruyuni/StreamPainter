@@ -6,7 +6,10 @@
 //!   baked + 描画中ストロークのみを描く (client の layers.ts と同じ構造)
 //! - 幾何は engine::geometry (docs/protocol.md) に従う
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
+use tracing::warn;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -15,11 +18,12 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Factory1, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle1, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_ELLIPSE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER,
-    D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_STROKE_STYLE_PROPERTIES1,
+    ID2D1StrokeStyle1, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_ROUND,
+    D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_QUADRATIC_BEZIER_SEGMENT,
+    D2D1_STROKE_STYLE_PROPERTIES1,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -38,9 +42,12 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows_numerics::Vector2;
 
+use crate::config::{self, StampConfig};
 use crate::engine::content_rect::Rect;
 use crate::engine::geometry::{dot, full_segments, Segment};
-use crate::protocol::{Brush, Stroke, Tool};
+use crate::protocol::{
+    Brush, CanvasItem, LineStyle, ShapeItem, ShapeKind, StampItem, Stroke, Tool,
+};
 
 pub struct Renderer {
     factory: ID2D1Factory1,
@@ -48,6 +55,7 @@ pub struct Renderer {
     swapchain: IDXGISwapChain1,
     target: ID2D1Bitmap1,
     baked: ID2D1Bitmap1,
+    stamp_bitmaps: HashMap<String, ID2D1Bitmap1>,
     stroke_style: ID2D1StrokeStyle1,
     /// content rect (ウィンドウローカル座標)。正規化座標をこの矩形に展開する
     content: Rect,
@@ -58,7 +66,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(hwnd: HWND, width: u32, height: u32, content: Rect) -> Result<Self> {
+    pub fn new(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        content: Rect,
+        stamps: &[StampConfig],
+    ) -> Result<Self> {
         unsafe {
             // D3D11 デバイス (BGRA サポートは D2D 連携に必須)
             let mut d3d_device: Option<ID3D11Device> = None;
@@ -127,6 +141,7 @@ impl Renderer {
                 colorContext: core::mem::ManuallyDrop::new(None),
             };
             let baked = dc.CreateBitmap(D2D_SIZE_U { width, height }, None, 0, &baked_props)?;
+            let stamp_bitmaps = load_stamp_bitmaps(&dc, stamps);
 
             // round cap / round join (docs/protocol.md)
             let stroke_style = factory.CreateStrokeStyle(
@@ -155,6 +170,7 @@ impl Renderer {
                 swapchain,
                 target,
                 baked,
+                stamp_bitmaps,
                 stroke_style,
                 content,
                 _dcomp_device: dcomp_device,
@@ -164,14 +180,14 @@ impl Renderer {
         }
     }
 
-    /// 確定ストローク一覧から baked を再構築する (起動時 / stroke_end / undo / clear)
-    pub fn rebuild_baked(&mut self, strokes: &[Stroke]) -> Result<()> {
+    /// 確定 CanvasItem 一覧から baked を再構築する。
+    pub fn rebuild_baked(&mut self, items: &[CanvasItem]) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.baked);
             self.dc.BeginDraw();
             self.dc.Clear(Some(&transparent()));
-            for stroke in strokes.iter().filter(|s| s.done) {
-                self.draw_stroke(stroke)?;
+            for item in items.iter().filter(|item| item.is_done()) {
+                self.draw_item(item)?;
             }
             self.dc.EndDraw(None, None)?;
         }
@@ -191,8 +207,8 @@ impl Renderer {
         Ok(())
     }
 
-    /// 1 フレーム描画: baked + 描画中ストローク (+ 描画モードの枠表示)
-    pub fn draw_frame(&mut self, strokes: &[Stroke], draw_mode: bool) -> Result<()> {
+    /// 1 フレーム描画: baked + 描画中項目 (+ 描画モードの枠表示)
+    pub fn draw_frame(&mut self, items: &[CanvasItem], draw_mode: bool) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.target);
             self.dc.BeginDraw();
@@ -205,8 +221,8 @@ impl Renderer {
                 None,
                 None,
             );
-            for stroke in strokes.iter().filter(|s| !s.done) {
-                self.draw_stroke(stroke)?;
+            for item in items.iter().filter(|item| !item.is_done()) {
+                self.draw_item(item)?;
             }
             if draw_mode {
                 self.draw_mode_border()?;
@@ -215,6 +231,14 @@ impl Renderer {
             self.swapchain.Present(1, Default::default()).ok()?;
         }
         Ok(())
+    }
+
+    fn draw_item(&self, item: &CanvasItem) -> Result<()> {
+        match item {
+            CanvasItem::Stroke { stroke } => self.draw_stroke(stroke),
+            CanvasItem::Shape { shape } => self.draw_shape(shape),
+            CanvasItem::Stamp { stamp } => self.draw_stamp(stamp),
+        }
     }
 
     fn draw_stroke(&self, stroke: &Stroke) -> Result<()> {
@@ -291,6 +315,95 @@ impl Renderer {
         Ok(())
     }
 
+    fn draw_shape(&self, shape: &ShapeItem) -> Result<()> {
+        let brush = self.line_brush(&shape.style)?;
+        let width = (shape.style.width_n * self.content.height) as f32;
+        let start = self.normalized_to_local(shape.start);
+        let end = self.normalized_to_local(shape.end);
+
+        unsafe {
+            match shape.shape {
+                ShapeKind::Line => {
+                    self.dc
+                        .DrawLine(start, end, &brush, width, &self.stroke_style);
+                }
+                ShapeKind::Arrow => {
+                    self.dc
+                        .DrawLine(start, end, &brush, width, &self.stroke_style);
+                    let dx = f64::from(end.X - start.X);
+                    let dy = f64::from(end.Y - start.Y);
+                    let length = dx.hypot(dy);
+                    if length > 0.0 {
+                        let angle = dy.atan2(dx);
+                        let head_length = (length * 0.4)
+                            .min((f64::from(width) * 4.0).max(self.content.height * 0.02));
+                        let spread = std::f64::consts::PI / 6.0;
+                        for head_angle in [angle - spread, angle + spread] {
+                            let point = Vector2 {
+                                X: end.X - (head_length * head_angle.cos()) as f32,
+                                Y: end.Y - (head_length * head_angle.sin()) as f32,
+                            };
+                            self.dc
+                                .DrawLine(end, point, &brush, width, &self.stroke_style);
+                        }
+                    }
+                }
+                ShapeKind::Rectangle => {
+                    let rect = D2D_RECT_F {
+                        left: start.X.min(end.X),
+                        top: start.Y.min(end.Y),
+                        right: start.X.max(end.X),
+                        bottom: start.Y.max(end.Y),
+                    };
+                    self.dc
+                        .DrawRectangle(&rect, &brush, width, &self.stroke_style);
+                }
+                ShapeKind::Ellipse => {
+                    self.dc.DrawEllipse(
+                        &D2D1_ELLIPSE {
+                            point: Vector2 {
+                                X: (start.X + end.X) / 2.0,
+                                Y: (start.Y + end.Y) / 2.0,
+                            },
+                            radiusX: (end.X - start.X).abs() / 2.0,
+                            radiusY: (end.Y - start.Y).abs() / 2.0,
+                        },
+                        &brush,
+                        width,
+                        &self.stroke_style,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_stamp(&self, stamp: &StampItem) -> Result<()> {
+        let Some(bitmap) = self.stamp_bitmaps.get(&stamp.stamp_id) else {
+            return Ok(());
+        };
+        let center = self.normalized_to_local(stamp.center);
+        let width = (stamp.width_n * self.content.width) as f32;
+        let height = (stamp.height_n * self.content.height) as f32;
+        let destination = D2D_RECT_F {
+            left: center.X - width / 2.0,
+            top: center.Y - height / 2.0,
+            right: center.X + width / 2.0,
+            bottom: center.Y + height / 2.0,
+        };
+        unsafe {
+            self.dc.DrawBitmap(
+                bitmap,
+                Some(&destination),
+                stamp.opacity as f32,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                None,
+                None,
+            );
+        }
+        Ok(())
+    }
+
     /// 描画モード中の視覚インジケータ: content rect の枠線
     fn draw_mode_border(&self) -> Result<()> {
         let color = D2D1_COLOR_F {
@@ -324,12 +437,93 @@ impl Renderer {
         unsafe { Ok(self.dc.CreateSolidColorBrush(&color, None)?) }
     }
 
+    fn line_brush(&self, style: &LineStyle) -> Result<ID2D1SolidColorBrush> {
+        let (r, g, b) = parse_color(&style.color);
+        let color = D2D1_COLOR_F {
+            r,
+            g,
+            b,
+            a: style.opacity as f32,
+        };
+        unsafe { Ok(self.dc.CreateSolidColorBrush(&color, None)?) }
+    }
+
+    fn normalized_to_local(&self, position: (f64, f64)) -> Vector2 {
+        self.to_local(
+            position.0 * self.content.width,
+            position.1 * self.content.height,
+        )
+    }
+
     /// geometry (content rect 基準の px) → ウィンドウローカル座標
     fn to_local(&self, x: f64, y: f64) -> Vector2 {
         Vector2 {
             X: (self.content.x + x) as f32,
             Y: (self.content.y + y) as f32,
         }
+    }
+}
+
+fn load_stamp_bitmaps(
+    dc: &ID2D1DeviceContext,
+    stamps: &[StampConfig],
+) -> HashMap<String, ID2D1Bitmap1> {
+    stamps
+        .iter()
+        .filter_map(|stamp| match load_stamp_bitmap(dc, stamp) {
+            Ok(bitmap) => Some((stamp.id.clone(), bitmap)),
+            Err(error) => {
+                warn!("failed to load stamp {}: {error:#}", stamp.name);
+                None
+            }
+        })
+        .collect()
+}
+
+fn load_stamp_bitmap(dc: &ID2D1DeviceContext, stamp: &StampConfig) -> Result<ID2D1Bitmap1> {
+    let path = config::stamp_path(&stamp.id)?;
+    let decoded = config::decode_stamp_png(&path)?.into_rgba8();
+    let (width, height) = decoded.dimensions();
+    if width != stamp.width_px || height != stamp.height_px {
+        anyhow::bail!(
+            "image dimensions changed (config {}x{}, file {}x{})",
+            stamp.width_px,
+            stamp.height_px,
+            width,
+            height
+        );
+    }
+
+    // D2D の BGRA premultiplied 形式へ変換する。
+    let mut pixels = decoded.into_raw();
+    for pixel in pixels.chunks_exact_mut(4) {
+        let red = pixel[0];
+        let green = pixel[1];
+        let blue = pixel[2];
+        let alpha = pixel[3];
+        let premultiply = |channel: u8| ((u16::from(channel) * u16::from(alpha) + 127) / 255) as u8;
+        pixel[0] = premultiply(blue);
+        pixel[1] = premultiply(green);
+        pixel[2] = premultiply(red);
+        pixel[3] = alpha;
+    }
+    let properties = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
+        colorContext: core::mem::ManuallyDrop::new(None),
+    };
+    unsafe {
+        Ok(dc.CreateBitmap(
+            D2D_SIZE_U { width, height },
+            Some(pixels.as_ptr().cast()),
+            width * 4,
+            &properties,
+        )?)
     }
 }
 

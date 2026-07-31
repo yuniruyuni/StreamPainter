@@ -1,6 +1,6 @@
 # Overview
 
-StreamPainterは、配信PC上でのみ動くWindows常駐アプリです。利用者が描いたストロークを
+StreamPainterは、配信PC上でのみ動くWindows常駐アプリです。利用者が描いた線・図形・スタンプを
 Windows透明オーバーレイへ即時表示し、同じ状態をOBS Browser Sourceへ配信します。
 
 ## 正式な製品境界
@@ -8,7 +8,8 @@ Windows透明オーバーレイへ即時表示し、同じ状態をOBS Browser S
 - 対応OS: Windows
 - Webサービス: `stream-painter.exe` が `127.0.0.1` に内蔵
 - OBS表示: 同一PC上のBrowser Source
-- 永続化: なし。ストロークはプロセス内メモリのみ
+- 描画履歴の永続化: なし。CanvasItemはプロセス内メモリのみ
+- 設定の永続化: 設定値と登録スタンプPNGだけをユーザーのAppDataへ保存
 - アカウント・認証・DB・クラウド: なし
 - インターネット接続: 不要
 
@@ -19,7 +20,7 @@ Windows透明オーバーレイへ即時表示し、同じ状態をOBS Browser S
 1. Windowsログイン後または配信前に `stream-painter.exe` を起動する。
 2. アプリが `http://127.0.0.1:16873/overlay` を配信する。
 3. OBS Browser SourceがページとWebSocketを同じloopback originから読み込む。
-4. `F9` で描画モードへ入り、入力イベントをストロークへ変換する。
+4. `F9` で描画モードへ入り、入力イベントをCanvasItemへ変換する。
 5. ローカルエコーとOBS overlayが同じイベント列を描画する。
 6. Browser Sourceが再接続した場合は、接続時snapshotで現在状態を復元する。
 

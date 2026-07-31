@@ -2,7 +2,7 @@
 //!
 //! - WS_EX_NOREDIRECTIONBITMAP + WS_EX_TOPMOST + WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
 //! - F9 (グローバルホットキー) でパススルー ⇔ 描画モードを切替 (WS_EX_TRANSPARENT)
-//! - WM_POINTER* で入力を受け、StrokeEngine → local web hub + ローカルエコー描画
+//! - WM_POINTER* で入力を受け、CanvasEngine → local web hub + ローカルエコー描画
 //! - 20ms タイマで stroke_points をバッチ送信
 
 use anyhow::{anyhow, Context, Result};
@@ -28,12 +28,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config;
+use crate::engine::canvas_engine::CanvasEngine;
 use crate::engine::content_rect::{content_rect, parse_aspect, Rect};
-use crate::engine::stroke_engine::StrokeEngine;
 use crate::net::local_server::{self, LocalServerHandle};
 use crate::net::obs::{self, ObsSettings, ProjectorView};
-use crate::protocol::{Brush, Tool};
-use crate::win::menu::{self, MenuAction};
+use crate::protocol::{Brush, LineStyle, ShapeKind, Tool};
+use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
 use crate::win::projector;
 use crate::win::render::Renderer;
@@ -54,10 +54,11 @@ const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// obs-websocket 要求スレッドからの結果通知 (wparam: 成功=1)
 const WM_OBS_RESULT: u32 = WM_APP + 2;
 struct App {
-    engine: StrokeEngine,
+    engine: CanvasEngine,
     web: LocalServerHandle,
     renderer: Renderer,
-    tool: Tool,
+    tool: DrawTool,
+    stamps: Vec<crate::config::StampConfig>,
     color: String,
     width_n: f64,
     /// content rect (スクリーン座標)。入力の正規化に使う
@@ -84,6 +85,9 @@ struct App {
 
 pub fn run() -> Result<()> {
     let config = config::load()?;
+    if let Err(error) = config::cleanup_unregistered_stamps(&config) {
+        warn!("failed to clean unregistered stamps: {error:#}");
+    }
 
     unsafe {
         // マニフェストでも宣言しているが、古い Windows への保険として実行時にも設定する
@@ -134,18 +138,25 @@ pub fn run() -> Result<()> {
         None
     };
 
-    let engine = StrokeEngine::new();
-    let web = local_server::spawn(config.local_server_port)?;
+    let engine = CanvasEngine::new();
+    let web = local_server::spawn(config.local_server_port, &config.stamps)?;
     debug_assert_eq!(web.overlay_url(), config.overlay_url());
 
     let hwnd = create_overlay_window(mon.x, mon.y, mon.width, mon.height)?;
-    let renderer = Renderer::new(hwnd, mon.width as u32, mon.height as u32, content_local)?;
+    let renderer = Renderer::new(
+        hwnd,
+        mon.width as u32,
+        mon.height as u32,
+        content_local,
+        &config.stamps,
+    )?;
 
     let mut app = Box::new(App {
         engine,
         web,
         renderer,
-        tool: Tool::Pen,
+        tool: DrawTool::Pen,
+        stamps: config.stamps.clone(),
         color: config.brush.color.clone(),
         width_n: config.brush.width_n,
         content_screen,
@@ -276,30 +287,43 @@ fn now_ms() -> f64 {
 
 impl App {
     /// 現在のツール・色から Brush を組み立てる (テストページと同じマッピング)
-    fn current_brush(&self) -> Brush {
-        match self.tool {
-            Tool::Pen => Brush {
+    fn current_brush(&self) -> Option<Brush> {
+        match &self.tool {
+            DrawTool::Pen => Some(Brush {
                 tool: Tool::Pen,
                 color: self.color.clone(),
                 opacity: 1.0,
                 width_n: self.width_n,
                 // M2 はマウスのみ (p=0.5 固定) のため実質無効。M3 でペン筆圧を有効化する
                 pressure_width: true,
-            },
-            Tool::Marker => Brush {
+            }),
+            DrawTool::Marker => Some(Brush {
                 tool: Tool::Marker,
                 color: self.color.clone(),
                 opacity: 0.5,
                 width_n: self.width_n * 3.0,
                 pressure_width: true,
-            },
-            Tool::Eraser => Brush {
+            }),
+            DrawTool::Eraser => Some(Brush {
                 tool: Tool::Eraser,
                 color: "#000000".into(),
                 opacity: 1.0,
                 width_n: self.width_n * 3.0,
                 pressure_width: true,
-            },
+            }),
+            DrawTool::Line
+            | DrawTool::Arrow
+            | DrawTool::Rectangle
+            | DrawTool::Ellipse
+            | DrawTool::Stamp(_) => None,
+        }
+    }
+
+    fn current_line_style(&self) -> LineStyle {
+        LineStyle {
+            color: self.color.clone(),
+            opacity: 1.0,
+            width_n: self.width_n,
         }
     }
 
@@ -340,7 +364,7 @@ impl App {
 
     /// 右クリックメニュー (描画モード中のみ呼ばれる)
     fn show_menu(&mut self, hwnd: HWND) {
-        match menu::show(hwnd, &self.tool, &self.color) {
+        match menu::show(hwnd, &self.tool, &self.color, &self.stamps) {
             Some(MenuAction::SelectTool(tool)) => {
                 info!("tool: {tool:?}");
                 self.tool = tool;
@@ -348,8 +372,8 @@ impl App {
             Some(MenuAction::SelectColor(color)) => {
                 self.color = color.to_string();
                 // 色を選んだ = 描く意図なので、消しゴム中ならペンに戻す
-                if self.tool == Tool::Eraser {
-                    self.tool = Tool::Pen;
+                if matches!(&self.tool, DrawTool::Eraser | DrawTool::Stamp(_)) {
+                    self.tool = DrawTool::Pen;
                 }
             }
             Some(MenuAction::Undo) => {
@@ -381,9 +405,9 @@ impl App {
         if !self.draw_mode {
             return;
         }
-        let strokes = self.engine.shared_strokes();
-        let strokes = strokes.lock().unwrap().clone();
-        let visible = if self.local_echo { &strokes[..] } else { &[] };
+        let items = self.engine.shared_items();
+        let items = items.lock().unwrap().clone();
+        let visible = if self.local_echo { &items[..] } else { &[] };
         if let Err(e) = self.renderer.draw_frame(visible, self.draw_mode) {
             warn!("draw_frame: {e:#}");
         }
@@ -393,9 +417,9 @@ impl App {
         if !self.local_echo {
             return;
         }
-        let strokes = self.engine.shared_strokes();
-        let strokes = strokes.lock().unwrap().clone();
-        if let Err(e) = self.renderer.rebuild_baked(&strokes) {
+        let items = self.engine.shared_items();
+        let items = items.lock().unwrap().clone();
+        if let Err(e) = self.renderer.rebuild_baked(&items) {
             warn!("rebuild_baked: {e:#}");
         }
     }
@@ -546,8 +570,61 @@ impl App {
             return;
         }
         let (u, v) = self.content_screen.normalize(x, y);
-        let msgs = self.engine.begin(self.current_brush(), u, v, 0.5, now_ms());
+        let msgs = match self.tool.clone() {
+            DrawTool::Pen | DrawTool::Marker | DrawTool::Eraser => {
+                let Some(brush) = self.current_brush() else {
+                    return;
+                };
+                self.engine.begin(brush, u, v, 0.5, now_ms())
+            }
+            DrawTool::Line => {
+                self.engine
+                    .begin_shape(ShapeKind::Line, self.current_line_style(), u, v)
+            }
+            DrawTool::Arrow => {
+                self.engine
+                    .begin_shape(ShapeKind::Arrow, self.current_line_style(), u, v)
+            }
+            DrawTool::Rectangle => {
+                self.engine
+                    .begin_shape(ShapeKind::Rectangle, self.current_line_style(), u, v)
+            }
+            DrawTool::Ellipse => {
+                self.engine
+                    .begin_shape(ShapeKind::Ellipse, self.current_line_style(), u, v)
+            }
+            DrawTool::Stamp(stamp_id) => {
+                let Some(stamp) = self
+                    .stamps
+                    .iter()
+                    .find(|stamp| stamp.id == stamp_id)
+                    .cloned()
+                else {
+                    warn!("selected stamp is no longer registered: {stamp_id}");
+                    return;
+                };
+                let aspect = f64::from(stamp.width_px) / f64::from(stamp.height_px);
+                let width_n = stamp.default_height_n * aspect * self.content_screen.height
+                    / self.content_screen.width;
+                let msgs = self.engine.add_stamp(
+                    stamp.id,
+                    (u, v),
+                    width_n,
+                    stamp.default_height_n,
+                    stamp.opacity,
+                    now_ms(),
+                );
+                self.web.send_all(msgs);
+                let _ = self.engine.take_rebuild_required();
+                self.rebuild();
+                self.render();
+                return;
+            }
+        };
         self.web.send_all(msgs);
+        if self.engine.take_rebuild_required() {
+            self.rebuild();
+        }
         unsafe {
             SetTimer(Some(hwnd), FLUSH_TIMER_ID, FLUSH_INTERVAL_MS, None);
         }
@@ -560,12 +637,15 @@ impl App {
         }
         let (u, v) = self.pointer_uv(lparam);
         let msgs = self.engine.move_to(u, v, 0.5, now_ms());
+        let trimmed = self.engine.take_rebuild_required();
         if !msgs.is_empty() {
             // 総点数上限による強制確定
             self.web.send_all(msgs);
             unsafe {
                 let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
             }
+            self.rebuild();
+        } else if trimmed {
             self.rebuild();
         }
         self.render();

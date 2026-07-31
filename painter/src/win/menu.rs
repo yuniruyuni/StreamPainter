@@ -9,7 +9,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_RIGHTBUTTON,
 };
 
-use crate::protocol::Tool;
+use crate::config::StampConfig;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrawTool {
+    Pen,
+    Marker,
+    Eraser,
+    Line,
+    Arrow,
+    Rectangle,
+    Ellipse,
+    Stamp(String),
+}
 
 /// カラーパレット (デザインシステム準拠の視認性の高い色)
 pub const COLORS: [(&str, &str); 10] = [
@@ -27,7 +39,7 @@ pub const COLORS: [(&str, &str); 10] = [
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MenuAction {
-    SelectTool(Tool),
+    SelectTool(DrawTool),
     SelectColor(&'static str),
     Undo,
     Clear,
@@ -37,10 +49,15 @@ pub enum MenuAction {
 const ID_TOOL_PEN: usize = 10;
 const ID_TOOL_MARKER: usize = 11;
 const ID_TOOL_ERASER: usize = 12;
+const ID_TOOL_LINE: usize = 13;
+const ID_TOOL_ARROW: usize = 14;
+const ID_TOOL_RECTANGLE: usize = 15;
+const ID_TOOL_ELLIPSE: usize = 16;
 const ID_UNDO: usize = 20;
 const ID_CLEAR: usize = 21;
 const ID_EXIT: usize = 30;
 const ID_COLOR_BASE: usize = 100;
+const ID_STAMP_BASE: usize = 1000;
 
 fn checked(flag: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
     if flag {
@@ -62,22 +79,73 @@ fn append(
 }
 
 /// メニューを表示し、選択されたアクションを返す (選択なしは None)
-pub fn show(hwnd: HWND, tool: &Tool, color: &str) -> Option<MenuAction> {
+pub fn show(
+    hwnd: HWND,
+    tool: &DrawTool,
+    color: &str,
+    stamps: &[StampConfig],
+) -> Option<MenuAction> {
     unsafe {
         let root = CreatePopupMenu().ok()?;
-        append(root, checked(*tool == Tool::Pen), ID_TOOL_PEN, "ペン");
+        append(root, checked(tool == &DrawTool::Pen), ID_TOOL_PEN, "ペン");
         append(
             root,
-            checked(*tool == Tool::Marker),
+            checked(tool == &DrawTool::Marker),
             ID_TOOL_MARKER,
             "マーカー",
         );
         append(
             root,
-            checked(*tool == Tool::Eraser),
+            checked(tool == &DrawTool::Eraser),
             ID_TOOL_ERASER,
             "消しゴム",
         );
+
+        let shapes = CreatePopupMenu().ok()?;
+        append(
+            shapes,
+            checked(tool == &DrawTool::Line),
+            ID_TOOL_LINE,
+            "直線",
+        );
+        append(
+            shapes,
+            checked(tool == &DrawTool::Arrow),
+            ID_TOOL_ARROW,
+            "矢印",
+        );
+        append(
+            shapes,
+            checked(tool == &DrawTool::Rectangle),
+            ID_TOOL_RECTANGLE,
+            "四角形",
+        );
+        append(
+            shapes,
+            checked(tool == &DrawTool::Ellipse),
+            ID_TOOL_ELLIPSE,
+            "楕円",
+        );
+        let _ = AppendMenuW(root, MF_POPUP, shapes.0 as usize, &HSTRING::from("図形"));
+
+        if !stamps.is_empty() {
+            let stamp_menu = CreatePopupMenu().ok()?;
+            for (index, stamp) in stamps.iter().enumerate() {
+                let label = stamp.name.replace('&', "&&");
+                append(
+                    stamp_menu,
+                    checked(matches!(tool, DrawTool::Stamp(id) if id == &stamp.id)),
+                    ID_STAMP_BASE + index,
+                    &label,
+                );
+            }
+            let _ = AppendMenuW(
+                root,
+                MF_POPUP,
+                stamp_menu.0 as usize,
+                &HSTRING::from("スタンプ"),
+            );
+        }
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
 
         let palette = CreatePopupMenu().ok()?;
@@ -112,15 +180,22 @@ pub fn show(hwnd: HWND, tool: &Tool, color: &str) -> Option<MenuAction> {
         let _ = DestroyMenu(root);
 
         match selected.0 as usize {
-            ID_TOOL_PEN => Some(MenuAction::SelectTool(Tool::Pen)),
-            ID_TOOL_MARKER => Some(MenuAction::SelectTool(Tool::Marker)),
-            ID_TOOL_ERASER => Some(MenuAction::SelectTool(Tool::Eraser)),
+            ID_TOOL_PEN => Some(MenuAction::SelectTool(DrawTool::Pen)),
+            ID_TOOL_MARKER => Some(MenuAction::SelectTool(DrawTool::Marker)),
+            ID_TOOL_ERASER => Some(MenuAction::SelectTool(DrawTool::Eraser)),
+            ID_TOOL_LINE => Some(MenuAction::SelectTool(DrawTool::Line)),
+            ID_TOOL_ARROW => Some(MenuAction::SelectTool(DrawTool::Arrow)),
+            ID_TOOL_RECTANGLE => Some(MenuAction::SelectTool(DrawTool::Rectangle)),
+            ID_TOOL_ELLIPSE => Some(MenuAction::SelectTool(DrawTool::Ellipse)),
             ID_UNDO => Some(MenuAction::Undo),
             ID_CLEAR => Some(MenuAction::Clear),
             ID_EXIT => Some(MenuAction::Exit),
             id if (ID_COLOR_BASE..ID_COLOR_BASE + COLORS.len()).contains(&id) => {
                 Some(MenuAction::SelectColor(COLORS[id - ID_COLOR_BASE].1))
             }
+            id if (ID_STAMP_BASE..ID_STAMP_BASE + stamps.len()).contains(&id) => Some(
+                MenuAction::SelectTool(DrawTool::Stamp(stamps[id - ID_STAMP_BASE].id.clone())),
+            ),
             _ => None,
         }
     }

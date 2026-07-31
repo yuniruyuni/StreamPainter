@@ -7,7 +7,7 @@
 ```text
 Win32 UI thread
 ├─ pointer / hotkey / tray
-├─ StrokeEngine
+├─ CanvasItem engine
 └─ Direct2D local echo
         │ bounded-size PaintEvent
         ▼
@@ -27,20 +27,24 @@ UIスレッドからハブへの送信はunbounded channelへの短いenqueueだ
 ハブは専用ランタイム上で全コマンドを直列処理します。これにより、接続処理と描画イベント
 の順序が一意になり、snapshotと増分イベントの競合を避けます。
 
-- 新規接続: 現在の全ストロークをsnapshotとして最初に送信
-- 通常描画: `stroke_*`、`undo`、`clear` を増分配信
+- 新規接続: 現在の全CanvasItemをsnapshotとして最初に送信
+- 通常描画: `stroke_*`、`shape_*`、`stamp_add`、`undo`、`clear` を増分配信
 - 再接続: 古いクライアント状態をsnapshotで全置換
 - backpressure: 各接続は256メッセージの上限を持つ
 - 遅延時: 接続をハブから除外し、Browser Source側の再接続に任せる
 
-ストロークは最大500本、合計200,000点、1本10,000点に制限します。古い確定ストローク
-を削除する必要が生じた場合は増分ではなくsnapshotを送り、全クライアントを再同期します。
+CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000点に制限します。古い確定
+アイテムを削除する必要が生じた場合は増分ではなくsnapshotを送り、全クライアントを再同期
+します。互換用の`strokes` snapshotも併記するため、旧overlayは従来ツールを表示できます。
 
 ## Web assets
 
 `client/` はOBS用透明ページだけを生成します。ビルド成果物は固定名の
 `index.html`、`index.css`、`index.js` で、Rust release build時にexeへ埋め込みます。
 実行時に外部ファイルやCDNは必要ありません。
+
+ユーザー登録スタンプだけは管理対象PNGとして`%APPDATA%\StreamPainter\stamps`へ保存し、
+許可されたIDを`/stamps/<id>`から配信します。任意パスをHTTP routeへ渡すことはありません。
 
 第三者ライセンスページも生成時に依存関係とlockfileを照合し、Rust本体へ埋め込みます。
 タスクトレイから開くと、同じloopbackサーバーの `/licenses` で表示されます。

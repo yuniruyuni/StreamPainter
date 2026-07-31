@@ -7,8 +7,8 @@ Windows 上で OBS の映像に直接描き込む、ローカル完結型のオ�
 Cloud Run、外部DB、Twitchログイン、公開Webアプリは使いません。
 
 ```text
-ペン入力
-  → stream-painter.exe / StrokeEngine
+ポインター入力
+  → stream-painter.exe / CanvasItem engine
       ├─ Windows透明オーバーレイ（ローカルエコー）
       └─ http://127.0.0.1:16873
            └─ WebSocket → OBS Browser Source
@@ -20,12 +20,13 @@ Cloud Run、外部DB、Twitchログイン、公開Webアプリは使いません
 2. タスクトレイアイコンの「設定...」で対象モニターやOBS連携を設定し、アプリを再起動する。
 3. 設定画面に表示されたURLをOBSの「ブラウザ」ソースへ設定する。
 4. Browser Source の幅と高さを OBS の基本キャンバス解像度に合わせる。
-5. `F9` で描画モードを切り替える。右クリックでペン・マーカー・消しゴム・Undo・Clear
-   を操作する。
+5. `F9` で描画モードを切り替える。右クリックでペン、マーカー、消しゴム、直線、矢印、
+   四角形、楕円、登録済みスタンプ、Undo、Clearを操作する。
 
 標準のBrowser Source URLは `http://127.0.0.1:16873/overlay` です。設定は画面から保存でき、
 `%APPDATA%\StreamPainter\config\config.toml` を直接編集する必要はありません。ポート競合などで
 通常起動できない場合も、`stream-painter.exe --settings` で設定画面だけを開けます。
+PNGスタンプの登録・削除・名称・既定サイズ・不透明度も同じ設定画面で管理できます。
 
 ## ソースからビルド
 

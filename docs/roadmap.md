@@ -4,6 +4,8 @@
 
 - Windows透明描画オーバーレイ
 - F9、タスクトレイ、右クリックツールメニュー
+- ペン・マーカー・消しゴム・直線・矢印・四角形・楕円
+- 設定画面で管理する固定サイズPNGスタンプ
 - OBS全画面プロジェクター追従、Z-order維持、obs-websocket連携
 - Rust内蔵loopback HTTP/WebSocketサーバー
 - OBS Browser Source用assetsのexe埋め込み
@@ -19,6 +21,8 @@
 - Windowsログイン時の自動起動を選べる設定
 - 設定画面からのBrowser Source疎通確認
 - ペンデバイスの筆圧・傾き取得
+- 図形・スタンプの選択、移動、回転、拡大縮小
+- テキスト、アニメーションスタンプ
 - 実OBSを使ったWindows smoke testの自動化
 
 ## 非目標

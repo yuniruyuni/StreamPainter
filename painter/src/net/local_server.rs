@@ -4,7 +4,10 @@
 //! `127.0.0.1` だけに配信する。新しい WebSocket 接続には必ずハブの snapshot を送り、
 //! 遅延した接続は切断して再接続時の snapshot で回復させる。
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use anyhow::{bail, Context, Result};
@@ -24,9 +27,10 @@ use rust_embed::RustEmbed;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use crate::config::{StampConfig, MAX_STAMP_FILE_BYTES};
 use crate::protocol::{
-    OverlayClientMessage, OverlayControlMessage, PainterMessage, Stroke, MAX_STROKES,
-    MAX_STROKE_POINTS, MAX_TOTAL_POINTS,
+    CanvasItem, OverlayClientMessage, OverlayControlMessage, PainterMessage, Stroke, MAX_ITEMS,
+    MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
 };
 
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
@@ -80,7 +84,7 @@ impl Drop for LocalServerHandle {
 }
 
 /// アセットを検証してから同期的にポートを確保するため、ポート競合は起動時に報告される。
-pub fn spawn(port: u16) -> Result<LocalServerHandle> {
+pub fn spawn(port: u16, stamps: &[StampConfig]) -> Result<LocalServerHandle> {
     if port == 0 {
         bail!("local_server_port に 0 は指定できません");
     }
@@ -100,11 +104,35 @@ pub fn spawn(port: u16) -> Result<LocalServerHandle> {
         .set_nonblocking(true)
         .context("failed to configure local listener")?;
 
+    let stamp_paths: HashMap<String, PathBuf> = stamps
+        .iter()
+        .filter_map(|stamp| match crate::config::stamp_path(&stamp.id) {
+            Ok(path) => match std::fs::symlink_metadata(&path) {
+                Ok(metadata)
+                    if metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.len() <= MAX_STAMP_FILE_BYTES =>
+                {
+                    Some((stamp.id.clone(), path))
+                }
+                _ => {
+                    warn!("stamp asset is missing or invalid: {}", path.display());
+                    None
+                }
+            },
+            Err(error) => {
+                warn!("invalid stamp asset {}: {error:#}", stamp.id);
+                None
+            }
+        })
+        .collect();
+
     let (hub_tx, hub_rx) = mpsc::unbounded_channel();
     let hub = HubHandle { tx: hub_tx };
     let web_state = WebState {
         hub: hub.clone(),
         port,
+        stamp_paths: Arc::new(stamp_paths),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -160,6 +188,7 @@ pub fn spawn(port: u16) -> Result<LocalServerHandle> {
 struct WebState {
     hub: HubHandle,
     port: u16,
+    stamp_paths: Arc<HashMap<String, PathBuf>>,
 }
 
 fn router(state: WebState) -> Router {
@@ -169,6 +198,7 @@ fn router(state: WebState) -> Router {
         .route("/licenses", get(licenses))
         .route("/health", get(health))
         .route("/ws", get(websocket))
+        .route("/stamps/{stamp_id}", get(stamp))
         .route("/{*path}", get(asset))
         .with_state(state)
 }
@@ -202,6 +232,34 @@ async fn licenses(State(state): State<WebState>, headers: HeaderMap) -> Response
         .header(REFERRER_POLICY, "no-referrer")
         .body(Body::from(THIRD_PARTY_LICENSES_HTML))
         .expect("valid licenses response")
+}
+
+async fn stamp(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(stamp_id): Path<String>,
+) -> Response {
+    if !trusted_host(&headers, state.port) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(path) = state.stamp_paths.get(&stamp_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!("failed to read stamp {}: {error}", path.display());
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "image/png")
+        .header(CACHE_CONTROL, "no-store")
+        .header(X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(REFERRER_POLICY, "no-referrer")
+        .body(Body::from(bytes))
+        .expect("valid stamp response")
 }
 
 async fn asset(
@@ -321,36 +379,38 @@ struct Subscriber {
 
 #[derive(Default)]
 struct HubState {
-    strokes: Vec<Stroke>,
+    items: Vec<CanvasItem>,
     revision: u64,
     total_points: usize,
 }
 
 impl HubState {
     fn apply(&mut self, message: PainterMessage) -> Option<String> {
-        let outbound = match message {
+        let (outbound, force_snapshot) = match message {
             PainterMessage::StrokeBegin { stroke_id, brush } => {
-                if self
-                    .strokes
-                    .iter()
-                    .any(|stroke| stroke.stroke_id == stroke_id)
-                {
+                if self.items.iter().any(|item| item.item_id() == stroke_id) {
                     return None;
                 }
-                self.strokes.push(Stroke {
-                    stroke_id: stroke_id.clone(),
-                    brush: brush.clone(),
-                    pts: Vec::new(),
-                    done: false,
-                    ended_at: None,
+                self.items.push(CanvasItem::Stroke {
+                    stroke: Stroke {
+                        stroke_id: stroke_id.clone(),
+                        brush: brush.clone(),
+                        pts: Vec::new(),
+                        done: false,
+                        ended_at: None,
+                    },
                 });
-                PainterMessage::StrokeBegin { stroke_id, brush }
+                (PainterMessage::StrokeBegin { stroke_id, brush }, false)
             }
             PainterMessage::StrokePoints { stroke_id, pts } => {
-                let stroke = self
-                    .strokes
-                    .iter_mut()
-                    .find(|stroke| stroke.stroke_id == stroke_id && !stroke.done)?;
+                let stroke = self.items.iter_mut().find_map(|item| match item {
+                    CanvasItem::Stroke { stroke }
+                        if stroke.stroke_id == stroke_id && !stroke.done =>
+                    {
+                        Some(stroke)
+                    }
+                    _ => None,
+                })?;
                 let available = MAX_STROKE_POINTS.saturating_sub(stroke.pts.len());
                 let accepted: Vec<_> = pts.into_iter().take(available).collect();
                 if accepted.is_empty() {
@@ -358,61 +418,131 @@ impl HubState {
                 }
                 self.total_points += accepted.len();
                 stroke.pts.extend_from_slice(&accepted);
-                PainterMessage::StrokePoints {
-                    stroke_id,
-                    pts: accepted,
-                }
+                (
+                    PainterMessage::StrokePoints {
+                        stroke_id,
+                        pts: accepted,
+                    },
+                    false,
+                )
             }
             PainterMessage::StrokeEnd {
                 stroke_id,
                 ended_at,
             } => {
-                let stroke = self
-                    .strokes
-                    .iter_mut()
-                    .find(|stroke| stroke.stroke_id == stroke_id && !stroke.done)?;
+                let stroke = self.items.iter_mut().find_map(|item| match item {
+                    CanvasItem::Stroke { stroke }
+                        if stroke.stroke_id == stroke_id && !stroke.done =>
+                    {
+                        Some(stroke)
+                    }
+                    _ => None,
+                })?;
                 stroke.done = true;
                 stroke.ended_at = Some(ended_at);
-                PainterMessage::StrokeEnd {
-                    stroke_id,
-                    ended_at,
-                }
+                (
+                    PainterMessage::StrokeEnd {
+                        stroke_id,
+                        ended_at,
+                    },
+                    false,
+                )
             }
             PainterMessage::StrokeCancel { stroke_id } => {
-                let before = self.strokes.len();
-                let removed_points: usize = self
-                    .strokes
+                let index = self.items.iter().position(|item| {
+                    matches!(
+                        item,
+                        CanvasItem::Stroke { stroke }
+                            if stroke.stroke_id == stroke_id && !stroke.done
+                    )
+                })?;
+                let removed = self.items.remove(index);
+                self.total_points = self.total_points.saturating_sub(removed.point_count());
+                (PainterMessage::StrokeCancel { stroke_id }, false)
+            }
+            PainterMessage::ShapeBegin { mut shape } => {
+                if self
+                    .items
                     .iter()
-                    .filter(|stroke| stroke.stroke_id == stroke_id && !stroke.done)
-                    .map(|stroke| stroke.pts.len())
-                    .sum();
-                self.strokes
-                    .retain(|stroke| stroke.stroke_id != stroke_id || stroke.done);
-                if self.strokes.len() == before {
+                    .any(|item| item.item_id() == shape.item_id)
+                {
                     return None;
                 }
-                self.total_points = self.total_points.saturating_sub(removed_points);
-                PainterMessage::StrokeCancel { stroke_id }
+                shape.done = false;
+                shape.ended_at = None;
+                self.items.push(CanvasItem::Shape {
+                    shape: shape.clone(),
+                });
+                (PainterMessage::ShapeBegin { shape }, false)
+            }
+            PainterMessage::ShapeUpdate { item_id, end } => {
+                let shape = self.items.iter_mut().find_map(|item| match item {
+                    CanvasItem::Shape { shape } if shape.item_id == item_id && !shape.done => {
+                        Some(shape)
+                    }
+                    _ => None,
+                })?;
+                shape.end = end;
+                (PainterMessage::ShapeUpdate { item_id, end }, false)
+            }
+            PainterMessage::ShapeEnd { item_id, ended_at } => {
+                let shape = self.items.iter_mut().find_map(|item| match item {
+                    CanvasItem::Shape { shape } if shape.item_id == item_id && !shape.done => {
+                        Some(shape)
+                    }
+                    _ => None,
+                })?;
+                shape.done = true;
+                shape.ended_at = Some(ended_at);
+                (PainterMessage::ShapeEnd { item_id, ended_at }, false)
+            }
+            PainterMessage::ShapeCancel { item_id } => {
+                let index = self.items.iter().position(|item| {
+                    matches!(
+                        item,
+                        CanvasItem::Shape { shape }
+                            if shape.item_id == item_id && !shape.done
+                    )
+                })?;
+                self.items.remove(index);
+                (PainterMessage::ShapeCancel { item_id }, false)
+            }
+            PainterMessage::StampAdd { mut stamp } => {
+                if self
+                    .items
+                    .iter()
+                    .any(|item| item.item_id() == stamp.item_id)
+                {
+                    return None;
+                }
+                stamp.done = true;
+                stamp.ended_at?;
+                self.items.push(CanvasItem::Stamp {
+                    stamp: stamp.clone(),
+                });
+                (PainterMessage::StampAdd { stamp }, false)
             }
             PainterMessage::Undo {} => {
-                let index = self.strokes.iter().rposition(|stroke| stroke.done)?;
-                let removed = self.strokes.remove(index);
-                self.total_points = self.total_points.saturating_sub(removed.pts.len());
-                PainterMessage::Undo {}
+                let index = self.items.iter().rposition(CanvasItem::is_done)?;
+                let removed = self.items.remove(index);
+                let removed_non_stroke = !matches!(&removed, CanvasItem::Stroke { .. });
+                self.total_points = self.total_points.saturating_sub(removed.point_count());
+                // v1 client の stroke 履歴を誤って 1 本戻さないよう snapshot を送る。
+                (PainterMessage::Undo {}, removed_non_stroke)
             }
             PainterMessage::Clear {} => {
-                if self.strokes.is_empty() {
+                if self.items.is_empty() {
                     return None;
                 }
-                self.strokes.clear();
+                self.items.clear();
                 self.total_points = 0;
-                PainterMessage::Clear {}
+                (PainterMessage::Clear {}, false)
             }
         };
 
         let trimmed = self.trim();
         self.revision = self.revision.saturating_add(1);
-        if trimmed {
+        if trimmed || force_snapshot {
             self.snapshot()
         } else {
             serde_json::to_string(&outbound).ok()
@@ -420,30 +550,38 @@ impl HubState {
     }
 
     fn snapshot(&self) -> Option<String> {
+        let strokes = self
+            .items
+            .iter()
+            .filter_map(CanvasItem::as_stroke)
+            .cloned()
+            .collect();
         serde_json::to_string(&OverlayControlMessage::Snapshot {
+            protocol_version: PROTOCOL_VERSION,
             rev: self.revision,
             fade_after_ms: None,
-            strokes: self.strokes.clone(),
+            strokes,
+            items: self.items.clone(),
         })
         .ok()
     }
 
     fn trim(&mut self) -> bool {
         let mut trimmed = false;
-        while self.strokes.len() > MAX_STROKES {
-            let Some(index) = self.strokes.iter().position(|stroke| stroke.done) else {
+        while self.items.len() > MAX_ITEMS {
+            let Some(index) = self.items.iter().position(CanvasItem::is_done) else {
                 break;
             };
-            let removed = self.strokes.remove(index);
-            self.total_points = self.total_points.saturating_sub(removed.pts.len());
+            let removed = self.items.remove(index);
+            self.total_points = self.total_points.saturating_sub(removed.point_count());
             trimmed = true;
         }
         while self.total_points > MAX_TOTAL_POINTS {
-            let Some(index) = self.strokes.iter().position(|stroke| stroke.done) else {
+            let Some(index) = self.items.iter().position(CanvasItem::is_done) else {
                 break;
             };
-            let removed = self.strokes.remove(index);
-            self.total_points = self.total_points.saturating_sub(removed.pts.len());
+            let removed = self.items.remove(index);
+            self.total_points = self.total_points.saturating_sub(removed.point_count());
             trimmed = true;
         }
         trimmed
@@ -529,7 +667,7 @@ async fn websocket_session(socket: WebSocket, hub: HubHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Brush, Tool};
+    use crate::protocol::{Brush, LineStyle, ShapeItem, ShapeKind, StampItem, Tool};
     use std::io::{Read, Write};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::ORIGIN as WS_ORIGIN;
@@ -586,11 +724,18 @@ mod tests {
         let snapshot = receiver.recv().await.unwrap();
         let message: OverlayControlMessage = serde_json::from_str(&snapshot).unwrap();
         match message {
-            OverlayControlMessage::Snapshot { rev, strokes, .. } => {
+            OverlayControlMessage::Snapshot {
+                rev,
+                strokes,
+                items,
+                ..
+            } => {
                 assert_eq!(rev, 3);
                 assert_eq!(strokes.len(), 1);
                 assert!(strokes[0].done);
                 assert_eq!(strokes[0].ended_at, Some(1234.0));
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0], CanvasItem::Stroke { .. }));
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
@@ -613,6 +758,70 @@ mod tests {
         assert!(event.contains("\"type\":\"stroke_begin\""));
     }
 
+    #[tokio::test]
+    async fn hub_preserves_shape_and_stamp_order_in_v2_snapshot() {
+        let hub = test_hub();
+        let shape = ShapeItem {
+            item_id: "shape-1".into(),
+            shape: ShapeKind::Rectangle,
+            style: LineStyle {
+                color: "#ffffff".into(),
+                opacity: 1.0,
+                width_n: 0.005,
+            },
+            start: (0.1, 0.2),
+            end: (0.1, 0.2),
+            done: false,
+            ended_at: None,
+        };
+        hub.tx
+            .send(HubCommand::Apply(PainterMessage::ShapeBegin { shape }))
+            .unwrap();
+        hub.tx
+            .send(HubCommand::Apply(PainterMessage::ShapeUpdate {
+                item_id: "shape-1".into(),
+                end: (0.8, 0.7),
+            }))
+            .unwrap();
+        hub.tx
+            .send(HubCommand::Apply(PainterMessage::ShapeEnd {
+                item_id: "shape-1".into(),
+                ended_at: 10.0,
+            }))
+            .unwrap();
+        hub.tx
+            .send(HubCommand::Apply(PainterMessage::StampAdd {
+                stamp: StampItem {
+                    item_id: "stamp-item-1".into(),
+                    stamp_id: "stamp-1".into(),
+                    center: (0.5, 0.5),
+                    width_n: 0.1,
+                    height_n: 0.2,
+                    opacity: 1.0,
+                    done: true,
+                    ended_at: Some(20.0),
+                },
+            }))
+            .unwrap();
+
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        let snapshot = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
+            OverlayControlMessage::Snapshot {
+                protocol_version,
+                strokes,
+                items,
+                ..
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(strokes.is_empty());
+                assert!(matches!(items[0], CanvasItem::Shape { .. }));
+                assert!(matches!(items[1], CanvasItem::Stamp { .. }));
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+    }
+
     #[test]
     fn only_expected_loopback_authorities_are_trusted() {
         let mut headers = HeaderMap::new();
@@ -627,6 +836,45 @@ mod tests {
         assert!(!trusted_origin(&headers, 16_873));
     }
 
+    #[tokio::test]
+    async fn stamp_handler_only_serves_catalogued_files_to_trusted_hosts() {
+        let path =
+            std::env::temp_dir().join(format!("stream-painter-{}.png", uuid::Uuid::now_v7()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut paths = HashMap::new();
+        paths.insert("stamp-1".to_owned(), path.clone());
+        let state = WebState {
+            hub: test_hub(),
+            port: 16_873,
+            stamp_paths: Arc::new(paths),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, "127.0.0.1:16873".parse().unwrap());
+
+        let response = stamp(
+            State(state.clone()),
+            headers.clone(),
+            Path("stamp-1".to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "image/png");
+
+        let missing = stamp(
+            State(state.clone()),
+            headers,
+            Path("not-registered".to_owned()),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let mut foreign = HeaderMap::new();
+        foreign.insert(HOST, "attacker.example".parse().unwrap());
+        let forbidden = stamp(State(state), foreign, Path("stamp-1".to_owned())).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn release_input_contains_overlay_assets() {
         assert!(OverlayAssets::get("index.html").is_some());
@@ -638,7 +886,7 @@ mod tests {
     #[tokio::test]
     async fn running_server_streams_events_and_rejects_foreign_origins() {
         let port = available_port();
-        let server = spawn(port).unwrap();
+        let server = spawn(port, &[]).unwrap();
         let url = format!("ws://127.0.0.1:{port}/ws");
 
         let mut http = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();

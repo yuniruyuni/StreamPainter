@@ -71,6 +71,66 @@ describe("OverlayState", () => {
     expect(effect.kind).toBe("none");
   });
 
+  test("図形は preview 更新後に確定される", () => {
+    const state = new OverlayState();
+    const shape = {
+      itemId: "shape-1",
+      shape: "arrow" as const,
+      style: { color: "#ffffff", opacity: 1, widthN: 0.005 },
+      start: [0.1, 0.2] as [number, number],
+      end: [0.1, 0.2] as [number, number],
+      done: false,
+      endedAt: null,
+    };
+    expect(state.apply({ type: "shape_begin", shape }).kind).toBe("preview");
+    expect(
+      state.apply({
+        type: "shape_update",
+        itemId: "shape-1",
+        end: [0.8, 0.7],
+      }).kind,
+    ).toBe("preview");
+    expect(state.items[0]).toMatchObject({ end: [0.8, 0.7], done: false });
+    expect(
+      state.apply({
+        type: "shape_end",
+        itemId: "shape-1",
+        endedAt: 123,
+      }).kind,
+    ).toBe("rebuild");
+    expect(state.items[0]).toMatchObject({ done: true, endedAt: 123 });
+  });
+
+  test("v2 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
+    const state = new OverlayState();
+    state.apply({
+      type: "snapshot",
+      protocolVersion: 2,
+      rev: 4,
+      fadeAfterMs: null,
+      strokes: [doneStroke("legacy-copy")],
+      items: [
+        { kind: "stroke", ...doneStroke("s1") },
+        {
+          kind: "stamp",
+          itemId: "stamp-item-1",
+          stampId: "stamp-1",
+          center: [0.5, 0.5],
+          widthN: 0.1,
+          heightN: 0.2,
+          opacity: 1,
+          done: true,
+          endedAt: 200,
+        },
+      ],
+    });
+    expect(state.items).toHaveLength(2);
+    expect(state.strokes.map((stroke) => stroke.strokeId)).toEqual(["s1"]);
+    expect(state.apply({ type: "undo" }).kind).toBe("rebuild");
+    expect(state.items).toHaveLength(1);
+    expect(state.items[0]?.kind).toBe("stroke");
+  });
+
   test("undo は最後の確定ストロークを削除し rebuild", () => {
     const state = new OverlayState();
     state.apply({

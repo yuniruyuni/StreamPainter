@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use tracing::info;
 
+pub const MAX_STAMPS: usize = 32;
+pub const MAX_STAMP_FILE_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_STAMP_DIMENSION: u32 = 2048;
+pub const MAX_STAMP_PIXELS: u64 = 4_194_304;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// OBS Browser Source を配信する loopback HTTP サーバーのポート
@@ -37,6 +42,9 @@ pub struct Config {
     pub close_projector: bool,
     #[serde(default)]
     pub brush: BrushConfig,
+    /// 管理ディレクトリ内の PNG スタンプ。外部パスや URL は保持しない。
+    #[serde(default)]
+    pub stamps: Vec<StampConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,6 +53,20 @@ pub struct BrushConfig {
     pub color: String,
     #[serde(default = "default_width")]
     pub width_n: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StampConfig {
+    /// アプリが生成する不透明な ID。ファイル名は `<id>.png`。
+    pub id: String,
+    pub name: String,
+    pub width_px: u32,
+    pub height_px: u32,
+    /// キャンバス高に対する既定の表示高。
+    #[serde(default = "default_stamp_height")]
+    pub default_height_n: f64,
+    #[serde(default = "default_stamp_opacity")]
+    pub opacity: f64,
 }
 
 impl Default for Config {
@@ -61,6 +83,7 @@ impl Default for Config {
             projector_view: default_projector_view(),
             close_projector: true,
             brush: BrushConfig::default(),
+            stamps: Vec::new(),
         }
     }
 }
@@ -85,6 +108,12 @@ fn default_color() -> String {
 }
 fn default_width() -> f64 {
     0.005
+}
+fn default_stamp_height() -> f64 {
+    0.15
+}
+fn default_stamp_opacity() -> f64 {
+    1.0
 }
 fn default_true() -> bool {
     true
@@ -144,6 +173,16 @@ fn legacy_config_path_from_roaming_app_data(roaming_app_data: &Path) -> PathBuf 
         .join("config.toml")
 }
 
+fn stamps_dir_from_config_path(config_path: &Path) -> Result<PathBuf> {
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("failed to resolve StreamPainter data directory"))?;
+    let app_dir = config_dir
+        .parent()
+        .ok_or_else(|| anyhow!("failed to resolve StreamPainter data directory"))?;
+    Ok(app_dir.join("stamps"))
+}
+
 #[cfg(windows)]
 pub fn config_path() -> Result<PathBuf> {
     use known_folders::{get_known_folder_path, KnownFolder};
@@ -151,6 +190,126 @@ pub fn config_path() -> Result<PathBuf> {
     let roaming_app_data = get_known_folder_path(KnownFolder::RoamingAppData)
         .ok_or_else(|| anyhow!("failed to resolve config directory"))?;
     Ok(config_path_from_roaming_app_data(&roaming_app_data))
+}
+
+pub fn stamps_dir() -> Result<PathBuf> {
+    stamps_dir_from_config_path(&config_path()?)
+}
+
+pub fn stamp_path(stamp_id: &str) -> Result<PathBuf> {
+    validate_stamp_id(stamp_id)?;
+    Ok(stamps_dir()?.join(format!("{stamp_id}.png")))
+}
+
+/// PNG の形式・ファイルサイズ・デコード時リソース上限を検証する。
+pub fn decode_stamp_png(source: &Path) -> Result<image::DynamicImage> {
+    let metadata = std::fs::metadata(source)
+        .with_context(|| format!("スタンプ画像を読み込めません: {}", source.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("スタンプには PNG ファイルを指定してください");
+    }
+    if metadata.len() > MAX_STAMP_FILE_BYTES {
+        anyhow::bail!("スタンプ画像は 5 MiB 以下にしてください");
+    }
+    let encoded = std::fs::read(source)
+        .with_context(|| format!("スタンプ画像を読み込めません: {}", source.display()))?;
+    reject_animated_png(&encoded)?;
+
+    let mut reader = image::ImageReader::open(source)
+        .with_context(|| format!("スタンプ画像を開けません: {}", source.display()))?
+        .with_guessed_format()
+        .context("スタンプ画像の形式を判定できません")?;
+    if reader.format() != Some(image::ImageFormat::Png) {
+        anyhow::bail!("スタンプに登録できる画像は PNG だけです");
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_STAMP_DIMENSION);
+    limits.max_image_height = Some(MAX_STAMP_DIMENSION);
+    limits.max_alloc = Some(MAX_STAMP_PIXELS * 16);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .context("PNG スタンプをデコードできません")?;
+    let (width_px, height_px) = (decoded.width(), decoded.height());
+    validate_stamp_dimensions(width_px, height_px)?;
+    Ok(decoded)
+}
+
+fn reject_animated_png(encoded: &[u8]) -> Result<()> {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !encoded.starts_with(SIGNATURE) {
+        anyhow::bail!("スタンプに登録できる画像は PNG だけです");
+    }
+    let mut offset = SIGNATURE.len();
+    while offset.saturating_add(12) <= encoded.len() {
+        let length = u32::from_be_bytes(
+            encoded[offset..offset + 4]
+                .try_into()
+                .expect("four-byte PNG chunk length"),
+        ) as usize;
+        let Some(chunk_end) = offset
+            .checked_add(12)
+            .and_then(|base| base.checked_add(length))
+        else {
+            break;
+        };
+        if chunk_end > encoded.len() {
+            break;
+        }
+        let chunk_type = &encoded[offset + 4..offset + 8];
+        if chunk_type == b"acTL" {
+            anyhow::bail!("アニメーションPNGは未対応です。静止PNGを指定してください");
+        }
+        offset = chunk_end;
+        if chunk_type == b"IEND" {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+/// 検証済みPNGを管理ディレクトリへコピーし、設定エントリを返す。
+/// 設定画面のキャンセル時に呼び出し側が返却パスを削除できるよう、コピー先も返す。
+pub fn import_stamp(source: &Path) -> Result<(StampConfig, PathBuf)> {
+    let decoded = decode_stamp_png(source)?;
+    let (width_px, height_px) = (decoded.width(), decoded.height());
+    let id = uuid::Uuid::now_v7().to_string();
+    let destination = stamp_path(&id)?;
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("スタンプ保存先を作成できません: {}", parent.display()))?;
+    }
+    std::fs::copy(source, &destination)
+        .with_context(|| format!("スタンプ画像を保存できません: {}", destination.display()))?;
+
+    let fallback_name = "スタンプ";
+    let raw_name = source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(fallback_name);
+    let name: String = raw_name
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(64)
+        .collect();
+    let name = if name.trim().is_empty() {
+        fallback_name.to_owned()
+    } else {
+        name
+    };
+
+    Ok((
+        StampConfig {
+            id,
+            name,
+            width_px,
+            height_px,
+            default_height_n: default_stamp_height(),
+            opacity: default_stamp_opacity(),
+        },
+        destination,
+    ))
 }
 
 #[cfg(windows)]
@@ -221,7 +380,8 @@ pub fn save(config: &Config) -> Result<()> {
     let body = toml::to_string_pretty(config).context("failed to serialize configuration")?;
     let text =
         format!("# StreamPainter 設定 — 通常はタスクトレイの「設定...」から編集します。\n{body}");
-    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))
+    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 impl Config {
@@ -267,8 +427,91 @@ impl Config {
         {
             anyhow::bail!("ブラシ幅には 0 より大きく 1 以下の値を指定してください");
         }
+
+        if self.stamps.len() > MAX_STAMPS {
+            anyhow::bail!("登録できるスタンプは最大 {MAX_STAMPS} 個です");
+        }
+        let mut ids = std::collections::HashSet::new();
+        for stamp in &self.stamps {
+            validate_stamp_id(&stamp.id)?;
+            if !ids.insert(&stamp.id) {
+                anyhow::bail!("スタンプ ID が重複しています: {}", stamp.id);
+            }
+            let name = stamp.name.trim();
+            if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+                anyhow::bail!("スタンプ名は 1〜64 文字で指定してください");
+            }
+            validate_stamp_dimensions(stamp.width_px, stamp.height_px)?;
+            if !stamp.default_height_n.is_finite()
+                || !(0.01..=1.0).contains(&stamp.default_height_n)
+            {
+                anyhow::bail!("スタンプの表示サイズは 1〜100% で指定してください");
+            }
+            if !stamp.opacity.is_finite() || !(0.0..=1.0).contains(&stamp.opacity) {
+                anyhow::bail!("スタンプの不透明度は 0〜100% で指定してください");
+            }
+        }
         Ok(())
     }
+}
+
+fn validate_stamp_id(stamp_id: &str) -> Result<()> {
+    if stamp_id.is_empty()
+        || stamp_id.len() > 64
+        || !stamp_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        anyhow::bail!("スタンプ ID が不正です");
+    }
+    Ok(())
+}
+
+fn validate_stamp_dimensions(width: u32, height: u32) -> Result<()> {
+    if width == 0
+        || height == 0
+        || width > MAX_STAMP_DIMENSION
+        || height > MAX_STAMP_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_STAMP_PIXELS
+    {
+        anyhow::bail!(
+            "スタンプ画像は最大 {MAX_STAMP_DIMENSION}×{MAX_STAMP_DIMENSION} px（合計 {MAX_STAMP_PIXELS} px）です"
+        );
+    }
+    Ok(())
+}
+
+/// アプリ起動時に、現在の設定から参照されない管理対象PNGを除去する。
+/// 設定保存直後には実行しない。再起動前のサーバーが旧スタンプを使える状態を保つため。
+pub fn cleanup_unregistered_stamps(config: &Config) -> Result<()> {
+    let directory = stamps_dir()?;
+    if !directory.exists() {
+        return Ok(());
+    }
+    let registered: std::collections::HashSet<&str> = config
+        .stamps
+        .iter()
+        .map(|stamp| stamp.id.as_str())
+        .collect();
+    for entry in std::fs::read_dir(&directory)
+        .with_context(|| format!("failed to inspect {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file()
+            || path.extension().and_then(|extension| extension.to_str()) != Some("png")
+        {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !registered.contains(stem) {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -308,6 +551,62 @@ mod tests {
         assert_eq!(config.screen, 0);
         assert!(config.local_echo);
         assert_eq!(config.brush.width_n, 0.005);
+        assert!(config.stamps.is_empty());
+    }
+
+    #[test]
+    fn stamp_directory_is_a_sibling_of_config_directory() {
+        let path = Path::new("RoamingAppData")
+            .join("StreamPainter")
+            .join("config")
+            .join("config.toml");
+        assert_eq!(
+            stamps_dir_from_config_path(&path).unwrap(),
+            Path::new("RoamingAppData")
+                .join("StreamPainter")
+                .join("stamps")
+        );
+    }
+
+    #[test]
+    fn stamp_validation_rejects_unsafe_ids_and_dimensions() {
+        let mut config = Config::default();
+        config.stamps.push(StampConfig {
+            id: "../outside".into(),
+            name: "bad".into(),
+            width_px: 64,
+            height_px: 64,
+            default_height_n: 0.15,
+            opacity: 1.0,
+        });
+        assert!(config.validate().is_err());
+
+        config.stamps[0].id = "safe-id".into();
+        config.stamps[0].width_px = MAX_STAMP_DIMENSION + 1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn stamp_png_decoder_accepts_a_small_valid_png() {
+        let path =
+            std::env::temp_dir().join(format!("stream-painter-{}.png", uuid::Uuid::now_v7()));
+        let image = image::RgbaImage::from_pixel(2, 3, image::Rgba([255, 0, 0, 128]));
+        image
+            .save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        let decoded = decode_stamp_png(&path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 3));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn animated_png_control_chunk_is_rejected() {
+        let mut encoded = b"\x89PNG\r\n\x1a\n".to_vec();
+        encoded.extend_from_slice(&8_u32.to_be_bytes());
+        encoded.extend_from_slice(b"acTL");
+        encoded.extend_from_slice(&[0; 8]);
+        encoded.extend_from_slice(&[0; 4]);
+        assert!(reject_animated_png(&encoded).is_err());
     }
 
     #[test]
@@ -325,7 +624,15 @@ local_server_port = 18080
 
     #[test]
     fn config_round_trips_through_toml() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.stamps.push(StampConfig {
+            id: "stamp-1".into(),
+            name: "テスト".into(),
+            width_px: 320,
+            height_px: 180,
+            default_height_n: 0.2,
+            opacity: 0.75,
+        });
         let text = toml::to_string_pretty(&config).unwrap();
         let decoded: Config = toml::from_str(&text).unwrap();
         assert_eq!(decoded, config);
