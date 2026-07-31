@@ -95,6 +95,9 @@ stream-painter.exe --settings
 - プロジェクター追従が有効な場合、設定対象モニターでOBSプロジェクターを表示する。
 - OBS自動制御が有効な場合、OBSのWebSocketサーバー設定とパスワードを確認する。
 
+他アプリがF9を使用中でもStreamPainter自体は終了せず、タスクトレイの
+「描画モード切替」から操作できます。競合の詳細はログに記録されます。
+
 診断用に `stream-painter.exe --detect` を実行すると、モニタ、検出対象ウィンドウ、
 OBS判定、Topmost状態を表示します。
 

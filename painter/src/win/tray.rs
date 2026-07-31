@@ -33,7 +33,7 @@ const MENU_SETTINGS: usize = 2;
 const MENU_LICENSES: usize = 3;
 const MENU_EXIT: usize = 4;
 
-pub fn add(hwnd: HWND) -> Result<()> {
+pub fn add(hwnd: HWND, hotkey_registered: bool) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -43,10 +43,12 @@ pub fn add(hwnd: HWND) -> Result<()> {
         hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).context("LoadIconW")? },
         ..Default::default()
     };
-    let tip: Vec<u16> = "StreamPainter (F9: 描画モード切替)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let tip_text = if hotkey_registered {
+        "StreamPainter (F9: 描画モード切替)"
+    } else {
+        "StreamPainter (描画モードはトレイから切替)"
+    };
+    let tip: Vec<u16> = tip_text.encode_utf16().chain(std::iter::once(0)).collect();
     data.szTip[..tip.len().min(128)].copy_from_slice(&tip[..tip.len().min(128)]);
 
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
@@ -68,7 +70,7 @@ pub fn remove(hwnd: HWND) {
 }
 
 /// WM_TRAY 受信時の処理。メニューを出し、選択されたコマンドを返す
-pub fn on_message(hwnd: HWND, lparam_low: u32) -> Option<TrayCommand> {
+pub fn on_message(hwnd: HWND, lparam_low: u32, hotkey_registered: bool) -> Option<TrayCommand> {
     if lparam_low != WM_RBUTTONUP && lparam_low != WM_LBUTTONUP && lparam_low != WM_CONTEXTMENU {
         return None;
     }
@@ -76,7 +78,12 @@ pub fn on_message(hwnd: HWND, lparam_low: u32) -> Option<TrayCommand> {
     let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();
     unsafe {
         let menu = CreatePopupMenu().ok()?;
-        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, w!("描画モード切替 (F9)"));
+        let toggle_label = if hotkey_registered {
+            w!("描画モード切替 (F9)")
+        } else {
+            w!("描画モード切替")
+        };
+        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle_label);
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定..."));
         let _ = AppendMenuW(menu, MF_STRING, MENU_LICENSES, w!("第三者ライセンス..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);

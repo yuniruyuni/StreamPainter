@@ -13,7 +13,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_NOREPEAT, VK_F9};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_F9,
+};
 use windows::Win32::UI::Input::Pointer::EnableMouseInPointer;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
@@ -78,6 +80,8 @@ struct App {
     close_projector: bool,
     /// F9 → プロジェクターを開いて描画モードに入る、の完了待ち (開始時刻)
     pending_draw: Option<std::time::Instant>,
+    /// F9を確保できない場合もトレイ操作だけで継続する。
+    hotkey_registered: bool,
     /// 現在のプロジェクターを自分が obs-websocket で開いたか
     /// (手動で開かれたものは F9 オフでも閉じない)
     projector_opened_by_us: bool,
@@ -174,6 +178,7 @@ pub fn run() -> Result<()> {
         obs,
         close_projector: config.close_projector,
         pending_draw: None,
+        hotkey_registered: false,
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
     });
@@ -189,22 +194,31 @@ pub fn run() -> Result<()> {
 
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
-        RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, MOD_NOREPEAT, VK_F9.0 as u32)
-            .context("RegisterHotKey F9 (他のアプリが使用中?)")?;
-        tray::add(hwnd)?;
+        let app_ref = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
+        app_ref.hotkey_registered =
+            match RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, MOD_NOREPEAT, VK_F9.0 as u32) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        "F9 global hotkey is unavailable ({error}); \
+                         use the task tray to toggle draw mode"
+                    );
+                    false
+                }
+            };
+        tray::add(hwnd, app_ref.hotkey_registered)?;
         // 初期状態はパススルー
         set_transparent(hwnd, true);
         SetTimer(Some(hwnd), PROJECTOR_TIMER_ID, PROJECTOR_INTERVAL_MS, None);
         // 追従モードでは初回検知が終わるまで隠しておく (poll_projector が表示する)。
         // 追従しない場合も、OBSプロジェクターがあればZ-orderだけは同期する。
-        let app_ref = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
         if !app_ref.follow_projector {
             app_ref.projector_visible = true;
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         app_ref.poll_projector(hwnd);
     }
-    info!("ready — F9 で描画モードを切り替えます");
+    info!("ready — 描画モードはF9またはタスクトレイから切り替えられます");
 
     unsafe {
         let mut msg = MSG::default();
@@ -781,7 +795,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_TRAY => {
             // tray popup も内部メッセージループを持つため、先に結果だけ取得する。
-            let command = tray::on_message(hwnd, (lparam.0 & 0xffff) as u32);
+            let command = tray::on_message(
+                hwnd,
+                (lparam.0 & 0xffff) as u32,
+                unsafe { &*app_ptr }.hotkey_registered,
+            );
             let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
             if current != app_ptr {
                 return LRESULT(0);
@@ -838,6 +856,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             tray::remove(hwnd);
+            if unsafe { &*app_ptr }.hotkey_registered {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
+                }
+            }
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(app_ptr));
