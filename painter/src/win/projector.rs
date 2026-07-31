@@ -298,12 +298,22 @@ fn set_topmost(hwnd: HWND, topmost: bool) -> WindowsResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
     use windows::core::w;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, GetTopWindow, GetWindow, GW_HWNDNEXT, WINDOW_EX_STYLE,
         WS_EX_TOOLWINDOW, WS_POPUP,
     };
+
+    static Z_ORDER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialize_z_order_tests() -> MutexGuard<'static, ()> {
+        Z_ORDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct TestWindow(HWND);
 
@@ -360,6 +370,7 @@ mod tests {
 
     #[test]
     fn guard_stacks_overlay_and_restores_only_promoted_projector() {
+        let _test_lock = serialize_z_order_tests();
         let projector = TestWindow::new(false);
         let overlay = TestWindow::new(true);
 
@@ -385,6 +396,7 @@ mod tests {
 
     #[test]
     fn foreground_ui_suspends_z_order_changes_until_it_closes() {
+        let _test_lock = serialize_z_order_tests();
         let projector = TestWindow::new(false);
         let overlay = TestWindow::new(true);
         let mut z_order = ZOrderGuard::default();
