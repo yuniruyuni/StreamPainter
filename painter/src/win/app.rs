@@ -23,10 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, IDC_CROSS, LWA_ALPHA, MSG,
     POINTER_MESSAGE_FLAG_FIRSTBUTTON, POINTER_MESSAGE_FLAG_SECONDBUTTON, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_DESTROY,
-    WM_HOTKEY, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config;
@@ -71,6 +71,8 @@ struct App {
     width_n: f64,
     /// content rect (スクリーン座標)。入力の正規化に使う
     content_screen: Rect,
+    configured_screen: usize,
+    canvas_aspect: (f64, f64),
     monitor: Monitor,
     draw_mode: bool,
     local_echo: bool,
@@ -107,17 +109,24 @@ pub fn run() -> Result<()> {
     }
 
     let monitors = monitor::enumerate();
-    let (screen_index, mon) = match monitors.get(config.screen).copied() {
-        Some(monitor) => (config.screen, monitor),
-        None if !monitors.is_empty() => {
-            warn!(
-                "screen index {} が見つかりません (モニタ数: {}) — プライマリを使用します",
-                config.screen,
-                monitors.len()
-            );
-            (0, monitors[0])
+    let (screen_index, mon) = match select_monitor(&monitors, config.screen) {
+        Some((screen_index, monitor)) => {
+            if screen_index != config.screen {
+                warn!(
+                    "screen index {} が見つかりません (モニタ数: {}) — プライマリを使用します",
+                    config.screen,
+                    monitors.len()
+                );
+            }
+            (screen_index, monitor)
         }
-        None => return Err(anyhow!("利用可能なモニターが見つかりません")),
+        None => {
+            warn!(
+                "screen index {} が見つかりません (モニタ数: 0)",
+                config.screen
+            );
+            return Err(anyhow!("利用可能なモニターが見つかりません"));
+        }
     };
     info!(
         "monitor {}: {}x{} at ({},{})",
@@ -177,6 +186,8 @@ pub fn run() -> Result<()> {
         color: config.brush.color.clone(),
         width_n: config.brush.width_n,
         content_screen,
+        configured_screen: config.screen,
+        canvas_aspect: (aw, ah),
         monitor: mon,
         draw_mode: false,
         local_echo: config.local_echo,
@@ -311,6 +322,14 @@ fn now_ms() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as f64
+}
+
+fn select_monitor(monitors: &[Monitor], configured: usize) -> Option<(usize, Monitor)> {
+    monitors
+        .get(configured)
+        .copied()
+        .map(|monitor| (configured, monitor))
+        .or_else(|| monitors.first().copied().map(|monitor| (0, monitor)))
 }
 
 impl App {
@@ -513,34 +532,7 @@ impl App {
 
         // 同じHWNDに複数のDirectComposition targetを作らないよう先に破棄する。
         self.renderer.take();
-        let items = {
-            let shared = self.engine.shared_items();
-            let snapshot = shared.lock().unwrap().clone();
-            snapshot
-        };
-        let recovery = (|| -> anyhow::Result<Renderer> {
-            let mut renderer = Renderer::new(
-                self.overlay_hwnd,
-                self.monitor.width as u32,
-                self.monitor.height as u32,
-                self.content_local,
-                &self.stamps,
-            )?;
-            if self.local_echo {
-                renderer.rebuild_baked(&items)?;
-            } else {
-                renderer.rebuild_baked(&[])?;
-            }
-            if self.draw_mode {
-                let visible = if self.local_echo { &items[..] } else { &[] };
-                renderer.draw_frame(visible, true)?;
-            } else {
-                renderer.clear_frame()?;
-            }
-            Ok(renderer)
-        })();
-
-        match recovery {
+        match self.create_renderer_from_history() {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
                 info!("graphics resources recovered");
@@ -549,6 +541,105 @@ impl App {
                 warn!("graphics resource recovery failed: {recovery_error:#}");
             }
         }
+    }
+
+    fn create_renderer_from_history(&self) -> anyhow::Result<Renderer> {
+        let items = {
+            let shared = self.engine.shared_items();
+            let snapshot = shared.lock().unwrap().clone();
+            snapshot
+        };
+        let mut renderer = Renderer::new(
+            self.overlay_hwnd,
+            self.monitor.width as u32,
+            self.monitor.height as u32,
+            self.content_local,
+            &self.stamps,
+        )?;
+        if self.local_echo {
+            renderer.rebuild_baked(&items)?;
+        } else {
+            renderer.rebuild_baked(&[])?;
+        }
+        if self.draw_mode {
+            let visible = if self.local_echo { &items[..] } else { &[] };
+            renderer.draw_frame(visible, true)?;
+        } else {
+            renderer.clear_frame()?;
+        }
+        Ok(renderer)
+    }
+
+    /// 解像度変更・モニタ増減に合わせてウィンドウ、座標変換、GPU資源を更新する。
+    fn on_display_change(&mut self, hwnd: HWND) {
+        let monitors = monitor::enumerate();
+        let Some((actual_index, next_monitor)) = select_monitor(&monitors, self.configured_screen)
+        else {
+            warn!("display configuration changed; no monitor is available");
+            self.set_draw_mode(hwnd, false);
+            self.projector_visible = false;
+            let _ = self.projector_z_order.enforce(None, hwnd);
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            return;
+        };
+
+        if next_monitor == self.monitor {
+            self.poll_projector(hwnd);
+            return;
+        }
+
+        let (aspect_width, aspect_height) = self.canvas_aspect;
+        let content_local = content_rect(
+            next_monitor.width as f64,
+            next_monitor.height as f64,
+            aspect_width,
+            aspect_height,
+        );
+        let content_screen = Rect {
+            x: content_local.x + next_monitor.x as f64,
+            y: content_local.y + next_monitor.y as f64,
+            ..content_local
+        };
+        let positioned = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                next_monitor.x,
+                next_monitor.y,
+                next_monitor.width,
+                next_monitor.height,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            )
+        };
+        if let Err(error) = positioned {
+            warn!("failed to resize overlay after display change: {error}");
+            return;
+        }
+
+        info!(
+            "display changed; monitor {} is now {}x{} at ({},{})",
+            actual_index, next_monitor.width, next_monitor.height, next_monitor.x, next_monitor.y
+        );
+        self.monitor = next_monitor;
+        self.content_local = content_local;
+        self.content_screen = content_screen;
+        self.projector_visible = false;
+        self.projector_opened_by_us = false;
+        self.renderer.take();
+        self.last_renderer_recovery = None;
+        match self.create_renderer_from_history() {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                info!("graphics resources resized for the new display");
+            }
+            Err(error) => {
+                self.last_renderer_recovery = Some(std::time::Instant::now());
+                warn!("failed to recreate graphics resources after display change: {error:#}");
+            }
+        }
+        self.poll_projector(hwnd);
     }
 
     /// F9 / トレイからの切替。プロジェクター未表示なら obs-websocket で開く
@@ -964,6 +1055,10 @@ unsafe extern "system" fn window_proc(
             unsafe { &mut *app_ptr }.on_pending_timer(hwnd);
             LRESULT(0)
         }
+        WM_DISPLAYCHANGE => {
+            unsafe { &mut *app_ptr }.on_display_change(hwnd);
+            LRESULT(0)
+        }
         WM_OBS_RESULT => {
             unsafe { &mut *app_ptr }.on_obs_result(hwnd, wparam.0 != 0);
             LRESULT(0)
@@ -983,5 +1078,28 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_monitor(x: i32, primary: bool) -> Monitor {
+        Monitor {
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary,
+        }
+    }
+
+    #[test]
+    fn monitor_selection_falls_back_to_the_first_monitor() {
+        let monitors = [test_monitor(0, true), test_monitor(1920, false)];
+        assert_eq!(select_monitor(&monitors, 1), Some((1, monitors[1])));
+        assert_eq!(select_monitor(&monitors, 9), Some((0, monitors[0])));
+        assert_eq!(select_monitor(&[], 0), None);
     }
 }
