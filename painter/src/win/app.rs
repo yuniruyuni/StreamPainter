@@ -817,6 +817,17 @@ unsafe extern "system" fn window_proc(
                     }
                     unsafe { &mut *app_ptr }.poll_projector(hwnd);
                 }
+                Some(TrayCommand::Logs) => {
+                    unsafe { &mut *app_ptr }.set_draw_mode(hwnd, false);
+                    let result = crate::win::logging::log_directory()
+                        .ok_or_else(|| anyhow!("ログフォルダーを取得できません"))
+                        .and_then(|path| crate::win::open_path(hwnd, &path));
+                    if let Err(error) = result {
+                        warn!("logs: {error:#}");
+                        crate::win::message_box(&format!("ログフォルダーを開けません:\n{error:#}"));
+                    }
+                    unsafe { &mut *app_ptr }.poll_projector(hwnd);
+                }
                 Some(TrayCommand::Licenses) => {
                     let licenses_url = {
                         let app = unsafe { &mut *app_ptr };

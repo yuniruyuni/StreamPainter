@@ -9,6 +9,7 @@ pub mod single_instance;
 pub mod tray;
 
 use anyhow::{bail, Result};
+use std::path::Path;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -54,6 +55,26 @@ pub fn open_url(parent: HWND, url: &str) -> Result<()> {
     if result.0 as isize <= 32 {
         bail!(
             "既定のWebブラウザを開けませんでした (ShellExecuteW: {})",
+            result.0 as isize
+        );
+    }
+    Ok(())
+}
+
+pub fn open_path(parent: HWND, path: &Path) -> Result<()> {
+    let result = unsafe {
+        ShellExecuteW(
+            Some(parent),
+            w!("open"),
+            &HSTRING::from(path),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        bail!(
+            "エクスプローラーを開けませんでした (ShellExecuteW: {})",
             result.0 as isize
         );
     }

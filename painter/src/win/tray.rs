@@ -24,14 +24,16 @@ const TRAY_ID: u32 = 1;
 pub enum TrayCommand {
     ToggleMode,
     Settings,
+    Logs,
     Licenses,
     Exit,
 }
 
 const MENU_TOGGLE: usize = 1;
 const MENU_SETTINGS: usize = 2;
-const MENU_LICENSES: usize = 3;
-const MENU_EXIT: usize = 4;
+const MENU_LOGS: usize = 3;
+const MENU_LICENSES: usize = 4;
+const MENU_EXIT: usize = 5;
 
 pub fn add(hwnd: HWND, hotkey_registered: bool) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
@@ -85,6 +87,7 @@ pub fn on_message(hwnd: HWND, lparam_low: u32, hotkey_registered: bool) -> Optio
         };
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle_label);
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定..."));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_LOGS, w!("ログフォルダー..."));
         let _ = AppendMenuW(menu, MF_STRING, MENU_LICENSES, w!("第三者ライセンス..."));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("終了"));
@@ -107,6 +110,7 @@ pub fn on_message(hwnd: HWND, lparam_low: u32, hotkey_registered: bool) -> Optio
         match selected.0 as usize {
             MENU_TOGGLE => Some(TrayCommand::ToggleMode),
             MENU_SETTINGS => Some(TrayCommand::Settings),
+            MENU_LOGS => Some(TrayCommand::Logs),
             MENU_LICENSES => Some(TrayCommand::Licenses),
             MENU_EXIT => Some(TrayCommand::Exit),
             _ => None,
