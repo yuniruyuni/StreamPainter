@@ -3,6 +3,7 @@ pub mod logging;
 pub mod menu;
 pub mod monitor;
 pub mod projector;
+pub mod radial_menu;
 pub mod render;
 pub mod settings;
 pub mod single_instance;

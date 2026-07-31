@@ -22,11 +22,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, GWLP_USERDATA, GWL_EXSTYLE, HWND_TOPMOST, IDC_CROSS, LWA_ALPHA, MSG,
-    POINTER_MESSAGE_FLAG_FIRSTBUTTON, POINTER_MESSAGE_FLAG_SECONDBUTTON, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    POINTER_MESSAGE_FLAG_CANCELED, POINTER_MESSAGE_FLAG_FIRSTBUTTON,
+    POINTER_MESSAGE_FLAG_SECONDBUTTON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_HOTKEY, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
+    WM_POINTERUPDATE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::config;
@@ -38,6 +39,7 @@ use crate::protocol::{Brush, LineStyle, ShapeKind, Tool};
 use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
 use crate::win::projector;
+use crate::win::radial_menu::{self, RadialMenu, RadialRelease};
 use crate::win::render::Renderer;
 use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
@@ -93,6 +95,8 @@ struct App {
     projector_opened_by_us: bool,
     /// OBSプロジェクターを前面化し、その直上にオーバーレイを保つ。
     projector_z_order: projector::ZOrderGuard,
+    /// 右ボタンを押している間のジェスチャーメニュー。
+    radial_menu: Option<RadialMenu>,
 }
 
 pub fn run() -> Result<()> {
@@ -199,6 +203,7 @@ pub fn run() -> Result<()> {
         hotkey_registered: false,
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
+        radial_menu: None,
     });
 
     // 起動時に透明フレームを 1 回描き、D2D シェーダコンパイル・swapchain 初回
@@ -207,7 +212,7 @@ pub fn run() -> Result<()> {
         let t = std::time::Instant::now();
         let renderer = app.renderer.as_mut().expect("renderer was initialized");
         renderer.rebuild_baked(&[])?;
-        renderer.draw_frame(&[], false)?;
+        renderer.draw_frame(&[], false, None)?;
         info!("renderer warmup: {:?}", t.elapsed());
     }
 
@@ -322,6 +327,21 @@ fn now_ms() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as f64
+}
+
+fn pointer_id(wparam: WPARAM) -> u32 {
+    (wparam.0 & 0xffff) as u32
+}
+
+fn pointer_flags(wparam: WPARAM) -> u32 {
+    ((wparam.0 >> 16) & 0xffff) as u32
+}
+
+fn pointer_screen(lparam: LPARAM) -> (f64, f64) {
+    (
+        (lparam.0 & 0xffff) as i16 as f64,
+        ((lparam.0 >> 16) & 0xffff) as i16 as f64,
+    )
 }
 
 fn select_monitor(monitors: &[Monitor], configured: usize) -> Option<(usize, Monitor)> {
@@ -470,11 +490,19 @@ impl App {
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
         let visible = if self.local_echo { &items[..] } else { &[] };
+        let radial = self.radial_menu.as_ref().map(|menu| {
+            (
+                menu,
+                &self.tool,
+                self.color.as_str(),
+                self.stamps.as_slice(),
+            )
+        });
         let result = self
             .renderer
             .as_mut()
             .ok_or_else(|| anyhow!("renderer is unavailable"))
-            .and_then(|renderer| renderer.draw_frame(visible, self.draw_mode));
+            .and_then(|renderer| renderer.draw_frame(visible, self.draw_mode, radial));
         drop(items);
         if let Err(error) = result {
             self.recover_renderer("draw_frame", error);
@@ -563,7 +591,15 @@ impl App {
         }
         if self.draw_mode {
             let visible = if self.local_echo { &items[..] } else { &[] };
-            renderer.draw_frame(visible, true)?;
+            let radial = self.radial_menu.as_ref().map(|menu| {
+                (
+                    menu,
+                    &self.tool,
+                    self.color.as_str(),
+                    self.stamps.as_slice(),
+                )
+            });
+            renderer.draw_frame(visible, true, radial)?;
         } else {
             renderer.clear_frame()?;
         }
@@ -589,6 +625,7 @@ impl App {
             self.poll_projector(hwnd);
             return;
         }
+        self.radial_menu = None;
 
         let (aspect_width, aspect_height) = self.canvas_aspect;
         let content_local = content_rect(
@@ -746,6 +783,7 @@ impl App {
         let t = std::time::Instant::now();
         self.draw_mode = on;
         if !self.draw_mode {
+            self.radial_menu = None;
             // 描画中に切り替えた場合はストロークを破棄する
             let msgs = self.engine.cancel();
             if !msgs.is_empty() {
@@ -779,9 +817,123 @@ impl App {
 
     /// lparam のスクリーン座標を正規化座標へ
     fn pointer_uv(&self, lparam: LPARAM) -> (f64, f64) {
-        let x = (lparam.0 & 0xffff) as i16 as f64;
-        let y = ((lparam.0 >> 16) & 0xffff) as i16 as f64;
+        let (x, y) = pointer_screen(lparam);
         self.content_screen.normalize(x, y)
+    }
+
+    fn begin_radial_menu(&mut self, pointer_id: u32, lparam: LPARAM) {
+        if !self.draw_mode || self.engine.is_drawing() || self.radial_menu.is_some() {
+            return;
+        }
+        let screen = pointer_screen(lparam);
+        let local = (
+            (screen.0 - f64::from(self.monitor.x)) as f32,
+            (screen.1 - f64::from(self.monitor.y)) as f32,
+        );
+        let scale =
+            radial_menu::scale_for_surface(self.monitor.width as u32, self.monitor.height as u32);
+        self.radial_menu = Some(RadialMenu::new(
+            pointer_id,
+            screen,
+            local,
+            (self.monitor.width as u32, self.monitor.height as u32),
+            scale,
+            self.stamps.len(),
+            (self.engine.can_undo(), self.engine.can_redo()),
+        ));
+        self.render();
+    }
+
+    fn begin_radial_click(&mut self, pointer_id: u32, lparam: LPARAM) -> bool {
+        let changed = {
+            let Some(menu) = self.radial_menu.as_mut() else {
+                return false;
+            };
+            if !menu.begin_click(pointer_id) {
+                return false;
+            }
+            menu.update(pointer_screen(lparam))
+        };
+        if changed {
+            self.render();
+        }
+        true
+    }
+
+    fn update_radial_menu(&mut self, pointer_id: u32, lparam: LPARAM) -> bool {
+        let Some(menu) = self.radial_menu.as_mut() else {
+            return false;
+        };
+        if !menu.accepts_update_from(pointer_id) {
+            return false;
+        }
+        if menu.update(pointer_screen(lparam)) {
+            self.render();
+        }
+        true
+    }
+
+    fn release_radial_menu(&mut self, pointer_id: u32, lparam: LPARAM) -> Option<RadialRelease> {
+        let release = {
+            let menu = self.radial_menu.as_mut()?;
+            if !menu.owns_pointer(pointer_id) {
+                return None;
+            }
+            menu.release(pointer_screen(lparam))
+        };
+        if !release.keeps_menu_open() {
+            self.radial_menu.take();
+        }
+        self.render();
+        Some(release)
+    }
+
+    fn cancel_radial_interaction(&mut self) -> bool {
+        let keep_pinned = {
+            let Some(menu) = self.radial_menu.as_mut() else {
+                return false;
+            };
+            if !menu.has_active_pointer() {
+                return false;
+            }
+            menu.cancel_active_pointer();
+            menu.is_pinned()
+        };
+        if !keep_pinned {
+            self.radial_menu.take();
+        }
+        self.render();
+        true
+    }
+
+    fn dismiss_radial_menu(&mut self) -> bool {
+        if self.radial_menu.take().is_none() {
+            return false;
+        }
+        self.render();
+        true
+    }
+
+    fn radial_menu_owns(&self, pointer_id: u32) -> bool {
+        self.radial_menu
+            .as_ref()
+            .is_some_and(|menu| menu.owns_pointer(pointer_id))
+    }
+
+    fn radial_menu_is_pinned(&self) -> bool {
+        self.radial_menu.as_ref().is_some_and(RadialMenu::is_pinned)
+    }
+
+    fn sync_radial_history(&mut self) {
+        let can_undo = self.engine.can_undo();
+        let can_redo = self.engine.can_redo();
+        if self
+            .radial_menu
+            .as_mut()
+            .is_some_and(|menu| menu.set_history_availability(can_undo, can_redo))
+        {
+            self.render();
+        }
     }
 
     fn on_pointer_down(&mut self, hwnd: HWND, lparam: LPARAM) {
@@ -906,6 +1058,46 @@ impl App {
     }
 }
 
+fn apply_menu_result(hwnd: HWND, app_ptr: *mut App, action: Option<MenuAction>) {
+    let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+    if current != app_ptr {
+        return;
+    }
+    let exit =
+        action.is_some_and(|action| unsafe { (&mut *app_ptr).apply_menu_action(hwnd, action) });
+    if exit {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    } else {
+        let app = unsafe { &mut *app_ptr };
+        app.sync_radial_history();
+        // popupが消えた場合と固定メニューが残る場合の双方でZ-orderを再同期する。
+        app.poll_projector(hwnd);
+    }
+}
+
+/// TrackPopupMenu の内部ループ中は App の参照を保持しない。
+fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
+    let menu_input = {
+        let app = unsafe { &*app_ptr };
+        (!app.engine.is_drawing()).then(|| {
+            (
+                app.tool.clone(),
+                app.color.clone(),
+                app.stamps.clone(),
+                app.engine.can_undo(),
+                app.engine.can_redo(),
+            )
+        })
+    };
+    let Some((tool, color, stamps, can_undo, can_redo)) = menu_input else {
+        return;
+    };
+    let action = menu::show(hwnd, &tool, &color, &stamps, can_undo, can_redo);
+    apply_menu_result(hwnd, app_ptr, action);
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: u32,
@@ -933,46 +1125,31 @@ unsafe extern "system" fn window_proc(
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
             // wparam の HIWORD にボタン種別フラグが入る (POINTER_MESSAGE_FLAG_*)
-            let flags = ((wparam.0 >> 16) & 0xffff) as u32;
-            if flags & POINTER_MESSAGE_FLAG_SECONDBUTTON != 0 {
-                // TrackPopupMenu は内部でメッセージをdispatchする。App の可変参照を
-                // popup 表示中まで保持せず、入力値を複製して閉じた後に取り直す。
-                let menu_input = {
-                    let app = unsafe { &*app_ptr };
-                    (!app.engine.is_drawing()).then(|| {
-                        (
-                            app.tool.clone(),
-                            app.color.clone(),
-                            app.stamps.clone(),
-                            app.engine.can_undo(),
-                            app.engine.can_redo(),
-                        )
-                    })
-                };
-                if let Some((tool, color, stamps, can_undo, can_redo)) = menu_input {
-                    let action = menu::show(hwnd, &tool, &color, &stamps, can_undo, can_redo);
-                    let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
-                    if current == app_ptr {
-                        let exit = action.is_some_and(|action| {
-                            unsafe { &mut *app_ptr }.apply_menu_action(hwnd, action)
-                        });
-                        if exit {
-                            unsafe {
-                                let _ = DestroyWindow(hwnd);
-                            }
-                        } else {
-                            // popup が消えたので overlay > projector の順を即時復元する。
-                            unsafe { &mut *app_ptr }.poll_projector(hwnd);
-                        }
-                    }
+            let flags = pointer_flags(wparam);
+            let id = pointer_id(wparam);
+            if unsafe { &*app_ptr }.radial_menu_is_pinned() {
+                if flags & (POINTER_MESSAGE_FLAG_FIRSTBUTTON | POINTER_MESSAGE_FLAG_SECONDBUTTON)
+                    != 0
+                {
+                    unsafe { &mut *app_ptr }.begin_radial_click(id, lparam);
                 }
+            } else if flags & POINTER_MESSAGE_FLAG_SECONDBUTTON != 0 {
+                unsafe { &mut *app_ptr }.begin_radial_menu(id, lparam);
             } else if flags & POINTER_MESSAGE_FLAG_FIRSTBUTTON != 0 {
                 unsafe { &mut *app_ptr }.on_pointer_down(hwnd, lparam);
             }
             LRESULT(0)
         }
         WM_POINTERUPDATE => {
-            if unsafe { &*app_ptr }.engine.is_drawing() {
+            let id = pointer_id(wparam);
+            if pointer_flags(wparam) & POINTER_MESSAGE_FLAG_CANCELED != 0
+                && unsafe { &*app_ptr }.radial_menu_owns(id)
+            {
+                unsafe { &mut *app_ptr }.cancel_radial_interaction();
+                LRESULT(0)
+            } else if unsafe { &mut *app_ptr }.update_radial_menu(id, lparam) {
+                LRESULT(0)
+            } else if unsafe { &*app_ptr }.engine.is_drawing() {
                 unsafe { &mut *app_ptr }.on_pointer_update(hwnd, lparam);
                 LRESULT(0)
             } else {
@@ -980,8 +1157,47 @@ unsafe extern "system" fn window_proc(
             }
         }
         WM_POINTERUP => {
-            if unsafe { &*app_ptr }.engine.is_drawing() {
+            let id = pointer_id(wparam);
+            if pointer_flags(wparam) & POINTER_MESSAGE_FLAG_CANCELED != 0
+                && unsafe { &*app_ptr }.radial_menu_owns(id)
+            {
+                unsafe { &mut *app_ptr }.cancel_radial_interaction();
+                LRESULT(0)
+            } else if let Some(release) = unsafe { &mut *app_ptr }.release_radial_menu(id, lparam) {
+                match release {
+                    RadialRelease::Action { action, .. } => {
+                        apply_menu_result(hwnd, app_ptr, Some(action));
+                    }
+                    RadialRelease::Stamp(index) => {
+                        let action = unsafe { &*app_ptr }
+                            .stamps
+                            .get(index)
+                            .map(|stamp| MenuAction::SelectTool(DrawTool::Stamp(stamp.id.clone())));
+                        apply_menu_result(hwnd, app_ptr, action);
+                    }
+                    RadialRelease::LegacyMenu => show_legacy_menu(hwnd, app_ptr),
+                    RadialRelease::Pin | RadialRelease::StayOpen => {
+                        unsafe { &mut *app_ptr }.poll_projector(hwnd);
+                    }
+                    RadialRelease::Cancel => unsafe { &mut *app_ptr }.poll_projector(hwnd),
+                }
+                LRESULT(0)
+            } else if unsafe { &*app_ptr }.engine.is_drawing() {
                 unsafe { &mut *app_ptr }.on_pointer_up(hwnd);
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_POINTERCAPTURECHANGED | WM_CAPTURECHANGED => {
+            if unsafe { &mut *app_ptr }.cancel_radial_interaction() {
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_CANCELMODE => {
+            if unsafe { &mut *app_ptr }.dismiss_radial_menu() {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

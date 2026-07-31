@@ -10,20 +10,24 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use tracing::warn;
-use windows::core::Interface;
+use windows::core::{w, Interface};
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN,
-    D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Factory1, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle1, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE,
+    D2D1CreateFactory, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext, ID2D1Factory1,
+    ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle1, D2D1_ARC_SEGMENT,
+    D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_ROUND,
-    D2D1_PRIMITIVE_BLEND_COPY, D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_QUADRATIC_BEZIER_SEGMENT,
-    D2D1_STROKE_STYLE_PROPERTIES1,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY,
+    D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
@@ -31,6 +35,11 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -48,6 +57,11 @@ use crate::engine::geometry::{dot, full_segments, Segment};
 use crate::protocol::{
     Brush, CanvasItem, LineStyle, ShapeItem, ShapeKind, StampItem, Stroke, Tool,
 };
+use crate::win::menu::{DrawTool, COLORS};
+use crate::win::radial_menu::{
+    self, RadialCommand, RadialMenu, RadialSelection, COLOR_COUNT, STAMPS_PER_RING,
+    STAMP_TOOL_INDEX, TOOL_COUNT,
+};
 
 pub struct Renderer {
     factory: ID2D1Factory1,
@@ -57,6 +71,7 @@ pub struct Renderer {
     baked: ID2D1Bitmap1,
     stamp_bitmaps: HashMap<String, ID2D1Bitmap1>,
     stroke_style: ID2D1StrokeStyle1,
+    radial_text: IDWriteTextFormat,
     /// content rect (ウィンドウローカル座標)。正規化座標をこの矩形に展開する
     content: Rect,
     // DComp オブジェクトは drop されると合成が消えるため保持し続ける
@@ -115,6 +130,8 @@ impl Renderer {
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let d2d_device = factory.CreateDevice(&dxgi_device)?;
             let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            // 透明swapchain上ではClearTypeではなくアルファ対応のグレースケールを使う。
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
             let bitmap_props = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -156,6 +173,20 @@ impl Renderer {
                 None,
             )?;
 
+            let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let radial_scale = radial_menu::scale_for_surface(width, height);
+            let radial_text = dwrite_factory.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                13.0 * radial_scale,
+                w!("ja-JP"),
+            )?;
+            radial_text.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            radial_text.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+
             // DComp: swapchain を visual としてウィンドウに合成
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)?;
             let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
@@ -172,6 +203,7 @@ impl Renderer {
                 baked,
                 stamp_bitmaps,
                 stroke_style,
+                radial_text,
                 content,
                 _dcomp_device: dcomp_device,
                 _dcomp_target: dcomp_target,
@@ -220,8 +252,13 @@ impl Renderer {
         Ok(())
     }
 
-    /// 1 フレーム描画: baked + 描画中項目 (+ 描画モードの枠表示)
-    pub fn draw_frame(&mut self, items: &[CanvasItem], draw_mode: bool) -> Result<()> {
+    /// 1 フレーム描画: baked + 描画中項目 + 描画UI。
+    pub fn draw_frame(
+        &mut self,
+        items: &[CanvasItem],
+        draw_mode: bool,
+        radial: Option<(&RadialMenu, &DrawTool, &str, &[StampConfig])>,
+    ) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.target);
             self.dc.BeginDraw();
@@ -239,6 +276,9 @@ impl Renderer {
             }
             if draw_mode {
                 self.draw_mode_border()?;
+            }
+            if let Some((menu, tool, color, stamps)) = radial {
+                self.draw_radial_menu(menu, tool, color, stamps)?;
             }
             self.dc.EndDraw(None, None)?;
             self.swapchain.Present(1, Default::default()).ok()?;
@@ -415,6 +455,549 @@ impl Renderer {
             );
         }
         Ok(())
+    }
+
+    fn draw_radial_menu(
+        &self,
+        menu: &RadialMenu,
+        current_tool: &DrawTool,
+        current_color: &str,
+        stamps: &[StampConfig],
+    ) -> Result<()> {
+        debug_assert_eq!(menu.stamp_count(), stamps.len());
+        let center = menu.center_local();
+        let outline = unsafe {
+            self.dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.02,
+                    g: 0.03,
+                    b: 0.05,
+                    a: 0.9,
+                },
+                None,
+            )?
+        };
+        let text = unsafe {
+            self.dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+                None,
+            )?
+        };
+
+        for index in 0..TOOL_COUNT {
+            let selection = if index == STAMP_TOOL_INDEX {
+                RadialSelection::StampCategory
+            } else {
+                RadialSelection::Tool(index)
+            };
+            let enabled = index != STAMP_TOOL_INDEX || !stamps.is_empty();
+            let highlighted = enabled
+                && (menu.highlighted() == Some(selection)
+                    || (index == STAMP_TOOL_INDEX && menu.stamp_mode()));
+            let current = if index == STAMP_TOOL_INDEX {
+                matches!(current_tool, DrawTool::Stamp(_))
+            } else {
+                radial_menu::tool_at(index)
+                    .as_ref()
+                    .is_some_and(|tool| tool == current_tool)
+            };
+            let fill_color = if highlighted {
+                D2D1_COLOR_F {
+                    r: 0.12,
+                    g: 0.52,
+                    b: 0.76,
+                    a: 0.98,
+                }
+            } else if current {
+                D2D1_COLOR_F {
+                    r: 0.08,
+                    g: 0.26,
+                    b: 0.36,
+                    a: 0.96,
+                }
+            } else if !enabled {
+                D2D1_COLOR_F {
+                    r: 0.035,
+                    g: 0.04,
+                    b: 0.05,
+                    a: 0.78,
+                }
+            } else {
+                D2D1_COLOR_F {
+                    r: 0.055,
+                    g: 0.065,
+                    b: 0.085,
+                    a: 0.94,
+                }
+            };
+            let fill = unsafe { self.dc.CreateSolidColorBrush(&fill_color, None)? };
+            let (start, end) = radial_menu::sector_angles(index, TOOL_COUNT);
+            let geometry = self.annular_wedge(
+                center,
+                menu.tool_inner_radius(),
+                menu.tool_outer_radius(),
+                start,
+                end,
+            )?;
+            unsafe {
+                self.dc.FillGeometry(&geometry, &fill, None::<&ID2D1Brush>);
+                self.dc.DrawGeometry(
+                    &geometry,
+                    &outline,
+                    if highlighted { 3.0 } else { 1.5 },
+                    &self.stroke_style,
+                );
+            }
+
+            if let Some(label) = radial_menu::tool_label(index) {
+                let angle = radial_menu::sector_center_angle(index, TOOL_COUNT);
+                let radius = (menu.tool_inner_radius() + menu.tool_outer_radius()) / 2.0;
+                let position = (
+                    center.0 + radius * angle.cos(),
+                    center.1 + radius * angle.sin(),
+                );
+                self.draw_centered_text(
+                    label,
+                    position,
+                    72.0 * menu.scale(),
+                    32.0 * menu.scale(),
+                    &text,
+                );
+            }
+        }
+
+        if menu.stamp_mode() {
+            self.draw_radial_stamp_rings(menu, current_tool, stamps, &outline, &text)?;
+        } else {
+            self.draw_radial_color_ring(menu, current_color, &outline)?;
+            self.draw_radial_commands(menu, &text)?;
+        }
+
+        let center_radius = menu.tool_inner_radius() - 5.0 * menu.scale();
+        let center_highlighted = menu.highlighted() == Some(RadialSelection::StandardMenu);
+        let center_color = if center_highlighted {
+            D2D1_COLOR_F {
+                r: 0.1,
+                g: 0.38,
+                b: 0.56,
+                a: 0.98,
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 0.055,
+                g: 0.065,
+                b: 0.085,
+                a: 0.96,
+            }
+        };
+        let center_fill = unsafe { self.dc.CreateSolidColorBrush(&center_color, None)? };
+        unsafe {
+            self.dc.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2 {
+                        X: center.0,
+                        Y: center.1,
+                    },
+                    radiusX: center_radius,
+                    radiusY: center_radius,
+                },
+                &center_fill,
+            );
+            self.dc.DrawEllipse(
+                &D2D1_ELLIPSE {
+                    point: Vector2 {
+                        X: center.0,
+                        Y: center.1,
+                    },
+                    radiusX: center_radius,
+                    radiusY: center_radius,
+                },
+                &outline,
+                if center_highlighted { 3.0 } else { 1.5 },
+                &self.stroke_style,
+            );
+        }
+        let center_label = match menu.highlighted() {
+            Some(RadialSelection::StandardMenu) => "標準\nメニュー",
+            Some(RadialSelection::Tool(index)) => radial_menu::tool_label(index).unwrap_or(""),
+            Some(RadialSelection::StampCategory) if stamps.is_empty() => "スタンプ\n未登録",
+            Some(RadialSelection::StampCategory) => "スタンプ\n外へ",
+            Some(RadialSelection::Stamp(index)) => {
+                stamps.get(index).map_or("", |stamp| stamp.name.as_str())
+            }
+            Some(RadialSelection::Color(index)) => COLORS.get(index).map_or("", |(name, _)| name),
+            Some(RadialSelection::Command(RadialCommand::Undo)) => "元に\n戻す",
+            Some(RadialSelection::Command(RadialCommand::Redo)) => "やり\n直す",
+            Some(RadialSelection::Command(RadialCommand::Clear)) => "全消去",
+            None if menu.stamp_mode() => "スタンプ\n選択",
+            None => "標準\nメニュー",
+        };
+        self.draw_centered_text(
+            center_label,
+            center,
+            center_radius * 1.8,
+            center_radius * 1.8,
+            &text,
+        );
+        Ok(())
+    }
+
+    fn draw_radial_color_ring(
+        &self,
+        menu: &RadialMenu,
+        current_color: &str,
+        outline: &ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let center = menu.center_local();
+        for (index, (_, hex)) in COLORS.iter().enumerate() {
+            let selection = RadialSelection::Color(index);
+            let highlighted = menu.highlighted() == Some(selection);
+            let (r, g, b) = parse_color(hex);
+            let fill = unsafe {
+                self.dc
+                    .CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a: 0.96 }, None)?
+            };
+            let (start, end) = radial_menu::sector_angles(index, COLOR_COUNT);
+            let geometry = self.annular_wedge(
+                center,
+                menu.color_inner_radius(),
+                menu.color_outer_radius(),
+                start,
+                end,
+            )?;
+            unsafe {
+                self.dc.FillGeometry(&geometry, &fill, None::<&ID2D1Brush>);
+                self.dc
+                    .DrawGeometry(&geometry, outline, 1.5, &self.stroke_style);
+            }
+
+            let current = hex.eq_ignore_ascii_case(current_color);
+            self.draw_radial_indicator(&geometry, highlighted, current)?;
+        }
+        Ok(())
+    }
+
+    fn draw_radial_stamp_rings(
+        &self,
+        menu: &RadialMenu,
+        current_tool: &DrawTool,
+        stamps: &[StampConfig],
+        outline: &ID2D1SolidColorBrush,
+        text: &ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let center = menu.center_local();
+        for ring in 0..menu.stamp_ring_count() {
+            let Some((inner, outer)) = menu.stamp_ring_radii(ring) else {
+                continue;
+            };
+            for slot in 0..menu.stamp_ring_item_count(ring) {
+                let index = ring * STAMPS_PER_RING + slot;
+                let Some(stamp) = stamps.get(index) else {
+                    continue;
+                };
+                let selection = RadialSelection::Stamp(index);
+                let highlighted = menu.highlighted() == Some(selection);
+                let current = match current_tool {
+                    DrawTool::Stamp(id) => id == &stamp.id,
+                    _ => false,
+                };
+                let fill_color = if highlighted {
+                    D2D1_COLOR_F {
+                        r: 0.12,
+                        g: 0.52,
+                        b: 0.76,
+                        a: 0.98,
+                    }
+                } else if current {
+                    D2D1_COLOR_F {
+                        r: 0.08,
+                        g: 0.26,
+                        b: 0.36,
+                        a: 0.96,
+                    }
+                } else {
+                    D2D1_COLOR_F {
+                        r: 0.055,
+                        g: 0.065,
+                        b: 0.085,
+                        a: 0.94,
+                    }
+                };
+                let fill = unsafe { self.dc.CreateSolidColorBrush(&fill_color, None)? };
+                let (start, end) = radial_menu::sector_angles(slot, STAMPS_PER_RING);
+                let geometry = self.annular_wedge(center, inner, outer, start, end)?;
+                unsafe {
+                    self.dc.FillGeometry(&geometry, &fill, None::<&ID2D1Brush>);
+                    self.dc
+                        .DrawGeometry(&geometry, outline, 1.5, &self.stroke_style);
+                }
+
+                let angle = radial_menu::sector_center_angle(slot, STAMPS_PER_RING);
+                let radius = (inner + outer) / 2.0;
+                let position = (
+                    center.0 + radius * angle.cos(),
+                    center.1 + radius * angle.sin(),
+                );
+                if let Some(bitmap) = self.stamp_bitmaps.get(&stamp.id) {
+                    let max_size = 42.0 * menu.scale();
+                    let aspect = stamp.width_px as f32 / stamp.height_px as f32;
+                    let (width, height) = if aspect >= 1.0 {
+                        (max_size, max_size / aspect)
+                    } else {
+                        (max_size * aspect, max_size)
+                    };
+                    let destination = D2D_RECT_F {
+                        left: position.0 - width / 2.0,
+                        top: position.1 - height / 2.0,
+                        right: position.0 + width / 2.0,
+                        bottom: position.1 + height / 2.0,
+                    };
+                    unsafe {
+                        self.dc.DrawBitmap(
+                            bitmap,
+                            Some(&destination),
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_LINEAR,
+                            None,
+                            None,
+                        );
+                    }
+                } else {
+                    self.draw_centered_text(
+                        &stamp.name,
+                        position,
+                        68.0 * menu.scale(),
+                        36.0 * menu.scale(),
+                        text,
+                    );
+                }
+                self.draw_radial_indicator(&geometry, highlighted, current)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_radial_commands(&self, menu: &RadialMenu, text: &ID2D1SolidColorBrush) -> Result<()> {
+        let muted_text = unsafe {
+            self.dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.55,
+                    g: 0.58,
+                    b: 0.64,
+                    a: 0.72,
+                },
+                None,
+            )?
+        };
+        for (command, rect) in menu.command_buttons() {
+            let enabled = menu.command_enabled(command);
+            let highlighted =
+                enabled && menu.highlighted() == Some(RadialSelection::Command(command));
+            let fill_color = match (command, highlighted, enabled) {
+                (RadialCommand::Undo, true, _) => D2D1_COLOR_F {
+                    r: 0.1,
+                    g: 0.45,
+                    b: 0.7,
+                    a: 0.98,
+                },
+                (RadialCommand::Redo, true, _) => D2D1_COLOR_F {
+                    r: 0.08,
+                    g: 0.52,
+                    b: 0.4,
+                    a: 0.98,
+                },
+                (RadialCommand::Clear, true, _) => D2D1_COLOR_F {
+                    r: 0.72,
+                    g: 0.12,
+                    b: 0.17,
+                    a: 0.98,
+                },
+                (RadialCommand::Clear, false, true) => D2D1_COLOR_F {
+                    r: 0.2,
+                    g: 0.055,
+                    b: 0.075,
+                    a: 0.96,
+                },
+                (_, false, true) => D2D1_COLOR_F {
+                    r: 0.055,
+                    g: 0.065,
+                    b: 0.085,
+                    a: 0.96,
+                },
+                (_, false, false) => D2D1_COLOR_F {
+                    r: 0.035,
+                    g: 0.04,
+                    b: 0.05,
+                    a: 0.78,
+                },
+            };
+            let accent_color = match (command, enabled) {
+                (_, false) => D2D1_COLOR_F {
+                    r: 0.16,
+                    g: 0.18,
+                    b: 0.22,
+                    a: 0.8,
+                },
+                (RadialCommand::Undo, true) => D2D1_COLOR_F {
+                    r: 0.23,
+                    g: 0.7,
+                    b: 0.93,
+                    a: 1.0,
+                },
+                (RadialCommand::Redo, true) => D2D1_COLOR_F {
+                    r: 0.3,
+                    g: 0.82,
+                    b: 0.62,
+                    a: 1.0,
+                },
+                (RadialCommand::Clear, true) => D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 0.3,
+                    b: 0.38,
+                    a: 1.0,
+                },
+            };
+            let fill = unsafe { self.dc.CreateSolidColorBrush(&fill_color, None)? };
+            let accent = unsafe { self.dc.CreateSolidColorBrush(&accent_color, None)? };
+            let rounded = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                radiusX: 10.0 * menu.scale(),
+                radiusY: 10.0 * menu.scale(),
+            };
+            unsafe {
+                self.dc.FillRoundedRectangle(&rounded, &fill);
+                self.dc.DrawRoundedRectangle(
+                    &rounded,
+                    &accent,
+                    if highlighted { 3.0 } else { 1.5 },
+                    &self.stroke_style,
+                );
+            }
+            self.draw_centered_text(
+                radial_menu::command_label(command),
+                rect.center(),
+                rect.width() - 8.0 * menu.scale(),
+                rect.height(),
+                if enabled { text } else { &muted_text },
+            );
+        }
+        Ok(())
+    }
+
+    fn draw_radial_indicator(
+        &self,
+        geometry: &ID2D1PathGeometry,
+        highlighted: bool,
+        current: bool,
+    ) -> Result<()> {
+        if !highlighted && !current {
+            return Ok(());
+        }
+        let indicator_color = if highlighted {
+            D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 0.23,
+                g: 0.7,
+                b: 0.93,
+                a: 1.0,
+            }
+        };
+        let indicator = unsafe { self.dc.CreateSolidColorBrush(&indicator_color, None)? };
+        unsafe {
+            self.dc.DrawGeometry(
+                geometry,
+                &indicator,
+                if highlighted { 5.0 } else { 3.0 },
+                &self.stroke_style,
+            );
+        }
+        Ok(())
+    }
+
+    fn annular_wedge(
+        &self,
+        center: (f32, f32),
+        inner: f32,
+        outer: f32,
+        start: f32,
+        end: f32,
+    ) -> Result<ID2D1PathGeometry> {
+        let point = |radius: f32, angle: f32| Vector2 {
+            X: center.0 + radius * angle.cos(),
+            Y: center.1 + radius * angle.sin(),
+        };
+        unsafe {
+            let geometry = self.factory.CreatePathGeometry()?;
+            let sink = geometry.Open()?;
+            sink.BeginFigure(point(outer, start), D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: point(outer, end),
+                size: D2D_SIZE_F {
+                    width: outer,
+                    height: outer,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddLine(point(inner, end));
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: point(inner, start),
+                size: D2D_SIZE_F {
+                    width: inner,
+                    height: inner,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            Ok(geometry.into())
+        }
+    }
+
+    fn draw_centered_text(
+        &self,
+        text: &str,
+        center: (f32, f32),
+        width: f32,
+        height: f32,
+        brush: &ID2D1SolidColorBrush,
+    ) {
+        let text = text.encode_utf16().collect::<Vec<_>>();
+        let rect = D2D_RECT_F {
+            left: center.0 - width / 2.0,
+            top: center.1 - height / 2.0,
+            right: center.0 + width / 2.0,
+            bottom: center.1 + height / 2.0,
+        };
+        unsafe {
+            self.dc.DrawText(
+                &text,
+                &self.radial_text,
+                &rect,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
     }
 
     /// 描画モード中の視覚インジケータ: content rect の枠線
