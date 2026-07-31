@@ -41,6 +41,17 @@ cargo build --release --locked
 `bun.lock`と`painter/Cargo.lock`は、Pull Request時に`bun audit`とRustSecの`cargo audit`で
 検査します。同じ監査は既知の脆弱性データ更新を拾うため毎週自動実行します。
 
+## リリース（メンテナー向け）
+
+1. `painter/Cargo.toml`のバージョンと`CHANGELOG.md`を更新してmainへ反映する。
+2. 同じバージョンの`vX.Y.Z`タグを作成し、originへpushする。
+3. Release workflowが全検証、Windows release build、SHA-256生成、GitHub Release公開を
+   完了したことを確認する。
+
+タグとCargoのバージョンが一致しない場合、または検証・asset uploadのいずれかが失敗した
+場合はReleaseを公開しません。公開後の同じタグ・assetの上書きは行わず、新しい修正版として
+バージョンを上げてください。Windowsコード署名は現在のフローには含まれません。
+
 ## ライセンス
 
 コントリビューションは、リポジトリの [MIT License](LICENSE) の下で提供されます。第三者の
