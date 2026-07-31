@@ -55,12 +55,16 @@ const PROJECTOR_INTERVAL_MS: u32 = 2000;
 const PENDING_TIMER_ID: usize = 3;
 const PENDING_INTERVAL_MS: u32 = 250;
 const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RENDERER_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// obs-websocket 要求スレッドからの結果通知 (wparam: 成功=1)
 const WM_OBS_RESULT: u32 = WM_APP + 2;
 struct App {
     engine: CanvasEngine,
     web: LocalServerHandle,
-    renderer: Renderer,
+    overlay_hwnd: HWND,
+    renderer: Option<Renderer>,
+    content_local: Rect,
+    last_renderer_recovery: Option<std::time::Instant>,
     tool: DrawTool,
     stamps: Vec<crate::config::StampConfig>,
     color: String,
@@ -164,7 +168,10 @@ pub fn run() -> Result<()> {
     let mut app = Box::new(App {
         engine,
         web,
-        renderer,
+        overlay_hwnd: hwnd,
+        renderer: Some(renderer),
+        content_local,
+        last_renderer_recovery: None,
         tool: DrawTool::Pen,
         stamps: config.stamps.clone(),
         color: config.brush.color.clone(),
@@ -187,8 +194,9 @@ pub fn run() -> Result<()> {
     // Present などの一時コストをここで消化する (初回 F9 の体感遅延対策)
     {
         let t = std::time::Instant::now();
-        app.renderer.rebuild_baked(&[])?;
-        app.renderer.draw_frame(&[], false)?;
+        let renderer = app.renderer.as_mut().expect("renderer was initialized");
+        renderer.rebuild_baked(&[])?;
+        renderer.draw_frame(&[], false)?;
         info!("renderer warmup: {:?}", t.elapsed());
     }
 
@@ -443,8 +451,14 @@ impl App {
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
         let visible = if self.local_echo { &items[..] } else { &[] };
-        if let Err(e) = self.renderer.draw_frame(visible, self.draw_mode) {
-            warn!("draw_frame: {e:#}");
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.draw_frame(visible, self.draw_mode));
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("draw_frame", error);
         }
     }
 
@@ -454,8 +468,14 @@ impl App {
         }
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
-        if let Err(e) = self.renderer.rebuild_baked(&items) {
-            warn!("rebuild_baked: {e:#}");
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.rebuild_baked(&items));
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("rebuild_baked", error);
         }
     }
 
@@ -468,8 +488,66 @@ impl App {
         let Some(item) = items.iter().rfind(|item| item.is_done()) else {
             return;
         };
-        if let Err(error) = self.renderer.bake_item(item) {
-            warn!("bake_item: {error:#}");
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.bake_item(item));
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("bake_item", error);
+        }
+    }
+
+    /// GPUデバイス喪失などの描画失敗時に、完全履歴から描画資源を作り直す。
+    fn recover_renderer(&mut self, operation: &str, error: anyhow::Error) {
+        let now = std::time::Instant::now();
+        if self
+            .last_renderer_recovery
+            .is_some_and(|last| now.duration_since(last) < RENDERER_RECOVERY_INTERVAL)
+        {
+            return;
+        }
+        self.last_renderer_recovery = Some(now);
+        warn!("{operation}: {error:#}; recreating graphics resources");
+
+        // 同じHWNDに複数のDirectComposition targetを作らないよう先に破棄する。
+        self.renderer.take();
+        let items = {
+            let shared = self.engine.shared_items();
+            let snapshot = shared.lock().unwrap().clone();
+            snapshot
+        };
+        let recovery = (|| -> anyhow::Result<Renderer> {
+            let mut renderer = Renderer::new(
+                self.overlay_hwnd,
+                self.monitor.width as u32,
+                self.monitor.height as u32,
+                self.content_local,
+                &self.stamps,
+            )?;
+            if self.local_echo {
+                renderer.rebuild_baked(&items)?;
+            } else {
+                renderer.rebuild_baked(&[])?;
+            }
+            if self.draw_mode {
+                let visible = if self.local_echo { &items[..] } else { &[] };
+                renderer.draw_frame(visible, true)?;
+            } else {
+                renderer.clear_frame()?;
+            }
+            Ok(renderer)
+        })();
+
+        match recovery {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                info!("graphics resources recovered");
+            }
+            Err(recovery_error) => {
+                warn!("graphics resource recovery failed: {recovery_error:#}");
+            }
         }
     }
 
@@ -590,8 +668,15 @@ impl App {
         let after_style = t.elapsed();
         if self.draw_mode {
             self.render();
-        } else if let Err(e) = self.renderer.clear_frame() {
-            warn!("clear_frame: {e:#}");
+        } else {
+            let result = self
+                .renderer
+                .as_mut()
+                .ok_or_else(|| anyhow!("renderer is unavailable"))
+                .and_then(Renderer::clear_frame);
+            if let Err(error) = result {
+                self.recover_renderer("clear_frame", error);
+            }
         }
         info!(
             "draw mode: {} (style: {:?}, total: {:?})",
