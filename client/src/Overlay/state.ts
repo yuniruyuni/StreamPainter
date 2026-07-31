@@ -24,6 +24,7 @@ export type RenderEffect =
   | { kind: "none" }
   | { kind: "active"; stroke: Stroke }
   | { kind: "bake"; stroke: Stroke }
+  | { kind: "bake_item"; item: CanvasItem }
   | { kind: "cancel"; strokeId: string }
   | { kind: "preview" }
   | { kind: "rebuild" }
@@ -131,7 +132,7 @@ export class OverlayState {
         if (!shape) return { kind: "none" };
         shape.done = true;
         shape.endedAt = msg.endedAt;
-        return { kind: "rebuild" };
+        return { kind: "bake_item", item: shape };
       }
       case "shape_cancel": {
         const index = this.items.findIndex(
@@ -149,9 +150,9 @@ export class OverlayState {
           return { kind: "none" };
         }
         const stamp: StampItem = { ...msg.stamp, done: true };
-        this.items.push({ kind: "stamp", ...stamp });
-        this.trim();
-        return { kind: "rebuild" };
+        const item: CanvasItem = { kind: "stamp", ...stamp };
+        this.items.push(item);
+        return this.trim() ? { kind: "rebuild" } : { kind: "bake_item", item };
       }
       case "undo": {
         let index = -1;

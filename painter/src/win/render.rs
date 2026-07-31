@@ -194,6 +194,19 @@ impl Renderer {
         Ok(())
     }
 
+    /// 新しく確定した1項目だけをbakedへ追記する。
+    pub fn bake_item(&mut self, item: &CanvasItem) -> Result<()> {
+        unsafe {
+            self.dc.SetTarget(&self.baked);
+            self.dc.BeginDraw();
+        }
+        let draw_result = self.draw_item(item);
+        let end_result = unsafe { self.dc.EndDraw(None, None) };
+        draw_result?;
+        end_result?;
+        Ok(())
+    }
+
     /// 空フレームを提示してオーバーレイ表示を消す (パススルー復帰時)。
     /// baked ビットマップは保持したままなので、次の描画モードで再表示される
     pub fn clear_frame(&mut self) -> Result<()> {

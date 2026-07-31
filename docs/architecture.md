@@ -39,6 +39,10 @@ CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000�
 アイテムを削除する必要が生じた場合は増分ではなくsnapshotを送り、全クライアントを再同期
 します。増分イベントにはrevisionを付け、欠落を検出したoverlayは再接続snapshotで復旧します。
 
+ローカルDirect2DとBrowser SourceのCanvas 2Dは、通常の確定操作では新しい1項目だけを
+bakedレイヤーへ追記します。全履歴の再構築はUndo、Clear、上限トリム、再接続snapshot、
+キャンバスのリサイズ時に限定します。
+
 ## Web assets
 
 `client/` はOBS用透明ページだけを生成します。ビルド成果物は固定名の

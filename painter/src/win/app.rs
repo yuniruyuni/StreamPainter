@@ -416,7 +416,7 @@ impl App {
             return;
         }
         let items = self.engine.shared_items();
-        let items = items.lock().unwrap().clone();
+        let items = items.lock().unwrap();
         let visible = if self.local_echo { &items[..] } else { &[] };
         if let Err(e) = self.renderer.draw_frame(visible, self.draw_mode) {
             warn!("draw_frame: {e:#}");
@@ -428,9 +428,23 @@ impl App {
             return;
         }
         let items = self.engine.shared_items();
-        let items = items.lock().unwrap().clone();
+        let items = items.lock().unwrap();
         if let Err(e) = self.renderer.rebuild_baked(&items) {
             warn!("rebuild_baked: {e:#}");
+        }
+    }
+
+    fn bake_last_done(&mut self) {
+        if !self.local_echo {
+            return;
+        }
+        let items = self.engine.shared_items();
+        let items = items.lock().unwrap();
+        let Some(item) = items.iter().rfind(|item| item.is_done()) else {
+            return;
+        };
+        if let Err(error) = self.renderer.bake_item(item) {
+            warn!("bake_item: {error:#}");
         }
     }
 
@@ -625,8 +639,11 @@ impl App {
                     now_ms(),
                 );
                 self.web.send_all(msgs);
-                let _ = self.engine.take_rebuild_required();
-                self.rebuild();
+                if self.engine.take_rebuild_required() {
+                    self.rebuild();
+                } else {
+                    self.bake_last_done();
+                }
                 self.render();
                 return;
             }
@@ -654,7 +671,11 @@ impl App {
             unsafe {
                 let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
             }
-            self.rebuild();
+            if trimmed {
+                self.rebuild();
+            } else {
+                self.bake_last_done();
+            }
         } else if trimmed {
             self.rebuild();
         }
@@ -670,7 +691,11 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
         }
-        self.rebuild();
+        if self.engine.take_rebuild_required() {
+            self.rebuild();
+        } else {
+            self.bake_last_done();
+        }
         self.render();
     }
 

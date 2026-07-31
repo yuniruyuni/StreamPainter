@@ -128,7 +128,7 @@ describe("OverlayState", () => {
         itemId: "shape-1",
         endedAt: 123,
       }).kind,
-    ).toBe("rebuild");
+    ).toBe("bake_item");
     expect(state.items[0]).toMatchObject({ done: true, endedAt: 123 });
   });
 

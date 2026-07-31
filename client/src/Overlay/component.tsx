@@ -58,6 +58,9 @@ export const OverlayApp: React.FC = () => {
         case "bake":
           schedule(() => layers.bake(effect.stroke));
           return true;
+        case "bake_item":
+          schedule(() => layers.bakeItem(effect.item));
+          return true;
         case "cancel":
           schedule(() => layers.cancelActive(effect.strokeId));
           return true;
