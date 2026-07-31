@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
 ### Added
 
 - 右ホールドでツール、色、サムネイル付きスタンプを選べるラジアルメニュー。短い右クリックで
@@ -45,6 +47,7 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yuniruyuni/StreamPainter/releases/tag/v0.1.0
