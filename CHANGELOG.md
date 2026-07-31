@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-01
+
 ### Added
 
 - Undoしたストローク・図形・スタンプを復元するRedo
@@ -29,6 +31,7 @@
 - Preview指定失敗時に意図せずProgramプロジェクターを開く挙動を廃止
 - GPUデバイス喪失後にキャンバス履歴から描画資源を復旧
 - モニターの解像度・配置・接続変更へ実行中に追従
+- OBSプロジェクター、オーバーレイ、StreamPainterのメニュー／ダイアログ間の前後関係を安定化
 
 ## [0.1.0] - 2026-07-31
 
@@ -36,5 +39,6 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yuniruyuni/StreamPainter/releases/tag/v0.1.0
