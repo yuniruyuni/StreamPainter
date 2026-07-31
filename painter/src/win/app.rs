@@ -41,6 +41,8 @@ use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
 
 const HOTKEY_TOGGLE: i32 = 1;
+/// 現在はポインタ種別を区別しないため、マウス相当の一定入力として扱う。
+const POINTER_PRESSURE: f64 = 1.0;
 /// 20ms バッチ (50 msg/s)
 const FLUSH_TIMER_ID: usize = 1;
 const FLUSH_INTERVAL_MS: u32 = 20;
@@ -294,22 +296,21 @@ impl App {
                 color: self.color.clone(),
                 opacity: 1.0,
                 width_n: self.width_n,
-                // M2 はマウスのみ (p=0.5 固定) のため実質無効。M3 でペン筆圧を有効化する
-                pressure_width: true,
+                pressure_width: false,
             }),
             DrawTool::Marker => Some(Brush {
                 tool: Tool::Marker,
                 color: self.color.clone(),
                 opacity: 0.5,
                 width_n: self.width_n * 3.0,
-                pressure_width: true,
+                pressure_width: false,
             }),
             DrawTool::Eraser => Some(Brush {
                 tool: Tool::Eraser,
                 color: "#000000".into(),
                 opacity: 1.0,
                 width_n: self.width_n * 3.0,
-                pressure_width: true,
+                pressure_width: false,
             }),
             DrawTool::Line
             | DrawTool::Arrow
@@ -580,7 +581,7 @@ impl App {
                 let Some(brush) = self.current_brush() else {
                     return;
                 };
-                self.engine.begin(brush, u, v, 0.5, now_ms())
+                self.engine.begin(brush, u, v, POINTER_PRESSURE, now_ms())
             }
             DrawTool::Line => {
                 self.engine
@@ -641,7 +642,7 @@ impl App {
             return;
         }
         let (u, v) = self.pointer_uv(lparam);
-        let msgs = self.engine.move_to(u, v, 0.5, now_ms());
+        let msgs = self.engine.move_to(u, v, POINTER_PRESSURE, now_ms());
         let trimmed = self.engine.take_rebuild_required();
         if !msgs.is_empty() {
             // 総点数上限による強制確定
