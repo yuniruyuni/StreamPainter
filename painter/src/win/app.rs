@@ -141,7 +141,11 @@ pub fn run() -> Result<()> {
     };
 
     let engine = CanvasEngine::new();
-    let web = local_server::spawn(config.local_server_port, &config.stamps)?;
+    let web = local_server::spawn(
+        config.local_server_port,
+        &config.stamps,
+        engine.shared_items(),
+    )?;
     debug_assert_eq!(web.overlay_url(), config.overlay_url());
 
     let hwnd = create_overlay_window(mon.x, mon.y, mon.width, mon.height)?;
