@@ -4,7 +4,7 @@
 
 - Windows透明描画オーバーレイ
 - F9、タスクトレイ、右クリックツールメニュー
-- OBS全画面プロジェクター追従とobs-websocket連携
+- OBS全画面プロジェクター追従、Z-order維持、obs-websocket連携
 - Rust内蔵loopback HTTP/WebSocketサーバー
 - OBS Browser Source用assetsのexe埋め込み
 - 接続時snapshot、自動再接続、bounded client queue

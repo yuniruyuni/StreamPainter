@@ -5,13 +5,15 @@
 //! みなす。ウィンドウタイトルはロケール依存 (「全画面プロジェクター」/
 //! "Fullscreen Projector") のため判定に使わない。
 
-use windows::core::BOOL;
+use windows::core::{Result as WindowsResult, BOOL};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    EnumWindows, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, WS_EX_TOPMOST,
 };
 
 use crate::win::monitor::Monitor;
@@ -62,7 +64,7 @@ pub fn print_diagnosis() {
             .map(|(i, _)| i)
             .collect();
         println!(
-            "hwnd={:?} rect=({},{})-({},{}) covers={:?} obs={} title={:?}",
+            "hwnd={:?} rect=({},{})-({},{}) covers={:?} obs={} topmost={} title={:?}",
             hwnd.0,
             rect.left,
             rect.top,
@@ -70,6 +72,7 @@ pub fn print_diagnosis() {
             rect.bottom,
             covers,
             is_obs_process(hwnd),
+            is_topmost(hwnd),
             title,
         );
         BOOL::from(true)
@@ -81,6 +84,53 @@ pub fn print_diagnosis() {
 }
 /// 全画面判定の許容誤差 (px)
 const TOLERANCE: i32 = 2;
+
+/// OBS プロジェクターとStreamPainterオーバーレイのTopmost順を管理する。
+///
+/// OBSを先に、オーバーレイを後にTopmost帯の先頭へ移すことで、
+/// `overlay > projector > other windows` の順序を作る。フォーカスは変更しない。
+/// StreamPainterがTopmostへ昇格させたプロジェクターだけ、検出終了時やDrop時に元へ戻す。
+#[derive(Default)]
+pub struct ZOrderGuard {
+    projector: Option<HWND>,
+    restore_not_topmost: bool,
+}
+
+impl ZOrderGuard {
+    pub fn enforce(&mut self, projector: Option<HWND>, overlay: HWND) -> WindowsResult<()> {
+        if self.projector != projector {
+            self.restore();
+            self.projector = projector;
+            self.restore_not_topmost = projector.is_some_and(|hwnd| !is_topmost(hwnd));
+        } else if let Some(hwnd) = projector {
+            // 外部操作でTopmostが外された場合も、終了時に元へ戻す対象として記録する。
+            self.restore_not_topmost |= !is_topmost(hwnd);
+        }
+
+        let Some(projector) = projector else {
+            return Ok(());
+        };
+        set_topmost(projector, true)?;
+        // 必ずOBSの後に移動し、Topmost帯でもオーバーレイを一段上に置く。
+        set_topmost(overlay, true)
+    }
+
+    fn restore(&mut self) {
+        if self.restore_not_topmost {
+            if let Some(projector) = self.projector {
+                let _ = set_topmost(projector, false);
+            }
+        }
+        self.projector = None;
+        self.restore_not_topmost = false;
+    }
+}
+
+impl Drop for ZOrderGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
 
 struct Search {
     monitor: Monitor,
@@ -101,11 +151,6 @@ pub fn find_projector(monitor: &Monitor, own: HWND) -> Option<HWND> {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut search as *mut _ as isize));
     }
     search.found
-}
-
-/// 対象モニタ上に OBS の全画面プロジェクターが表示されているか
-pub fn is_projector_visible(monitor: &Monitor, own: HWND) -> bool {
-    find_projector(monitor, own).is_some()
 }
 
 /// プロジェクターを閉じる (WM_CLOSE を送る)。見つからなければ false
@@ -182,4 +227,115 @@ fn is_obs_process(hwnd: HWND) -> bool {
     let path = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
     let name = path.rsplit(['\\', '/']).next().unwrap_or("");
     OBS_EXE_NAMES.contains(&name)
+}
+
+fn is_topmost(hwnd: HWND) -> bool {
+    let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    ex_style & WS_EX_TOPMOST.0 as isize != 0
+}
+
+fn set_topmost(hwnd: HWND, topmost: bool) -> WindowsResult<()> {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(if topmost {
+                HWND_TOPMOST
+            } else {
+                HWND_NOTOPMOST
+            }),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetTopWindow, GetWindow, GW_HWNDNEXT, WINDOW_EX_STYLE,
+        WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+
+    struct TestWindow(HWND);
+
+    impl TestWindow {
+        fn new(topmost: bool) -> Self {
+            let ex_style = WS_EX_TOOLWINDOW
+                | if topmost {
+                    WS_EX_TOPMOST
+                } else {
+                    WINDOW_EX_STYLE(0)
+                };
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    ex_style,
+                    w!("STATIC"),
+                    w!("StreamPainter Z-order test"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("test window");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    fn is_above(upper: HWND, lower: HWND) -> bool {
+        let mut current = unsafe { GetTopWindow(None) }.ok();
+        while let Some(hwnd) = current {
+            if hwnd == upper {
+                return true;
+            }
+            if hwnd == lower {
+                return false;
+            }
+            current = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+        }
+        false
+    }
+
+    #[test]
+    fn guard_stacks_overlay_and_restores_only_promoted_projector() {
+        let projector = TestWindow::new(false);
+        let overlay = TestWindow::new(true);
+
+        let mut guard = ZOrderGuard::default();
+        guard
+            .enforce(Some(projector.0), overlay.0)
+            .expect("enforce Z-order");
+        assert!(is_topmost(projector.0));
+        assert!(is_topmost(overlay.0));
+        assert!(is_above(overlay.0, projector.0));
+        drop(guard);
+        assert!(!is_topmost(projector.0));
+        assert!(is_topmost(overlay.0));
+
+        set_topmost(projector.0, true).expect("make projector topmost");
+        let mut guard = ZOrderGuard::default();
+        guard
+            .enforce(Some(projector.0), overlay.0)
+            .expect("enforce existing Topmost Z-order");
+        drop(guard);
+        assert!(is_topmost(projector.0));
+    }
 }

@@ -78,6 +78,8 @@ struct App {
     /// 現在のプロジェクターを自分が obs-websocket で開いたか
     /// (手動で開かれたものは F9 オフでも閉じない)
     projector_opened_by_us: bool,
+    /// OBSプロジェクターを前面化し、その直上にオーバーレイを保つ。
+    projector_z_order: projector::ZOrderGuard,
 }
 
 pub fn run() -> Result<()> {
@@ -156,6 +158,7 @@ pub fn run() -> Result<()> {
         close_projector: config.close_projector,
         pending_draw: None,
         projector_opened_by_us: false,
+        projector_z_order: projector::ZOrderGuard::default(),
     });
 
     // 起動時に透明フレームを 1 回描き、D2D シェーダコンパイル・swapchain 初回
@@ -175,14 +178,14 @@ pub fn run() -> Result<()> {
         // 初期状態はパススルー
         set_transparent(hwnd, true);
         SetTimer(Some(hwnd), PROJECTOR_TIMER_ID, PROJECTOR_INTERVAL_MS, None);
-        // 追従モードでは初回検知が終わるまで隠しておく (poll_projector が表示する)
+        // 追従モードでは初回検知が終わるまで隠しておく (poll_projector が表示する)。
+        // 追従しない場合も、OBSプロジェクターがあればZ-orderだけは同期する。
         let app_ref = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
-        if app_ref.follow_projector {
-            app_ref.poll_projector(hwnd);
-        } else {
+        if !app_ref.follow_projector {
             app_ref.projector_visible = true;
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
+        app_ref.poll_projector(hwnd);
     }
     info!("ready — F9 で描画モードを切り替えます");
 
@@ -305,41 +308,33 @@ impl App {
         !self.follow_projector || self.projector_visible
     }
 
-    /// OBS プロジェクターの表示状態をポーリングし、変化があれば表示/非表示を切り替える
+    /// OBSプロジェクターを検出し、表示追従とZ-orderを同期する。
     fn poll_projector(&mut self, hwnd: HWND) {
-        if !self.follow_projector {
-            return;
+        let projector = projector::find_projector(&self.monitor, hwnd);
+        let visible = projector.is_some();
+
+        if self.follow_projector && visible != self.projector_visible {
+            self.projector_visible = visible;
+            if visible {
+                info!("OBS projector detected — overlay enabled");
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            } else {
+                info!("OBS projector closed — overlay disabled");
+                self.projector_opened_by_us = false;
+                if self.draw_mode {
+                    // 描画モードのまま消えた場合はパススルーへ戻す
+                    self.set_draw_mode(hwnd, false);
+                }
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_HIDE);
+                }
+            }
         }
-        let visible = projector::is_projector_visible(&self.monitor, hwnd);
-        if visible == self.projector_visible {
-            return;
-        }
-        self.projector_visible = visible;
-        if visible {
-            info!("OBS projector detected — overlay enabled");
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                // プロジェクターより上に来るよう topmost を再主張する
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
-        } else {
-            info!("OBS projector closed — overlay disabled");
-            self.projector_opened_by_us = false;
-            if self.draw_mode {
-                // 描画モードのまま消えた場合はパススルーへ戻す
-                self.set_draw_mode(hwnd, false);
-            }
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
+
+        if let Err(error) = self.projector_z_order.enforce(projector, hwnd) {
+            warn!("OBS projector Z-order sync failed: {error}");
         }
     }
 
