@@ -97,3 +97,8 @@ stream-painter.exe --settings
 
 診断用に `stream-painter.exe --detect` を実行すると、モニタ、検出対象ウィンドウ、
 OBS判定、Topmost状態を表示します。
+
+通常起動・設定画面・診断モードのログは
+`%LOCALAPPDATA%\StreamPainter\logs\stream-painter.YYYY-MM-DD.log` に保存します。日単位で
+ローテーションし、直近7ファイルだけを保持します。問題を報告する場合は、再現直後のログを
+添付してください。OBS WebSocketパスワードやスタンプ画像本体はログへ記録しません。

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod logging;
 pub mod menu;
 pub mod monitor;
 pub mod projector;

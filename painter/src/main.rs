@@ -12,6 +12,8 @@ mod win;
 
 #[cfg(windows)]
 fn main() {
+    let _logging = win::logging::init();
+
     // 診断モード: モニタとウィンドウの一覧を表示して終了する
     if std::env::args().any(|a| a == "--detect") {
         win::projector::print_diagnosis();
@@ -24,12 +26,6 @@ fn main() {
         }
         return;
     }
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
 
     if let Err(e) = win::app::run() {
         tracing::error!("fatal: {e:#}");
