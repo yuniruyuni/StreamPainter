@@ -32,6 +32,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94.1
           components: rustfmt
 
       - name: Cache Cargo
