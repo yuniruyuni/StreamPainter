@@ -11,13 +11,19 @@ on:
   push:
     branches: [main, develop]
     paths:
+      - "package.json"
+      - "client/package.json"
       - "bun.lock"
+      - "painter/Cargo.toml"
       - "painter/Cargo.lock"
       - ".github/workflows/security.yml"
   pull_request:
     branches: [main, develop]
     paths:
+      - "package.json"
+      - "client/package.json"
       - "bun.lock"
+      - "painter/Cargo.toml"
       - "painter/Cargo.lock"
       - ".github/workflows/security.yml"
   schedule:
