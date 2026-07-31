@@ -42,6 +42,7 @@ pub enum MenuAction {
     SelectTool(DrawTool),
     SelectColor(&'static str),
     Undo,
+    Redo,
     Clear,
     Exit,
 }
@@ -54,7 +55,8 @@ const ID_TOOL_ARROW: usize = 14;
 const ID_TOOL_RECTANGLE: usize = 15;
 const ID_TOOL_ELLIPSE: usize = 16;
 const ID_UNDO: usize = 20;
-const ID_CLEAR: usize = 21;
+const ID_REDO: usize = 21;
+const ID_CLEAR: usize = 22;
 const ID_EXIT: usize = 30;
 const ID_COLOR_BASE: usize = 100;
 const ID_STAMP_BASE: usize = 1000;
@@ -64,6 +66,14 @@ fn checked(flag: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLA
         MF_STRING | MF_CHECKED
     } else {
         MF_STRING
+    }
+}
+
+fn enabled(flag: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
+    if flag {
+        MF_STRING
+    } else {
+        MF_STRING | windows::Win32::UI::WindowsAndMessaging::MF_GRAYED
     }
 }
 
@@ -84,6 +94,8 @@ pub fn show(
     tool: &DrawTool,
     color: &str,
     stamps: &[StampConfig],
+    can_undo: bool,
+    can_redo: bool,
 ) -> Option<MenuAction> {
     // TrackPopupMenu の内部メッセージループ中に通常の projector timer が動いても、
     // overlay をこの popup より前へ移動させない。
@@ -163,7 +175,8 @@ pub fn show(
         let _ = AppendMenuW(root, MF_POPUP, palette.0 as usize, &HSTRING::from("色"));
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
 
-        append(root, MF_STRING, ID_UNDO, "元に戻す");
+        append(root, enabled(can_undo), ID_UNDO, "元に戻す");
+        append(root, enabled(can_redo), ID_REDO, "やり直す");
         append(root, MF_STRING, ID_CLEAR, "全消去...");
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
         append(root, MF_STRING, ID_EXIT, "終了");
@@ -191,6 +204,7 @@ pub fn show(
             ID_TOOL_RECTANGLE => Some(MenuAction::SelectTool(DrawTool::Rectangle)),
             ID_TOOL_ELLIPSE => Some(MenuAction::SelectTool(DrawTool::Ellipse)),
             ID_UNDO => Some(MenuAction::Undo),
+            ID_REDO => Some(MenuAction::Redo),
             ID_CLEAR => Some(MenuAction::Clear),
             ID_EXIT => Some(MenuAction::Exit),
             id if (ID_COLOR_BASE..ID_COLOR_BASE + COLORS.len()).contains(&id) => {

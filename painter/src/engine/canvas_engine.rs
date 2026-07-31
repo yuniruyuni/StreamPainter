@@ -37,6 +37,7 @@ enum ActiveItem {
 pub struct CanvasEngine {
     items: SharedItems,
     active: Option<ActiveItem>,
+    redo_items: Vec<CanvasItem>,
     total_points: usize,
     rebuild_required: bool,
 }
@@ -46,6 +47,7 @@ impl CanvasEngine {
         Self {
             items: Arc::new(Mutex::new(Vec::new())),
             active: None,
+            redo_items: Vec::new(),
             total_points: 0,
             rebuild_required: false,
         }
@@ -77,6 +79,7 @@ impl CanvasEngine {
         if self.active.is_some() {
             return Vec::new();
         }
+        self.redo_items.clear();
         let stroke_id = uuid::Uuid::now_v7().to_string();
         let first: Point = (round5(u), round5(v), round2(p), 0.0);
         let stroke = Stroke {
@@ -114,6 +117,7 @@ impl CanvasEngine {
         if self.active.is_some() {
             return Vec::new();
         }
+        self.redo_items.clear();
         let item_id = uuid::Uuid::now_v7().to_string();
         let position = (round5(u), round5(v));
         let shape = ShapeItem {
@@ -150,6 +154,7 @@ impl CanvasEngine {
         if self.active.is_some() {
             return Vec::new();
         }
+        self.redo_items.clear();
         let stamp = StampItem {
             item_id: uuid::Uuid::now_v7().to_string(),
             stamp_id,
@@ -326,11 +331,35 @@ impl CanvasEngine {
         };
         let removed = items.remove(index);
         self.total_points = self.total_points.saturating_sub(removed.point_count());
+        self.redo_items.push(removed);
         vec![PainterMessage::Undo {}]
+    }
+
+    /// 最後にUndoした確定項目を描画順の末尾へ戻す。
+    pub fn redo(&mut self) -> Vec<PainterMessage> {
+        if self.active.is_some() {
+            return Vec::new();
+        }
+        let Some(item) = self.redo_items.pop() else {
+            return Vec::new();
+        };
+        self.total_points += item.point_count();
+        self.items.lock().unwrap().push(item.clone());
+        self.trim();
+        vec![PainterMessage::Redo { item }]
+    }
+
+    pub fn can_undo(&self) -> bool {
+        self.items.lock().unwrap().iter().any(CanvasItem::is_done)
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_items.is_empty() && self.active.is_none()
     }
 
     pub fn clear(&mut self) -> Vec<PainterMessage> {
         let mut items = self.items.lock().unwrap();
+        self.redo_items.clear();
         if items.is_empty() {
             return Vec::new();
         }
@@ -409,6 +438,7 @@ mod tests {
                 PainterMessage::ShapeCancel { .. } => "shape_cancel",
                 PainterMessage::StampAdd { .. } => "stamp_add",
                 PainterMessage::Undo {} => "undo",
+                PainterMessage::Redo { .. } => "redo",
                 PainterMessage::Clear {} => "clear",
             })
             .collect()
@@ -540,6 +570,44 @@ mod tests {
         assert_eq!(drain_types(&engine.undo()), ["undo"]);
         assert_eq!(engine.shared_items().lock().unwrap().len(), 1);
         assert!(engine.undo().is_empty());
+    }
+
+    #[test]
+    fn redo_restores_undone_items_in_order() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
+        engine.add_stamp("two".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 20.0);
+
+        assert!(engine.can_undo());
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(engine.can_redo());
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+        assert!(!engine.can_redo());
+
+        let items = engine.shared_items();
+        let items = items.lock().unwrap();
+        let stamp_ids: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                CanvasItem::Stamp { stamp } => Some(stamp.stamp_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamp_ids, ["one", "two"]);
+    }
+
+    #[test]
+    fn new_item_discards_redo_history() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
+        engine.undo();
+        assert!(engine.can_redo());
+
+        engine.add_stamp("replacement".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 20.0);
+        assert!(!engine.can_redo());
+        assert!(engine.redo().is_empty());
     }
 
     #[test]

@@ -166,6 +166,20 @@ export class OverlayState {
         this.items.splice(index, 1);
         return { kind: "rebuild" };
       }
+      case "redo": {
+        if (
+          !msg.item.done ||
+          this.items.some(
+            (existing) => canvasItemId(existing) === canvasItemId(msg.item),
+          )
+        ) {
+          return { kind: "none" };
+        }
+        this.items.push(msg.item);
+        return this.trim()
+          ? { kind: "rebuild" }
+          : { kind: "bake_item", item: msg.item };
+      }
       case "clear": {
         if (this.items.length === 0) return { kind: "none" };
         this.items = [];

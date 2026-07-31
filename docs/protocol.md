@@ -27,7 +27,7 @@ JSONフィールドはcamelCase、`type`値はsnake_caseです。
 ```json
 {
   "type": "snapshot",
-  "protocolVersion": 3,
+  "protocolVersion": 4,
   "rev": 12,
   "fadeAfterMs": null,
   "items": []
@@ -49,7 +49,8 @@ overlayは`protocolVersion`が対応版と一致することを確認し、`item
 {"type":"shape_cancel","rev":20,"itemId":"..."}
 {"type":"stamp_add","rev":21,"stamp":{"itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
 {"type":"undo","rev":22}
-{"type":"clear","rev":23}
+{"type":"redo","rev":23,"item":{"kind":"stamp","itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
+{"type":"clear","rev":24}
 ```
 
 図形の`shape`は`line`、`arrow`、`rectangle`、`ellipse`です。スタンプの画像は同じoriginの

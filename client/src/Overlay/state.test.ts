@@ -132,7 +132,7 @@ describe("OverlayState", () => {
     expect(state.items[0]).toMatchObject({ done: true, endedAt: 123 });
   });
 
-  test("v3 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
+  test("v4 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
     const state = synchronizedState(
       [
         strokeItem("s1"),
@@ -167,6 +167,17 @@ describe("OverlayState", () => {
   test("確定ストロークがなければ undo は none", () => {
     const state = synchronizedState();
     expect(applyNext(state, { type: "undo" }).kind).toBe("none");
+  });
+
+  test("redo は確定項目を末尾へ戻して焼き込みを要求する", () => {
+    const state = synchronizedState([strokeItem("s1")], 1);
+    applyNext(state, { type: "undo" });
+    const item = strokeItem("s1");
+    expect(applyNext(state, { type: "redo", item })).toEqual({
+      kind: "bake_item",
+      item,
+    });
+    expect(state.items).toEqual([item]);
   });
 
   test("clear は全消去して rebuild", () => {

@@ -575,6 +575,19 @@ impl HubState {
                 // v1 client の stroke 履歴を誤って 1 本戻さないよう snapshot を送る。
                 (PainterMessage::Undo {}, removed_non_stroke)
             }
+            PainterMessage::Redo { item } => {
+                if !item.is_done()
+                    || self
+                        .items
+                        .iter()
+                        .any(|existing| existing.item_id() == item.item_id())
+                {
+                    return None;
+                }
+                self.total_points += item.point_count();
+                self.items.push(item.clone());
+                (PainterMessage::Redo { item }, false)
+            }
             PainterMessage::Clear {} => {
                 if self.items.is_empty() {
                     return None;
@@ -891,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_preserves_shape_and_stamp_order_in_v3_snapshot() {
+    async fn hub_preserves_shape_and_stamp_order_in_v4_snapshot() {
         let hub = test_hub();
         let shape = ShapeItem {
             item_id: "shape-1".into(),
@@ -951,6 +964,35 @@ mod tests {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert!(matches!(items[0], CanvasItem::Shape { .. }));
                 assert!(matches!(items[1], CanvasItem::Stamp { .. }));
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_restores_a_redone_item() {
+        let hub = test_hub();
+        let item = CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: "stamp-item-1".into(),
+                stamp_id: "stamp-1".into(),
+                center: (0.5, 0.5),
+                width_n: 0.1,
+                height_n: 0.2,
+                opacity: 1.0,
+                done: true,
+                ended_at: Some(20.0),
+            },
+        };
+        apply(&hub, PainterMessage::Redo { item }).await;
+
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        let snapshot = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
+            OverlayControlMessage::Snapshot { rev, items, .. } => {
+                assert_eq!(rev, 1);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].item_id(), "stamp-item-1");
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }

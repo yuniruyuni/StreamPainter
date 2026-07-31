@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub type Point = (f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
@@ -177,6 +177,9 @@ pub enum PainterMessage {
         stamp: StampItem,
     },
     Undo {},
+    Redo {
+        item: CanvasItem,
+    },
     Clear {},
 }
 
@@ -293,7 +296,7 @@ mod tests {
     #[test]
     fn overlay_message_roundtrips_snapshot() {
         let msg: OverlayControlMessage = serde_json::from_str(
-            r##"{"type":"snapshot","protocolVersion":3,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
+            r##"{"type":"snapshot","protocolVersion":4,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
         )
         .unwrap();
         match msg {

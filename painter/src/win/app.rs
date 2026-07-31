@@ -410,6 +410,14 @@ impl App {
                     self.render();
                 }
             }
+            MenuAction::Redo => {
+                let msgs = self.engine.redo();
+                if !msgs.is_empty() {
+                    self.web.send_all(msgs);
+                    self.rebuild();
+                    self.render();
+                }
+            }
             MenuAction::Clear => {
                 if !crate::win::confirm(hwnd, "すべての描画を消去しますか？") {
                     return false;
@@ -755,11 +763,18 @@ unsafe extern "system" fn window_proc(
                 // popup 表示中まで保持せず、入力値を複製して閉じた後に取り直す。
                 let menu_input = {
                     let app = unsafe { &*app_ptr };
-                    (!app.engine.is_drawing())
-                        .then(|| (app.tool.clone(), app.color.clone(), app.stamps.clone()))
+                    (!app.engine.is_drawing()).then(|| {
+                        (
+                            app.tool.clone(),
+                            app.color.clone(),
+                            app.stamps.clone(),
+                            app.engine.can_undo(),
+                            app.engine.can_redo(),
+                        )
+                    })
                 };
-                if let Some((tool, color, stamps)) = menu_input {
-                    let action = menu::show(hwnd, &tool, &color, &stamps);
+                if let Some((tool, color, stamps, can_undo, can_redo)) = menu_input {
+                    let action = menu::show(hwnd, &tool, &color, &stamps, can_undo, can_redo);
                     let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
                     if current == app_ptr {
                         let exit = action.is_some_and(|action| {
