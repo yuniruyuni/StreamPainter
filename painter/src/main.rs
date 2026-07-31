@@ -27,6 +27,22 @@ fn main() {
         return;
     }
 
+    let _single_instance = match win::single_instance::acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            tracing::info!("another StreamPainter instance is already running");
+            win::message_box_info(
+                "StreamPainterは既に起動しています。\nタスクトレイを確認してください。",
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!("single-instance guard: {e:#}");
+            win::message_box(&format!("多重起動の確認に失敗しました:\n{e:#}"));
+            std::process::exit(1);
+        }
+    };
+
     if let Err(e) = win::app::run() {
         tracing::error!("fatal: {e:#}");
         win::message_box(&format!("StreamPainter を開始できません:\n{e:#}"));

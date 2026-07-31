@@ -85,9 +85,10 @@ stream-painter.exe --settings
 
 ### ポートを使用できない
 
-起動時にエラーが表示されます。別のアプリまたは別のStreamPainterが同じポートを使用して
-います。重複プロセスを終了するか、`stream-painter.exe --settings` でポートを変更し、表示
-されたOBS URLも更新します。
+起動時にエラーが表示されます。別のアプリが同じポートを使用している場合は、
+`stream-painter.exe --settings` でポートを変更し、表示されたOBS URLも更新します。
+StreamPainterをもう一度起動した場合は多重起動せず、既に起動中であることを通知します。
+通常版の実行中でも `--settings` と `--detect` は利用できます。
 
 ### F9で描画できない
 
