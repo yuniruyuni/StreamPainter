@@ -389,7 +389,7 @@ impl App {
     }
 
     /// popup が閉じた後に選択結果を反映する。true はアプリ終了要求。
-    fn apply_menu_action(&mut self, action: MenuAction) -> bool {
+    fn apply_menu_action(&mut self, hwnd: HWND, action: MenuAction) -> bool {
         match action {
             MenuAction::SelectTool(tool) => {
                 info!("tool: {tool:?}");
@@ -411,6 +411,9 @@ impl App {
                 }
             }
             MenuAction::Clear => {
+                if !crate::win::confirm(hwnd, "すべての描画を消去しますか？") {
+                    return false;
+                }
                 let msgs = self.engine.clear();
                 if !msgs.is_empty() {
                     self.web.send_all(msgs);
@@ -760,7 +763,7 @@ unsafe extern "system" fn window_proc(
                     let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
                     if current == app_ptr {
                         let exit = action.is_some_and(|action| {
-                            unsafe { &mut *app_ptr }.apply_menu_action(action)
+                            unsafe { &mut *app_ptr }.apply_menu_action(hwnd, action)
                         });
                         if exit {
                             unsafe {

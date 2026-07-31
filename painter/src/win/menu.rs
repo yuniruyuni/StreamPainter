@@ -164,7 +164,7 @@ pub fn show(
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
 
         append(root, MF_STRING, ID_UNDO, "元に戻す");
-        append(root, MF_STRING, ID_CLEAR, "全消去");
+        append(root, MF_STRING, ID_CLEAR, "全消去...");
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
         append(root, MF_STRING, ID_EXIT, "終了");
 
