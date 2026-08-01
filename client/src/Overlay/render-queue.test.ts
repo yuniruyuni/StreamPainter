@@ -39,6 +39,12 @@ function stamp(index: number): CanvasItem {
   };
 }
 
+function stampPreview(index: number, rebuildBaked: boolean) {
+  const item = stamp(index);
+  if (item.kind !== "stamp") throw new Error("expected stamp");
+  return { kind: "stamp_preview" as const, stamp: item, rebuildBaked };
+}
+
 describe("RenderQueue", () => {
   test("同じstrokeの連続更新は最新1件へ集約する", () => {
     const queue = new RenderQueue();
@@ -74,6 +80,38 @@ describe("RenderQueue", () => {
     queue.enqueue({ kind: "active", stroke: stroke("s1", 1) });
     queue.enqueue({ kind: "rebuild" });
     queue.enqueue({ kind: "bake_item", item: stamp(1) });
+
+    expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
+  });
+
+  test("同じスタンプのpreviewは初回再構築を保ったまま最新位置へ集約する", () => {
+    const queue = new RenderQueue();
+    const first = stampPreview(1, true);
+    const latest = stampPreview(1, false);
+    latest.stamp.center = [0.8, 0.6];
+    queue.enqueue(first);
+    queue.enqueue(latest);
+
+    expect(queue.drain()).toEqual([{ ...latest, rebuildBaked: true }]);
+  });
+
+  test("rebuild直後のスタンプpreviewは別レイヤー復元のため保持する", () => {
+    const queue = new RenderQueue();
+    const preview = stampPreview(1, false);
+    queue.enqueue({ kind: "rebuild" });
+    queue.enqueue(preview);
+
+    expect(queue.drain()).toEqual([
+      { kind: "rebuild" },
+      { ...preview, rebuildBaked: true },
+    ]);
+  });
+
+  test("確定rebuildは同一フレーム内のスタンプpreviewを包含する", () => {
+    const queue = new RenderQueue();
+    queue.enqueue({ kind: "rebuild" });
+    queue.enqueue(stampPreview(1, false));
+    queue.enqueue({ kind: "rebuild" });
 
     expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
   });

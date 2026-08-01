@@ -27,7 +27,7 @@ JSONフィールドはcamelCase、`type`値はsnake_caseです。
 ```json
 {
   "type": "snapshot",
-  "protocolVersion": 4,
+  "protocolVersion": 5,
   "rev": 12,
   "fadeAfterMs": null,
   "items": []
@@ -48,14 +48,24 @@ overlayは`protocolVersion`が対応版と一致することを確認し、`item
 {"type":"shape_end","rev":19,"itemId":"...","endedAt":1785380000000}
 {"type":"shape_cancel","rev":20,"itemId":"..."}
 {"type":"stamp_add","rev":21,"stamp":{"itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
-{"type":"undo","rev":22}
-{"type":"redo","rev":23,"item":{"kind":"stamp","itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
-{"type":"clear","rev":24}
+{"type":"stamp_move_preview","rev":22,"itemId":"...","center":[0.7,0.55]}
+{"type":"stamp_move","rev":23,"itemId":"...","center":[0.75,0.6]}
+{"type":"undo","rev":24}
+{"type":"redo","rev":25,"item":{"kind":"stamp","itemId":"...","stampId":"...","center":[0.5,0.5],"widthN":0.0844,"heightN":0.15,"opacity":1,"done":true,"endedAt":1785380000000}}
+{"type":"clear","rev":26}
 ```
 
 図形の`shape`は`line`、`arrow`、`rectangle`、`ellipse`です。スタンプの画像は同じoriginの
 `/stamps/<stampId>`から取得します。`widthN`と`heightN`をイベントに固定しているため、設定を
 後で変更しても配置済みスタンプの寸法は変わりません。
+
+`stamp_move_preview`と`stamp_move`は描画順を変えずに指定した`itemId`の`center`を更新します。
+ドラッグ中は最新座標を16ms間隔（約60fps）の`stamp_move_preview`で送り、同じ間隔内の中間座標は
+送らずに上書きします。overlayは最初のpreviewで対象をbakedレイヤーから除き、以降はactive
+レイヤー上のスタンプだけを`requestAnimationFrame`単位で更新します。ドラッグ確定時は待機中の
+最終座標を`stamp_move`として即時送信し、通常の描画順へ戻します。キャンセルとスタンプ移動の
+Undo／Redoも、確定位置だけを示す`stamp_move`として配信します。項目追加のUndo／Redoは従来
+どおり`undo`／`redo`を使います。
 
 `endedAt` はUnix epoch millisecondsです。
 

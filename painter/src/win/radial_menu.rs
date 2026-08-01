@@ -4,7 +4,7 @@ use std::f64::consts::{PI, TAU};
 
 use crate::win::menu::{DrawTool, MenuAction, COLORS};
 
-pub const DRAW_TOOL_COUNT: usize = 7;
+pub const DRAW_TOOL_COUNT: usize = 8;
 pub const TOOL_COUNT: usize = DRAW_TOOL_COUNT + 1;
 pub const STAMP_TOOL_INDEX: usize = DRAW_TOOL_COUNT;
 pub const COLOR_COUNT: usize = COLORS.len();
@@ -440,26 +440,28 @@ pub fn sector_center_angle(index: usize, count: usize) -> f32 {
 
 pub fn tool_at(index: usize) -> Option<DrawTool> {
     match index {
-        0 => Some(DrawTool::Pen),
-        1 => Some(DrawTool::Marker),
-        2 => Some(DrawTool::Eraser),
-        3 => Some(DrawTool::Line),
-        4 => Some(DrawTool::Arrow),
-        5 => Some(DrawTool::Rectangle),
-        6 => Some(DrawTool::Ellipse),
+        0 => Some(DrawTool::Select),
+        1 => Some(DrawTool::Pen),
+        2 => Some(DrawTool::Marker),
+        3 => Some(DrawTool::Eraser),
+        4 => Some(DrawTool::Line),
+        5 => Some(DrawTool::Arrow),
+        6 => Some(DrawTool::Rectangle),
+        7 => Some(DrawTool::Ellipse),
         _ => None,
     }
 }
 
 pub fn tool_label(index: usize) -> Option<&'static str> {
     match index {
-        0 => Some("ペン"),
-        1 => Some("マーカー"),
-        2 => Some("消しゴム"),
-        3 => Some("直線"),
-        4 => Some("矢印"),
-        5 => Some("四角"),
-        6 => Some("楕円"),
+        0 => Some("選択"),
+        1 => Some("ペン"),
+        2 => Some("マーカー"),
+        3 => Some("消しゴム"),
+        4 => Some("直線"),
+        5 => Some("矢印"),
+        6 => Some("四角"),
+        7 => Some("楕円"),
         STAMP_TOOL_INDEX => Some("スタンプ"),
         _ => None,
     }
@@ -576,7 +578,7 @@ mod tests {
     fn pinned_menu_accepts_a_left_or_right_click_selection() {
         let mut menu = pin(menu(0));
         assert!(menu.begin_click(2));
-        let target = point(1, TOOL_COUNT, 72.0);
+        let target = point(2, TOOL_COUNT, 72.0);
         menu.update(target);
         assert_eq!(
             menu.release(target),

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub type Point = (f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
@@ -176,6 +176,16 @@ pub enum PainterMessage {
     StampAdd {
         stamp: StampItem,
     },
+    #[serde(rename_all = "camelCase")]
+    StampMovePreview {
+        item_id: String,
+        center: Position,
+    },
+    #[serde(rename_all = "camelCase")]
+    StampMove {
+        item_id: String,
+        center: Position,
+    },
     Undo {},
     Redo {
         item: CanvasItem,
@@ -296,7 +306,7 @@ mod tests {
     #[test]
     fn overlay_message_roundtrips_snapshot() {
         let msg: OverlayControlMessage = serde_json::from_str(
-            r##"{"type":"snapshot","protocolVersion":4,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
+            r##"{"type":"snapshot","protocolVersion":5,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
         )
         .unwrap();
         match msg {
@@ -335,6 +345,40 @@ mod tests {
                 "rev": 7,
             })
         );
+    }
+
+    #[test]
+    fn stamp_move_events_identify_the_item_and_destination() {
+        for (message, message_type) in [
+            (
+                PainterMessage::StampMovePreview {
+                    item_id: "stamp-item-1".into(),
+                    center: (0.75, 0.25),
+                },
+                "stamp_move_preview",
+            ),
+            (
+                PainterMessage::StampMove {
+                    item_id: "stamp-item-1".into(),
+                    center: (0.75, 0.25),
+                },
+                "stamp_move",
+            ),
+        ] {
+            let json = serde_json::to_value(&message).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "type": message_type,
+                    "itemId": "stamp-item-1",
+                    "center": [0.75, 0.25],
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<PainterMessage>(json).unwrap(),
+                message
+            );
+        }
     }
 
     #[test]

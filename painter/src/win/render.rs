@@ -214,11 +214,23 @@ impl Renderer {
 
     /// 確定 CanvasItem 一覧から baked を再構築する。
     pub fn rebuild_baked(&mut self, items: &[CanvasItem]) -> Result<()> {
+        self.rebuild_baked_excluding(items, None)
+    }
+
+    /// 選択中スタンプだけをフレーム側へ分離して baked を再構築する。
+    pub fn rebuild_baked_excluding(
+        &mut self,
+        items: &[CanvasItem],
+        excluded_item_id: Option<&str>,
+    ) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.baked);
             self.dc.BeginDraw();
             self.dc.Clear(Some(&transparent()));
-            for item in items.iter().filter(|item| item.is_done()) {
+            for item in items
+                .iter()
+                .filter(|item| item.is_done() && excluded_item_id != Some(item.item_id()))
+            {
                 self.draw_item(item)?;
             }
             self.dc.EndDraw(None, None)?;
@@ -257,6 +269,7 @@ impl Renderer {
         &mut self,
         items: &[CanvasItem],
         draw_mode: bool,
+        selected_stamp: Option<&StampItem>,
         radial: Option<(&RadialMenu, &DrawTool, &str, &[StampConfig])>,
     ) -> Result<()> {
         unsafe {
@@ -273,6 +286,10 @@ impl Renderer {
             );
             for item in items.iter().filter(|item| !item.is_done()) {
                 self.draw_item(item)?;
+            }
+            if let Some(stamp) = selected_stamp {
+                self.draw_stamp(stamp)?;
+                self.draw_stamp_selection(stamp)?;
             }
             if draw_mode {
                 self.draw_mode_border()?;
@@ -435,15 +452,7 @@ impl Renderer {
         let Some(bitmap) = self.stamp_bitmaps.get(&stamp.stamp_id) else {
             return Ok(());
         };
-        let center = self.normalized_to_local(stamp.center);
-        let width = (stamp.width_n * self.content.width) as f32;
-        let height = (stamp.height_n * self.content.height) as f32;
-        let destination = D2D_RECT_F {
-            left: center.X - width / 2.0,
-            top: center.Y - height / 2.0,
-            right: center.X + width / 2.0,
-            bottom: center.Y + height / 2.0,
-        };
+        let destination = self.stamp_rect(stamp);
         unsafe {
             self.dc.DrawBitmap(
                 bitmap,
@@ -453,6 +462,76 @@ impl Renderer {
                 None,
                 None,
             );
+        }
+        Ok(())
+    }
+
+    fn stamp_rect(&self, stamp: &StampItem) -> D2D_RECT_F {
+        let center = self.normalized_to_local(stamp.center);
+        let width = (stamp.width_n * self.content.width) as f32;
+        let height = (stamp.height_n * self.content.height) as f32;
+        D2D_RECT_F {
+            left: center.X - width / 2.0,
+            top: center.Y - height / 2.0,
+            right: center.X + width / 2.0,
+            bottom: center.Y + height / 2.0,
+        }
+    }
+
+    fn draw_stamp_selection(&self, stamp: &StampItem) -> Result<()> {
+        let rect = self.stamp_rect(stamp);
+        let shadow = unsafe {
+            self.dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.015,
+                    g: 0.025,
+                    b: 0.04,
+                    a: 0.95,
+                },
+                None,
+            )?
+        };
+        let accent = unsafe {
+            self.dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.12,
+                    g: 0.72,
+                    b: 0.98,
+                    a: 1.0,
+                },
+                None,
+            )?
+        };
+        unsafe {
+            self.dc
+                .DrawRectangle(&rect, &shadow, 5.0, &self.stroke_style);
+            self.dc
+                .DrawRectangle(&rect, &accent, 2.0, &self.stroke_style);
+        }
+
+        let handle = (self.content.height as f32 * 0.007).clamp(5.0, 9.0);
+        for (x, y) in [
+            (rect.left, rect.top),
+            (rect.right, rect.top),
+            (rect.right, rect.bottom),
+            (rect.left, rect.bottom),
+        ] {
+            let outer = D2D_RECT_F {
+                left: x - handle,
+                top: y - handle,
+                right: x + handle,
+                bottom: y + handle,
+            };
+            let inner = D2D_RECT_F {
+                left: x - handle + 2.0,
+                top: y - handle + 2.0,
+                right: x + handle - 2.0,
+                bottom: y + handle - 2.0,
+            };
+            unsafe {
+                self.dc.FillRectangle(&outer, &shadow);
+                self.dc.FillRectangle(&inner, &accent);
+            }
         }
         Ok(())
     }

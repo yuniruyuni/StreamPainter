@@ -1,6 +1,6 @@
 // Rust 側 `painter/src/protocol.rs` と JSON 表現を揃えるローカル WS 型。
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 export const MAX_ITEMS = 500;
 export const MAX_STROKES = MAX_ITEMS;
 export const MAX_TOTAL_POINTS = 200_000;
@@ -71,6 +71,8 @@ export type PaintEvent =
   | { type: "shape_end"; itemId: string; endedAt: number }
   | { type: "shape_cancel"; itemId: string }
   | { type: "stamp_add"; stamp: StampItem }
+  | { type: "stamp_move_preview"; itemId: string; center: Position }
+  | { type: "stamp_move"; itemId: string; center: Position }
   | { type: "undo" }
   | { type: "redo"; item: CanvasItem }
   | { type: "clear" };

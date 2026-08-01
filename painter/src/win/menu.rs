@@ -13,6 +13,7 @@ use crate::config::StampConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrawTool {
+    Select,
     Pen,
     Marker,
     Eraser,
@@ -47,6 +48,7 @@ pub enum MenuAction {
     Exit,
 }
 
+const ID_TOOL_SELECT: usize = 9;
 const ID_TOOL_PEN: usize = 10;
 const ID_TOOL_MARKER: usize = 11;
 const ID_TOOL_ERASER: usize = 12;
@@ -102,6 +104,13 @@ pub fn show(
     let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();
     unsafe {
         let root = CreatePopupMenu().ok()?;
+        append(
+            root,
+            checked(tool == &DrawTool::Select),
+            ID_TOOL_SELECT,
+            "選択・移動",
+        );
+        let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
         append(root, checked(tool == &DrawTool::Pen), ID_TOOL_PEN, "ペン");
         append(
             root,
@@ -196,6 +205,7 @@ pub fn show(
         let _ = DestroyMenu(root);
 
         match selected.0 as usize {
+            ID_TOOL_SELECT => Some(MenuAction::SelectTool(DrawTool::Select)),
             ID_TOOL_PEN => Some(MenuAction::SelectTool(DrawTool::Pen)),
             ID_TOOL_MARKER => Some(MenuAction::SelectTool(DrawTool::Marker)),
             ID_TOOL_ERASER => Some(MenuAction::SelectTool(DrawTool::Eraser)),

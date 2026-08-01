@@ -6,6 +6,7 @@
 //   フレームごとに active へ globalAlpha = opacity で合成する。
 // - eraser は baked へ直接 destination-out で増分適用する。
 // - undo / clear / snapshot / トリム時は strokes 一覧から baked を全再構築する。
+// - 移動中スタンプは baked から一度だけ除き、active で位置だけを再描画する。
 
 import type { CanvasItem, ShapeItem, StampItem, Stroke } from "~/protocol";
 import { stableSegments, tailSegment } from "./geometry";
@@ -31,6 +32,7 @@ export class OverlayLayers {
   private actives = new Map<string, ActiveEntry>();
   private latestItems: CanvasItem[] = [];
   private stampImages = new Map<string, HTMLImageElement | null>();
+  private movingStamp: StampItem | null = null;
 
   constructor(
     private baked: HTMLCanvasElement,
@@ -49,7 +51,12 @@ export class OverlayLayers {
       canvas.width = width;
       canvas.height = height;
     }
-    this.rebuild(items);
+    if (this.movingStamp) {
+      this.rebuildBaked(items, this.movingStamp.itemId);
+      this.renderActive();
+    } else {
+      this.rebuild(items);
+    }
   }
 
   setItems(items: CanvasItem[]): void {
@@ -58,13 +65,28 @@ export class OverlayLayers {
 
   // 確定 CanvasItem 一覧から baked を全再構築する。
   rebuild(items: CanvasItem[]): void {
+    this.movingStamp = null;
+    this.rebuildBaked(items);
+    this.renderActive();
+  }
+
+  // 最初のpreviewだけbakedを再構築し、以降はactive上のスタンプだけを更新する。
+  previewStamp(stamp: StampItem, rebuildBaked: boolean): void {
+    this.movingStamp = stamp;
+    if (rebuildBaked) this.rebuildBaked(this.latestItems, stamp.itemId);
+  }
+
+  private rebuildBaked(items: CanvasItem[], excludedStampId?: string): void {
     this.latestItems = items;
     const ctx = context2d(this.baked);
     ctx.globalCompositeOperation = "source-over";
     ctx.clearRect(0, 0, this.width, this.height);
 
     for (const item of items) {
-      if (item.done) {
+      if (
+        item.done &&
+        !(item.kind === "stamp" && item.itemId === excludedStampId)
+      ) {
         this.compositeItem(ctx, item);
       }
     }
@@ -89,7 +111,6 @@ export class OverlayLayers {
         this.appendActive(stroke);
       }
     }
-    this.renderActive();
   }
 
   bakeItem(item: CanvasItem): void {
@@ -187,6 +208,7 @@ export class OverlayLayers {
         this.drawShape(ctx, item);
       }
     }
+    if (this.movingStamp) this.drawStamp(ctx, this.movingStamp);
   }
 
   private compositeItem(ctx: CanvasRenderingContext2D, item: CanvasItem): void {
@@ -326,7 +348,12 @@ export class OverlayLayers {
     pending.decoding = "async";
     pending.onload = () => {
       this.stampImages.set(stamp.stampId, pending);
-      this.rebuild(this.latestItems);
+      if (this.movingStamp) {
+        this.rebuildBaked(this.latestItems, this.movingStamp.itemId);
+        this.renderActive();
+      } else {
+        this.rebuild(this.latestItems);
+      }
     };
     pending.onerror = () => {
       console.warn(`overlay: failed to load stamp ${stamp.stampId}`);

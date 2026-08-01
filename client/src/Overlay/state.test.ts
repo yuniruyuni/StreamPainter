@@ -132,7 +132,7 @@ describe("OverlayState", () => {
     expect(state.items[0]).toMatchObject({ done: true, endedAt: 123 });
   });
 
-  test("v4 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
+  test("v5 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
     const state = synchronizedState(
       [
         strokeItem("s1"),
@@ -155,6 +155,64 @@ describe("OverlayState", () => {
     expect(applyNext(state, { type: "undo" }).kind).toBe("rebuild");
     expect(state.items).toHaveLength(1);
     expect(state.items[0]?.kind).toBe("stroke");
+  });
+
+  test("連続する stamp_move_preview は初回だけbaked再構築し確定時に戻す", () => {
+    const state = synchronizedState([
+      {
+        kind: "stamp",
+        itemId: "stamp-item-1",
+        stampId: "stamp-1",
+        center: [0.2, 0.3],
+        widthN: 0.1,
+        heightN: 0.2,
+        opacity: 1,
+        done: true,
+        endedAt: 200,
+      },
+      strokeItem("s1"),
+    ]);
+
+    const first = applyNext(state, {
+      type: "stamp_move_preview",
+      itemId: "stamp-item-1",
+      center: [0.5, 0.45],
+    });
+    expect(first.kind).toBe("stamp_preview");
+    if (first.kind === "stamp_preview") expect(first.rebuildBaked).toBe(true);
+
+    const second = applyNext(state, {
+      type: "stamp_move_preview",
+      itemId: "stamp-item-1",
+      center: [0.75, 0.6],
+    });
+    expect(second.kind).toBe("stamp_preview");
+    if (second.kind === "stamp_preview") {
+      expect(second.rebuildBaked).toBe(false);
+      expect(second.stamp.center).toEqual([0.75, 0.6]);
+    }
+
+    expect(
+      applyNext(state, {
+        type: "stamp_move",
+        itemId: "stamp-item-1",
+        center: [0.8, 0.65],
+      }).kind,
+    ).toBe("rebuild");
+    expect(state.items[0]).toMatchObject({ center: [0.8, 0.65] });
+    expect(state.items[1]).toEqual(strokeItem("s1"));
+  });
+
+  test("未知の stamp_move は状態を変えない", () => {
+    const state = synchronizedState([strokeItem("s1")]);
+    expect(
+      applyNext(state, {
+        type: "stamp_move",
+        itemId: "missing",
+        center: [0.75, 0.6],
+      }).kind,
+    ).toBe("none");
+    expect(state.items).toEqual([strokeItem("s1")]);
   });
 
   test("undo は最後の確定ストロークを削除し rebuild", () => {

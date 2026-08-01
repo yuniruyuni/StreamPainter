@@ -27,6 +27,7 @@ export type RenderEffect =
   | { kind: "bake_item"; item: CanvasItem }
   | { kind: "cancel"; strokeId: string }
   | { kind: "preview" }
+  | { kind: "stamp_preview"; stamp: StampItem; rebuildBaked: boolean }
   | { kind: "rebuild" }
   | { kind: "resync" };
 
@@ -35,6 +36,7 @@ export class OverlayState {
   fadeAfterMs: number | null = null;
   rev = 0;
   private synchronized = false;
+  private movingStampId: string | null = null;
 
   /** ストロークだけを必要とする描画処理向けの読み取りビュー。 */
   get strokes(): Stroke[] {
@@ -52,17 +54,20 @@ export class OverlayState {
     if (msg.type === "snapshot") {
       if (msg.protocolVersion !== PROTOCOL_VERSION) {
         this.synchronized = false;
+        this.movingStampId = null;
         return { kind: "resync" };
       }
       this.items = msg.items;
       this.fadeAfterMs = msg.fadeAfterMs;
       this.rev = msg.rev;
       this.synchronized = true;
+      this.movingStampId = null;
       return { kind: "rebuild" };
     }
 
     if (!this.synchronized || msg.rev !== this.rev + 1) {
       this.synchronized = false;
+      this.movingStampId = null;
       return { kind: "resync" };
     }
     this.rev = msg.rev;
@@ -154,7 +159,29 @@ export class OverlayState {
         this.items.push(item);
         return this.trim() ? { kind: "rebuild" } : { kind: "bake_item", item };
       }
+      case "stamp_move_preview": {
+        const stamp = this.items.find(
+          (item): item is Extract<CanvasItem, { kind: "stamp" }> =>
+            item.kind === "stamp" && item.itemId === msg.itemId && item.done,
+        );
+        if (!stamp) return { kind: "none" };
+        stamp.center = msg.center;
+        const rebuildBaked = this.movingStampId !== msg.itemId;
+        this.movingStampId = msg.itemId;
+        return { kind: "stamp_preview", stamp, rebuildBaked };
+      }
+      case "stamp_move": {
+        const stamp = this.items.find(
+          (item): item is Extract<CanvasItem, { kind: "stamp" }> =>
+            item.kind === "stamp" && item.itemId === msg.itemId && item.done,
+        );
+        if (!stamp) return { kind: "none" };
+        stamp.center = msg.center;
+        if (this.movingStampId === msg.itemId) this.movingStampId = null;
+        return { kind: "rebuild" };
+      }
       case "undo": {
+        this.movingStampId = null;
         let index = -1;
         for (let i = this.items.length - 1; i >= 0; i--) {
           if (this.items[i]?.done) {
@@ -167,6 +194,7 @@ export class OverlayState {
         return { kind: "rebuild" };
       }
       case "redo": {
+        this.movingStampId = null;
         if (
           !msg.item.done ||
           this.items.some(
@@ -181,6 +209,7 @@ export class OverlayState {
           : { kind: "bake_item", item: msg.item };
       }
       case "clear": {
+        this.movingStampId = null;
         if (this.items.length === 0) return { kind: "none" };
         this.items = [];
         return { kind: "rebuild" };

@@ -30,7 +30,8 @@ snapshot再同期します。完全履歴の複製はこの異常復旧時だけ
 の順序が一意になり、snapshotと増分イベントの競合を避けます。
 
 - 新規接続: 現在の全CanvasItemをsnapshotとして最初に送信
-- 通常描画: `stroke_*`、`shape_*`、`stamp_add`、`undo`、`clear` を増分配信
+- 通常描画: `stroke_*`、`shape_*`、`stamp_add`、`stamp_move_preview`、`stamp_move`、`undo`、
+  `redo`、`clear` を増分配信
 - 再接続: 古いクライアント状態をsnapshotで全置換
 - backpressure: 各接続は256メッセージの上限を持つ
 - 遅延時: 接続をハブから除外し、Browser Source側の再接続に任せる
@@ -40,8 +41,13 @@ CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000�
 します。増分イベントにはrevisionを付け、欠落を検出したoverlayは再接続snapshotで復旧します。
 
 ローカルDirect2DとBrowser SourceのCanvas 2Dは、通常の確定操作では新しい1項目だけを
-bakedレイヤーへ追記します。全履歴の再構築はUndo、Clear、上限トリム、再接続snapshot、
-キャンバスのリサイズ時に限定します。
+bakedレイヤーへ追記します。全履歴の再構築はUndo、スタンプ移動、Clear、上限トリム、
+再接続snapshot、キャンバスのリサイズ時に限定します。スタンプのドラッグ中はネイティブ側の
+選択レイヤーを即時更新し、最新座標だけを16ms間隔（約60fps）の`stamp_move_preview`として
+送ります。Browser Source側は開始時に対象スタンプをbakedレイヤーから除き、その後はactive
+レイヤー上の1枚だけを更新します。同一描画フレーム内の更新は最新状態へ畳み込み、確定座標は
+`stamp_move`としてポインタを離した時点で即時送信します。履歴全体の再構築はドラッグの開始時と
+確定時に各1回だけ行います。
 
 ## Web assets
 

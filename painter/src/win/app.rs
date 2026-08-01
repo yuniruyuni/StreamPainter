@@ -3,7 +3,7 @@
 //! - WS_EX_NOREDIRECTIONBITMAP + WS_EX_TOPMOST + WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
 //! - F9 (グローバルホットキー) でパススルー ⇔ 描画モードを切替 (WS_EX_TRANSPARENT)
 //! - WM_POINTER* で入力を受け、CanvasEngine → local web hub + ローカルエコー描画
-//! - 20ms タイマで stroke_points をバッチ送信
+//! - 16ms タイマで描画差分を約60fpsにバッチ送信
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
@@ -35,7 +35,7 @@ use crate::engine::canvas_engine::CanvasEngine;
 use crate::engine::content_rect::{content_rect, parse_aspect, Rect};
 use crate::net::local_server::{self, LocalServerHandle};
 use crate::net::obs::{self, ObsSettings, ProjectorView};
-use crate::protocol::{Brush, LineStyle, ShapeKind, Tool};
+use crate::protocol::{Brush, LineStyle, ShapeKind, StampItem, Tool};
 use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
 use crate::win::projector;
@@ -47,9 +47,9 @@ use crate::win::tray::{self, TrayCommand, WM_TRAY};
 const HOTKEY_TOGGLE: i32 = 1;
 /// 現在はポインタ種別を区別しないため、マウス相当の一定入力として扱う。
 const POINTER_PRESSURE: f64 = 1.0;
-/// 20ms バッチ (50 msg/s)
+/// 動画フレームに合わせた約60fpsのバッチ送信。
 const FLUSH_TIMER_ID: usize = 1;
-const FLUSH_INTERVAL_MS: u32 = 20;
+const FLUSH_INTERVAL_MS: u32 = 16;
 /// OBS プロジェクター検知のポーリング間隔 (docs/painter.md)
 const PROJECTOR_TIMER_ID: usize = 2;
 const PROJECTOR_INTERVAL_MS: u32 = 2000;
@@ -60,6 +60,18 @@ const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RENDERER_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// obs-websocket 要求スレッドからの結果通知 (wparam: 成功=1)
 const WM_OBS_RESULT: u32 = WM_APP + 2;
+
+struct StampDrag {
+    pointer_id: u32,
+    offset: (f64, f64),
+    origin: (f64, f64),
+}
+
+struct StampSelection {
+    stamp: StampItem,
+    drag: Option<StampDrag>,
+}
+
 struct App {
     engine: CanvasEngine,
     web: LocalServerHandle,
@@ -97,6 +109,8 @@ struct App {
     projector_z_order: projector::ZOrderGuard,
     /// 右ボタンを押している間のジェスチャーメニュー。
     radial_menu: Option<RadialMenu>,
+    /// 選択中スタンプは baked から分離し、ドラッグ用のフレーム層へ描く。
+    stamp_selection: Option<StampSelection>,
 }
 
 pub fn run() -> Result<()> {
@@ -204,6 +218,7 @@ pub fn run() -> Result<()> {
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
         radial_menu: None,
+        stamp_selection: None,
     });
 
     // 起動時に透明フレームを 1 回描き、D2D シェーダコンパイル・swapchain 初回
@@ -212,7 +227,7 @@ pub fn run() -> Result<()> {
         let t = std::time::Instant::now();
         let renderer = app.renderer.as_mut().expect("renderer was initialized");
         renderer.rebuild_baked(&[])?;
-        renderer.draw_frame(&[], false, None)?;
+        renderer.draw_frame(&[], false, None, None)?;
         info!("renderer warmup: {:?}", t.elapsed());
     }
 
@@ -352,6 +367,22 @@ fn select_monitor(monitors: &[Monitor], configured: usize) -> Option<(usize, Mon
         .or_else(|| monitors.first().copied().map(|monitor| (0, monitor)))
 }
 
+fn clamp_stamp_center(stamp: &StampItem, center: (f64, f64)) -> (f64, f64) {
+    fn axis(value: f64, size: f64) -> f64 {
+        let half = size.abs() / 2.0;
+        if half >= 0.5 {
+            0.5
+        } else {
+            value.clamp(half, 1.0 - half)
+        }
+    }
+
+    (
+        axis(center.0, stamp.width_n),
+        axis(center.1, stamp.height_n),
+    )
+}
+
 impl App {
     /// 現在のツール・色から Brush を組み立てる (テストページと同じマッピング)
     fn current_brush(&self) -> Option<Brush> {
@@ -377,7 +408,8 @@ impl App {
                 width_n: self.width_n * 3.0,
                 pressure_width: false,
             }),
-            DrawTool::Line
+            DrawTool::Select
+            | DrawTool::Line
             | DrawTool::Arrow
             | DrawTool::Rectangle
             | DrawTool::Ellipse
@@ -396,6 +428,19 @@ impl App {
     /// オーバーレイが操作可能な状態か (プロジェクター追従が無効なら常に可)
     fn overlay_enabled(&self) -> bool {
         !self.follow_projector || self.projector_visible
+    }
+
+    fn stamp_drag_active(&self) -> bool {
+        self.stamp_selection
+            .as_ref()
+            .is_some_and(|selection| selection.drag.is_some())
+    }
+
+    fn stamp_drag_owns(&self, pointer_id: u32) -> bool {
+        self.stamp_selection
+            .as_ref()
+            .and_then(|selection| selection.drag.as_ref())
+            .is_some_and(|drag| drag.pointer_id == pointer_id)
     }
 
     /// OBSプロジェクターを検出し、表示追従とZ-orderを同期する。
@@ -440,27 +485,48 @@ impl App {
         match action {
             MenuAction::SelectTool(tool) => {
                 info!("tool: {tool:?}");
+                let deselected = tool != DrawTool::Select && self.stamp_selection.take().is_some();
                 self.tool = tool;
+                if deselected {
+                    self.rebuild();
+                    self.render();
+                }
             }
             MenuAction::SelectColor(color) => {
                 self.color = color.to_string();
-                // 色を選んだ = 描く意図なので、消しゴム中ならペンに戻す
-                if matches!(&self.tool, DrawTool::Eraser | DrawTool::Stamp(_)) {
+                // 色を選んだ = 描く意図なので、非着色ツール中ならペンに戻す
+                if matches!(
+                    &self.tool,
+                    DrawTool::Select | DrawTool::Eraser | DrawTool::Stamp(_)
+                ) {
+                    let deselected = self.stamp_selection.take().is_some();
                     self.tool = DrawTool::Pen;
+                    if deselected {
+                        self.rebuild();
+                        self.render();
+                    }
                 }
             }
             MenuAction::Undo => {
+                let deselected = self.stamp_selection.take().is_some();
                 let msgs = self.engine.undo();
-                if !msgs.is_empty() {
+                let changed = !msgs.is_empty();
+                if changed {
                     self.web.send_all(msgs);
+                }
+                if deselected || changed {
                     self.rebuild();
                     self.render();
                 }
             }
             MenuAction::Redo => {
+                let deselected = self.stamp_selection.take().is_some();
                 let msgs = self.engine.redo();
-                if !msgs.is_empty() {
+                let changed = !msgs.is_empty();
+                if changed {
                     self.web.send_all(msgs);
+                }
+                if deselected || changed {
                     self.rebuild();
                     self.render();
                 }
@@ -469,9 +535,13 @@ impl App {
                 if !crate::win::confirm(hwnd, "すべての描画を消去しますか？") {
                     return false;
                 }
+                let deselected = self.stamp_selection.take().is_some();
                 let msgs = self.engine.clear();
-                if !msgs.is_empty() {
+                let changed = !msgs.is_empty();
+                if changed {
                     self.web.send_all(msgs);
+                }
+                if deselected || changed {
                     self.rebuild();
                     self.render();
                 }
@@ -490,6 +560,10 @@ impl App {
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
         let visible = if self.local_echo { &items[..] } else { &[] };
+        let selected_stamp = self
+            .stamp_selection
+            .as_ref()
+            .map(|selection| &selection.stamp);
         let radial = self.radial_menu.as_ref().map(|menu| {
             (
                 menu,
@@ -502,7 +576,9 @@ impl App {
             .renderer
             .as_mut()
             .ok_or_else(|| anyhow!("renderer is unavailable"))
-            .and_then(|renderer| renderer.draw_frame(visible, self.draw_mode, radial));
+            .and_then(|renderer| {
+                renderer.draw_frame(visible, self.draw_mode, selected_stamp, radial)
+            });
         drop(items);
         if let Err(error) = result {
             self.recover_renderer("draw_frame", error);
@@ -515,11 +591,15 @@ impl App {
         }
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
+        let excluded = self
+            .stamp_selection
+            .as_ref()
+            .map(|selection| selection.stamp.item_id.as_str());
         let result = self
             .renderer
             .as_mut()
             .ok_or_else(|| anyhow!("renderer is unavailable"))
-            .and_then(|renderer| renderer.rebuild_baked(&items));
+            .and_then(|renderer| renderer.rebuild_baked_excluding(&items, excluded));
         drop(items);
         if let Err(error) = result {
             self.recover_renderer("rebuild_baked", error);
@@ -585,12 +665,20 @@ impl App {
             &self.stamps,
         )?;
         if self.local_echo {
-            renderer.rebuild_baked(&items)?;
+            let excluded = self
+                .stamp_selection
+                .as_ref()
+                .map(|selection| selection.stamp.item_id.as_str());
+            renderer.rebuild_baked_excluding(&items, excluded)?;
         } else {
             renderer.rebuild_baked(&[])?;
         }
         if self.draw_mode {
             let visible = if self.local_echo { &items[..] } else { &[] };
+            let selected_stamp = self
+                .stamp_selection
+                .as_ref()
+                .map(|selection| &selection.stamp);
             let radial = self.radial_menu.as_ref().map(|menu| {
                 (
                     menu,
@@ -599,7 +687,7 @@ impl App {
                     self.stamps.as_slice(),
                 )
             });
-            renderer.draw_frame(visible, true, radial)?;
+            renderer.draw_frame(visible, true, selected_stamp, radial)?;
         } else {
             renderer.clear_frame()?;
         }
@@ -626,6 +714,7 @@ impl App {
             return;
         }
         self.radial_menu = None;
+        self.cancel_stamp_drag(hwnd);
 
         let (aspect_width, aspect_height) = self.canvas_aspect;
         let content_local = content_rect(
@@ -784,13 +873,20 @@ impl App {
         self.draw_mode = on;
         if !self.draw_mode {
             self.radial_menu = None;
+            let deselected = self.stamp_selection.take().is_some();
             // 描画中に切り替えた場合はストロークを破棄する
+            let had_active_input = self.engine.is_drawing();
             let msgs = self.engine.cancel();
             if !msgs.is_empty() {
                 self.web.send_all(msgs);
+            }
+            if had_active_input {
                 unsafe {
                     let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
                 }
+            }
+            if deselected {
+                self.rebuild();
             }
         }
         set_transparent(hwnd, !self.draw_mode);
@@ -821,8 +917,136 @@ impl App {
         self.content_screen.normalize(x, y)
     }
 
+    fn begin_stamp_drag(&mut self, hwnd: HWND, pointer_id: u32, u: f64, v: f64) {
+        let hit = self.engine.stamp_at(u, v);
+        match hit {
+            Some(stamp) => {
+                if !self.engine.begin_stamp_move(&stamp.item_id) {
+                    return;
+                }
+                let changed_selection = self
+                    .stamp_selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.stamp.item_id != stamp.item_id);
+                let origin = stamp.center;
+                self.stamp_selection = Some(StampSelection {
+                    drag: Some(StampDrag {
+                        pointer_id,
+                        offset: (u - origin.0, v - origin.1),
+                        origin,
+                    }),
+                    stamp,
+                });
+                if changed_selection {
+                    self.rebuild();
+                }
+                unsafe {
+                    SetTimer(Some(hwnd), FLUSH_TIMER_ID, FLUSH_INTERVAL_MS, None);
+                }
+            }
+            None => {
+                if self.stamp_selection.take().is_some() {
+                    self.rebuild();
+                }
+            }
+        }
+        self.render();
+    }
+
+    /// 選択ドラッグを更新した場合は true。対象ポインタのメッセージを消費する。
+    fn update_stamp_drag(&mut self, pointer_id: u32, lparam: LPARAM) -> bool {
+        let (u, v) = self.pointer_uv(lparam);
+        let moved = {
+            let Some(selection) = self.stamp_selection.as_mut() else {
+                return false;
+            };
+            let Some(drag) = selection
+                .drag
+                .as_ref()
+                .filter(|drag| drag.pointer_id == pointer_id)
+            else {
+                return false;
+            };
+            let center =
+                clamp_stamp_center(&selection.stamp, (u - drag.offset.0, v - drag.offset.1));
+            if selection.stamp.center == center {
+                None
+            } else {
+                selection.stamp.center = center;
+                Some((selection.stamp.item_id.clone(), center))
+            }
+        };
+        if let Some((item_id, center)) = moved {
+            let _ = self.engine.preview_stamp_move(&item_id, center);
+            self.render();
+        }
+        true
+    }
+
+    fn finish_stamp_drag(&mut self, hwnd: HWND, pointer_id: u32, lparam: LPARAM) -> bool {
+        if !self.update_stamp_drag(pointer_id, lparam) {
+            return false;
+        }
+        let item_id = {
+            let Some(selection) = self.stamp_selection.as_mut() else {
+                return false;
+            };
+            let Some(drag) = selection.drag.take() else {
+                return false;
+            };
+            debug_assert_eq!(drag.pointer_id, pointer_id);
+            selection.stamp.item_id.clone()
+        };
+
+        let messages = self.engine.end(now_ms());
+        if !messages.is_empty() {
+            self.web.send_all(messages);
+        }
+        unsafe {
+            let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
+        }
+        if let Some(stamp) = self.engine.stamp_by_id(&item_id) {
+            if let Some(selection) = self.stamp_selection.as_mut() {
+                selection.stamp = stamp;
+            }
+        } else {
+            self.stamp_selection = None;
+            self.rebuild();
+        }
+        self.render();
+        true
+    }
+
+    fn cancel_stamp_drag(&mut self, hwnd: HWND) -> bool {
+        let canceled = {
+            let Some(selection) = self.stamp_selection.as_mut() else {
+                return false;
+            };
+            let Some(drag) = selection.drag.take() else {
+                return false;
+            };
+            selection.stamp.center = drag.origin;
+            true
+        };
+        if canceled {
+            let messages = self.engine.cancel();
+            if !messages.is_empty() {
+                self.web.send_all(messages);
+            }
+            unsafe {
+                let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
+            }
+            self.render();
+        }
+        canceled
+    }
+
     fn begin_radial_menu(&mut self, pointer_id: u32, lparam: LPARAM) {
-        if !self.draw_mode || self.engine.is_drawing() || self.radial_menu.is_some() {
+        if !self.draw_mode
+            || self.engine.is_drawing()
+            || self.stamp_drag_active()
+            || self.radial_menu.is_some()
+        {
             return;
         }
         let screen = pointer_screen(lparam);
@@ -936,8 +1160,8 @@ impl App {
         }
     }
 
-    fn on_pointer_down(&mut self, hwnd: HWND, lparam: LPARAM) {
-        if !self.draw_mode || self.engine.is_drawing() {
+    fn on_pointer_down(&mut self, hwnd: HWND, pointer_id: u32, lparam: LPARAM) {
+        if !self.draw_mode || self.engine.is_drawing() || self.stamp_drag_active() {
             return;
         }
         let x = (lparam.0 & 0xffff) as i16 as f64;
@@ -948,6 +1172,10 @@ impl App {
         }
         let (u, v) = self.content_screen.normalize(x, y);
         let msgs = match self.tool.clone() {
+            DrawTool::Select => {
+                self.begin_stamp_drag(hwnd, pointer_id, u, v);
+                return;
+            }
             DrawTool::Pen | DrawTool::Marker | DrawTool::Eraser => {
                 let Some(brush) = self.current_brush() else {
                     return;
@@ -1011,7 +1239,13 @@ impl App {
         self.render();
     }
 
-    fn on_pointer_update(&mut self, hwnd: HWND, lparam: LPARAM) {
+    fn on_pointer_update(&mut self, hwnd: HWND, pointer_id: u32, lparam: LPARAM) {
+        if self.update_stamp_drag(pointer_id, lparam) {
+            return;
+        }
+        if self.stamp_drag_active() {
+            return;
+        }
         if !self.engine.is_drawing() {
             return;
         }
@@ -1035,7 +1269,13 @@ impl App {
         self.render();
     }
 
-    fn on_pointer_up(&mut self, hwnd: HWND) {
+    fn on_pointer_up(&mut self, hwnd: HWND, pointer_id: u32, lparam: LPARAM) {
+        if self.finish_stamp_drag(hwnd, pointer_id, lparam) {
+            return;
+        }
+        if self.stamp_drag_active() {
+            return;
+        }
         if !self.engine.is_drawing() {
             return;
         }
@@ -1081,7 +1321,7 @@ fn apply_menu_result(hwnd: HWND, app_ptr: *mut App, action: Option<MenuAction>) 
 fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
     let menu_input = {
         let app = unsafe { &*app_ptr };
-        (!app.engine.is_drawing()).then(|| {
+        (!app.engine.is_drawing() && !app.stamp_drag_active()).then(|| {
             (
                 app.tool.clone(),
                 app.color.clone(),
@@ -1136,7 +1376,7 @@ unsafe extern "system" fn window_proc(
             } else if flags & POINTER_MESSAGE_FLAG_SECONDBUTTON != 0 {
                 unsafe { &mut *app_ptr }.begin_radial_menu(id, lparam);
             } else if flags & POINTER_MESSAGE_FLAG_FIRSTBUTTON != 0 {
-                unsafe { &mut *app_ptr }.on_pointer_down(hwnd, lparam);
+                unsafe { &mut *app_ptr }.on_pointer_down(hwnd, id, lparam);
             }
             LRESULT(0)
         }
@@ -1147,10 +1387,17 @@ unsafe extern "system" fn window_proc(
             {
                 unsafe { &mut *app_ptr }.cancel_radial_interaction();
                 LRESULT(0)
+            } else if pointer_flags(wparam) & POINTER_MESSAGE_FLAG_CANCELED != 0
+                && unsafe { &*app_ptr }.stamp_drag_owns(id)
+            {
+                unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd);
+                LRESULT(0)
             } else if unsafe { &mut *app_ptr }.update_radial_menu(id, lparam) {
                 LRESULT(0)
-            } else if unsafe { &*app_ptr }.engine.is_drawing() {
-                unsafe { &mut *app_ptr }.on_pointer_update(hwnd, lparam);
+            } else if unsafe { &*app_ptr }.engine.is_drawing()
+                || unsafe { &*app_ptr }.stamp_drag_owns(id)
+            {
+                unsafe { &mut *app_ptr }.on_pointer_update(hwnd, id, lparam);
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1162,6 +1409,11 @@ unsafe extern "system" fn window_proc(
                 && unsafe { &*app_ptr }.radial_menu_owns(id)
             {
                 unsafe { &mut *app_ptr }.cancel_radial_interaction();
+                LRESULT(0)
+            } else if pointer_flags(wparam) & POINTER_MESSAGE_FLAG_CANCELED != 0
+                && unsafe { &*app_ptr }.stamp_drag_owns(id)
+            {
+                unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd);
                 LRESULT(0)
             } else if let Some(release) = unsafe { &mut *app_ptr }.release_radial_menu(id, lparam) {
                 match release {
@@ -1182,22 +1434,28 @@ unsafe extern "system" fn window_proc(
                     RadialRelease::Cancel => unsafe { &mut *app_ptr }.poll_projector(hwnd),
                 }
                 LRESULT(0)
-            } else if unsafe { &*app_ptr }.engine.is_drawing() {
-                unsafe { &mut *app_ptr }.on_pointer_up(hwnd);
+            } else if unsafe { &*app_ptr }.engine.is_drawing()
+                || unsafe { &*app_ptr }.stamp_drag_owns(id)
+            {
+                unsafe { &mut *app_ptr }.on_pointer_up(hwnd, id, lparam);
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
         WM_POINTERCAPTURECHANGED | WM_CAPTURECHANGED => {
-            if unsafe { &mut *app_ptr }.cancel_radial_interaction() {
+            if unsafe { &mut *app_ptr }.cancel_radial_interaction()
+                || unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd)
+            {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
         WM_CANCELMODE => {
-            if unsafe { &mut *app_ptr }.dismiss_radial_menu() {
+            if unsafe { &mut *app_ptr }.dismiss_radial_menu()
+                || unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd)
+            {
                 LRESULT(0)
             } else {
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1317,5 +1575,22 @@ mod tests {
         assert_eq!(select_monitor(&monitors, 1), Some((1, monitors[1])));
         assert_eq!(select_monitor(&monitors, 9), Some((0, monitors[0])));
         assert_eq!(select_monitor(&[], 0), None);
+    }
+
+    #[test]
+    fn moved_stamp_stays_fully_inside_the_canvas() {
+        let stamp = StampItem {
+            item_id: "item-1".into(),
+            stamp_id: "stamp-1".into(),
+            center: (0.5, 0.5),
+            width_n: 0.2,
+            height_n: 0.4,
+            opacity: 1.0,
+            done: true,
+            ended_at: Some(1.0),
+        };
+
+        assert_eq!(clamp_stamp_center(&stamp, (-0.3, 1.4)), (0.1, 0.8));
+        assert_eq!(clamp_stamp_center(&stamp, (0.4, 0.6)), (0.4, 0.6));
     }
 }

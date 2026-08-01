@@ -567,6 +567,26 @@ impl HubState {
                 });
                 (PainterMessage::StampAdd { stamp }, false)
             }
+            PainterMessage::StampMovePreview { item_id, center } => {
+                let stamp = self.items.iter_mut().find_map(|item| match item {
+                    CanvasItem::Stamp { stamp } if stamp.done && stamp.item_id == item_id => {
+                        Some(stamp)
+                    }
+                    _ => None,
+                })?;
+                stamp.center = center;
+                (PainterMessage::StampMovePreview { item_id, center }, false)
+            }
+            PainterMessage::StampMove { item_id, center } => {
+                let stamp = self.items.iter_mut().find_map(|item| match item {
+                    CanvasItem::Stamp { stamp } if stamp.done && stamp.item_id == item_id => {
+                        Some(stamp)
+                    }
+                    _ => None,
+                })?;
+                stamp.center = center;
+                (PainterMessage::StampMove { item_id, center }, false)
+            }
             PainterMessage::Undo {} => {
                 let index = self.items.iter().rposition(CanvasItem::is_done)?;
                 let removed = self.items.remove(index);
@@ -904,7 +924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_preserves_shape_and_stamp_order_in_v4_snapshot() {
+    async fn hub_preserves_shape_and_stamp_order_in_v5_snapshot() {
         let hub = test_hub();
         let shape = ShapeItem {
             item_id: "shape-1".into(),
@@ -964,6 +984,66 @@ mod tests {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert!(matches!(items[0], CanvasItem::Shape { .. }));
                 assert!(matches!(items[1], CanvasItem::Stamp { .. }));
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_applies_stamp_move_preview_and_commit_to_snapshots() {
+        let hub = test_hub();
+        apply(
+            &hub,
+            PainterMessage::StampAdd {
+                stamp: StampItem {
+                    item_id: "stamp-item-1".into(),
+                    stamp_id: "stamp-1".into(),
+                    center: (0.2, 0.3),
+                    width_n: 0.1,
+                    height_n: 0.2,
+                    opacity: 1.0,
+                    done: true,
+                    ended_at: Some(20.0),
+                },
+            },
+        )
+        .await;
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        receiver.recv().await.unwrap();
+
+        apply(
+            &hub,
+            PainterMessage::StampMovePreview {
+                item_id: "stamp-item-1".into(),
+                center: (0.5, 0.45),
+            },
+        )
+        .await;
+        let event = receiver.recv().await.unwrap();
+        assert!(event.contains("\"type\":\"stamp_move_preview\""));
+        assert!(event.contains("\"center\":[0.5,0.45]"));
+
+        apply(
+            &hub,
+            PainterMessage::StampMove {
+                item_id: "stamp-item-1".into(),
+                center: (0.75, 0.6),
+            },
+        )
+        .await;
+        let event = receiver.recv().await.unwrap();
+        assert!(event.contains("\"type\":\"stamp_move\""));
+        assert!(event.contains("\"center\":[0.75,0.6]"));
+
+        let (_, mut latest) = hub.subscribe().await.unwrap();
+        let snapshot = latest.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
+            OverlayControlMessage::Snapshot { rev, items, .. } => {
+                assert_eq!(rev, 3);
+                match &items[0] {
+                    CanvasItem::Stamp { stamp } => assert_eq!(stamp.center, (0.75, 0.6)),
+                    _ => panic!("expected stamp"),
+                }
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
