@@ -34,7 +34,7 @@ PNGスタンプの登録・削除・名称・既定サイズ・不透明度も�
 
 ## ソースからビルド
 
-必要なものは Bun 1.3.12、Rust 1.94.1、`cargo-about 0.9.1`、Visual Studio Build Tools
+必要なものは Bun 1.3.14、Rust 1.97.1、`cargo-about 0.9.1`、Visual Studio Build Tools
 （Desktop development with C++）です。
 
 ```powershell

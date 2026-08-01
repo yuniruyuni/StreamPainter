@@ -12,7 +12,7 @@ StreamPainterは、Windows上で動作するローカル完結型アプリケー
 ## 開発と検証
 
 リポジトリ直下で次を実行します。
-Rustはルートの`rust-toolchain.toml`で1.94.1、Bunは`package.json`で1.3.12に固定しています。
+Rustはルートの`rust-toolchain.toml`で1.97.1、Bunは`package.json`で1.3.14に固定しています。
 
 ```bash
 bun install --frozen-lockfile
