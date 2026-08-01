@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-01
+
 ### Added
 
 - 配置済みスタンプを選択枠付きでドラッグ再配置する選択ツールと、移動操作のUndo／Redo
@@ -53,7 +55,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yuniruyuni/StreamPainter/releases/tag/v0.1.0
