@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-03
+
+### Added
+
+- OBS WebSocketパスワードをWindows資格情報マネージャーへ移し、既存の平文設定とbackupを
+  初回起動時に安全に移行
+- RustとTypeScriptの全描画メッセージ、状態遷移、上限処理を共有fixtureで照合する
+  protocol conformanceテスト
+
+### Fixed
+
+- letterbox／pillarbox時に描画内容がキャンバス外へはみ出す問題を修正し、選択枠や
+  ラジアルメニューなどの操作UIは引き続き黒帯上にも表示
+
 ## [0.3.3] - 2026-08-03
 
 ### Changed
@@ -88,7 +102,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.0...v0.3.1

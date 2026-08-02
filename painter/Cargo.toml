@@ -1,6 +1,6 @@
 [package]
 name = "stream-painter"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = "A local drawing overlay for OBS Studio"
 license = "MIT"
