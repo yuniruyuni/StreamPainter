@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- GitHubのrepository-level immutable releasesを有効化し、今後公開するReleaseのtag／asset保護と
+  release attestation自動生成を適用
+
 ## [0.7.0] - 2026-08-03
 
 ### Added

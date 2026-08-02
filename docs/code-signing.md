@@ -7,6 +7,9 @@ artifact configuration、証明書が未取得です。GitHubの`code-signing` e
 secret/variablesもまだ存在せず、`SIGNPATH_ENABLED`は設定していません。このため現在の公式Releaseは
 従来どおりunsignedです。署名済みであるとは表示しません。
 
+GitHubのrepository-level immutable releasesは2026-08-03に有効化済みです。これは次回以降に
+公開するReleaseへ適用されますが、SignPathやAuthenticodeの有効化を意味しません。
+
 Release workflowには本番値を含まないscaffoldだけを用意しています。`SIGNPATH_ENABLED`が未設定または
 厳密に`false`なら従来のunsigned経路を使います。`true`へ切り替えた後は署名失敗時にunsignedへ
 fallbackせず、Release公開を止めます。大文字の`TRUE`など不明な値もbuild時に拒否します。
@@ -52,7 +55,7 @@ buildし、別projectのproprietary binaryを同梱しません。脆弱性の�
 - SignPath上のroles、manual approval、certificate、trusted build/origin policyを確定する。
 - 保護されたtagから発生するGitHub origin metadataをSignPathで実測し、許可するoriginをその経路だけに
   制限する。tag eventで使う値を推測してpolicyへ入力しない。
-- GitHubのmain/tag ruleset、`code-signing` environment、immutable releasesを有効にする。
+- GitHubのmain/tag rulesetと`code-signing` environmentを有効にする。
 - tagをpushするactorとは別のGitHub environment reviewerを決める。現在は未定であり、self-review禁止の
   environmentを安全に運用できるreviewerが参加するまで署名を有効化しない。
 
@@ -95,11 +98,50 @@ portable版を削除する場合はアプリを終了してexeを削除します
 | 別証明書・timestampなし・壊れたchain | final exeでAuthenticode `Valid`、割り当て済みsubject、leaf certificate SHA-256、timestamp certificateの存在を検査し、さらに`signtool verify /pa /all /v /tw`を成功必須にする。 |
 | 署名後fileの差し替え | 検証対象をfinal `dist`へcopyしてから署名を再検証し、その後にだけSHA-256を生成する。publish jobでもassetがexeとchecksumの2つだけでhashが一致することを再検証する。 |
 | 署名拒否・timeout・provider障害 | `SIGNPATH_ENABLED=true`時はsign job成功だけがpublish条件であり、unsigned jobはskipされる。失敗、denied、timeout、出力欠落のいずれでもReleaseを作らない。 |
-| 公開後のtag/asset置換 | `gh release create --verify-tag --fail-on-no-commits`を維持し、既存releaseを更新しない。GitHub immutable releasesも有効化し、修正版は新versionで公開する。 |
+| 公開後のtag/asset置換 | `gh release create --verify-tag --fail-on-no-commits`を維持し、既存releaseを更新しない。Repository-level immutable releasesで公開後のtagとassetを保護し、修正版は新versionで公開する。 |
 
 [GitHubはfork PRへActions secretを渡さない](https://docs.github.com/en/code-security/reference/secret-security/secret-types)
 一方、同じrepositoryへmergeされた悪意あるworkflowはsecretを参照できます。そのためworkflow、build script、
 artifact helper、CODEOWNERS自体をCODEOWNERS対象にし、main rulesetで第三者reviewを必須にすることが重要です。
+
+## GitHub immutable releases
+
+Repositoryの[`Enable release immutability`](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes)は
+2026-08-03に有効化しました。GitHubの仕様上、設定後に
+公開するReleaseだけがimmutableになります。既に公開済みのv0.1.0〜v0.7.0は遡及して保護されず、
+Release APIでも`immutable=false`のままです。過去版をimmutableであると表示せず、必要な修正は
+既存tagやassetの差し替えではなく、新しいversionとして公開します。
+
+Immutable Releaseを公開すると、GitHubは次を適用します。
+
+- Release assetの追加・変更・削除を禁止する。
+- Releaseに対応するGit tagの移動を禁止し、Releaseが存在する間はtagの削除も禁止する。Releaseを
+  削除してtagを削除できる状態にしても、同じtag名は再利用できない。
+- tag、commit SHA、Release assetsを記録した暗号学的に検証可能なrelease attestationを自動生成する。
+
+一方、公開後もReleaseのtitleとnotesは編集できます。Immutable releasesとrelease attestationは、
+GitHub上で公開されたtagとassetが後から差し替えられていないことを検証する仕組みです。Windowsが
+publisherを確認するAuthenticode署名、証明書chain、timestamp、SmartScreen reputationの代替には
+ならず、侵害された公開権限で最初から不正なassetを公開することも単独では防げません。このため
+SignPathのtrusted build/origin verification、manual approval、署名後検証は別の制御として維持します。
+
+GitHubが推奨する公開順序は、draft Releaseを作成し、全assetを添付し、最後にpublishするものです。
+現行workflowの1回のasset付き`gh release create`は、[GitHub CLI公式manual](https://cli.github.com/manual/gh_release_create)
+に従い、内部で次のAPI呼び出し順序を実行します。
+
+```text
+draft Release作成
+  -> exeとSHA-256 checksumを添付
+  -> publish
+  -> tag/asset保護とrelease attestation生成
+```
+
+したがって、現在のRelease workflowを手動の複数commandへ分割する必要はありません。publish前には
+`Assert-ReleaseAssetBundle`でexact file setとchecksumを検証済みであり、asset uploadに失敗すれば
+publishへ到達しません。公開後はRelease pageの`Immutable`表示と
+`gh release verify vX.Y.Z`でReleaseを、`gh release verify-asset vX.Y.Z <file>`でdownload済みassetを
+確認できます。詳細はGitHubの[immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)と
+[release integrityの検証手順](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/verify-release-integrity)を参照してください。
 
 ## SignPath側の必須設定
 
@@ -142,18 +184,16 @@ test requestで確認します。
 
 ## GitHub側の必須設定と有効化順序
 
-調査時点でrepository ruleset、environment、Actions variablesは未設定で、最新Releaseの
-`immutable`もfalseでした。次をすべて完了するまでは`SIGNPATH_ENABLED`を作成しません。
+調査時点でrepository ruleset、environment、Actions variablesは未設定です。Repository-level
+immutable releasesは有効化済みですが、次をすべて完了するまでは`SIGNPATH_ENABLED`を作成しません。
 
 1. main rulesetでPR reviewとworkflow/build scriptのCODEOWNER reviewを要求し、force pushを禁止する。
 2. active tag rulesetを`v*`へ適用し、release maintainerだけをbypass actorとしてtagの作成を許可する。
    updateとdeleteも制限する。GitHubの[タグruleset](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)を使う。
-3. GitHubの[immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)を
-   有効にする。
-4. `code-signing` environmentを作り、required reviewer、self-review禁止、admin bypass禁止、protected tag
+3. `code-signing` environmentを作り、required reviewer、self-review禁止、admin bypass禁止、protected tag
    だけのdeployment ruleを設定する。GitHubによれば、approval前は
    [environment secretへjobがアクセスできません](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)。
-5. `code-signing` environment secretへ`SIGNPATH_API_TOKEN`、environment variablesへ次を設定する。
+4. `code-signing` environment secretへ`SIGNPATH_API_TOKEN`、environment variablesへ次を設定する。
 
 | variable | 値の取得元 |
 | --- | --- |
@@ -164,11 +204,11 @@ test requestで確認します。
 | `SIGNPATH_EXPECTED_SIGNER_SUBJECT` | Foundationから実際に割り当てられたleaf certificateの完全なSubject |
 | `SIGNPATH_EXPECTED_SIGNER_SHA256` | 同じleaf certificate DERのSHA-256 fingerprint（64 hex） |
 
-6. 公開証明書ではないtest policyでprotected tag相当のorigin、manual approval、署名fileの出力位置、
+5. 公開証明書ではないtest policyでprotected tag相当のorigin、manual approval、署名fileの出力位置、
    subject/fingerprint、timestamp、chain、metadata制約を確認する。
-7. Code signing policyの現在状態、README、利用者向けexpected publisher/fingerprintを実値へ更新するPRを
+6. Code signing policyの現在状態、README、利用者向けexpected publisher/fingerprintを実値へ更新するPRを
    reviewしてmainへmergeする。
-8. 最後にrepository variable `SIGNPATH_ENABLED=true`を小文字で設定する。有効化後は署名失敗を回避する
+7. 最後にrepository variable `SIGNPATH_ENABLED=true`を小文字で設定する。有効化後は署名失敗を回避する
    ためだけに`false`へ戻さない。同じtagを再利用せず、原因を修正して新versionを署名付きでreleaseする。
    意図的にunsigned配布へ戻す場合は、緊急時の例外としてpolicyとREADMEを更新するreview済みPRを先に
    mergeし、利用者へ明示する。
@@ -185,7 +225,9 @@ protected vX.Y.Z tag
   -> Authenticode subject/fingerprint/timestamp/chain verification
   -> SHA-256生成
   -> final artifactのexact file set/hash再検証
-  -> GitHub Release create
+  -> draft GitHub Release作成
+  -> exeとSHA-256 checksumを添付
+  -> publish（immutable化とrelease attestation自動生成）
 ```
 
 build/sign jobにRelease書き込み権限は与えず、最終publish jobだけを`contents: write`にしています。
