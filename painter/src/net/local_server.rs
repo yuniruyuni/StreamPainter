@@ -447,7 +447,11 @@ impl HubState {
                 });
                 (PainterMessage::StrokeBegin { stroke_id, brush }, false)
             }
-            PainterMessage::StrokePoints { stroke_id, pts } => {
+            PainterMessage::StrokePoints {
+                stroke_id,
+                offset,
+                pts,
+            } => {
                 let stroke = self.items.iter_mut().find_map(|item| match item {
                     CanvasItem::Stroke { stroke }
                         if stroke.stroke_id == stroke_id && !stroke.done =>
@@ -456,16 +460,27 @@ impl HubState {
                     }
                     _ => None,
                 })?;
+                // snapshot は source canvas の未来側まで含む場合がある。絶対offsetで
+                // 既に含まれるprefixを照合し、未適用のsuffixだけを追記する。
+                if offset > stroke.pts.len() {
+                    return None;
+                }
+                let overlap = (stroke.pts.len() - offset).min(pts.len());
+                if stroke.pts[offset..offset + overlap] != pts[..overlap] {
+                    return None;
+                }
                 let available = MAX_STROKE_POINTS.saturating_sub(stroke.pts.len());
-                let accepted: Vec<_> = pts.into_iter().take(available).collect();
+                let accepted: Vec<_> = pts.into_iter().skip(overlap).take(available).collect();
                 if accepted.is_empty() {
                     return None;
                 }
+                let accepted_offset = offset + overlap;
                 self.total_points += accepted.len();
                 stroke.pts.extend_from_slice(&accepted);
                 (
                     PainterMessage::StrokePoints {
                         stroke_id,
+                        offset: accepted_offset,
                         pts: accepted,
                     },
                     false,
@@ -767,6 +782,7 @@ async fn websocket_session(socket: WebSocket, hub: HubHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::canvas_engine::CanvasEngine;
     use crate::protocol::{Brush, LineStyle, ShapeItem, ShapeKind, StampItem, Tool};
     use std::io::{Read, Write};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -788,6 +804,39 @@ mod tests {
         let (tx, rx) = mpsc::channel(HUB_INPUT_QUEUE_CAPACITY);
         tokio::spawn(run_hub(rx, Arc::new(HubRecovery::default())));
         HubHandle { tx }
+    }
+
+    fn queued_server(
+        capacity: usize,
+        source_items: SharedItems,
+    ) -> (
+        LocalServerHandle,
+        HubHandle,
+        mpsc::Receiver<HubCommand>,
+        Arc<HubRecovery>,
+    ) {
+        let recovery = Arc::new(HubRecovery::default());
+        let (tx, rx) = mpsc::channel(capacity);
+        let hub = HubHandle { tx };
+        let server = LocalServerHandle {
+            hub: hub.clone(),
+            source_items,
+            recovery: Arc::clone(&recovery),
+            shutdown: None,
+            thread: None,
+            overlay_url: String::new(),
+            licenses_url: String::new(),
+        };
+        (server, hub, rx, recovery)
+    }
+
+    async fn current_hub_items(hub: &HubHandle) -> Vec<CanvasItem> {
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        let snapshot = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
+            OverlayControlMessage::Snapshot { items, .. } => items,
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
     }
 
     async fn apply(hub: &HubHandle, message: PainterMessage) {
@@ -823,6 +872,7 @@ mod tests {
             &hub,
             PainterMessage::StrokePoints {
                 stroke_id: "s1".into(),
+                offset: 0,
                 pts: vec![(0.1, 0.2, 0.5, 0.0)],
             },
         )
@@ -874,6 +924,177 @@ mod tests {
         let event = receiver.recv().await.unwrap();
         assert!(event.contains("\"type\":\"stroke_begin\""));
         assert!(event.contains("\"rev\":1"));
+    }
+
+    #[test]
+    fn hub_applies_stroke_points_idempotently_by_absolute_offset() {
+        let p0 = (0.1, 0.2, 0.5, 0.0);
+        let p1 = (0.2, 0.3, 0.5, 16.0);
+        let p2 = (0.3, 0.4, 0.5, 32.0);
+        let mut state = HubState::default();
+        state.replace_items(vec![CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: "s1".into(),
+                brush: brush(),
+                pts: vec![p0, p1],
+                done: false,
+                ended_at: None,
+            },
+        }]);
+
+        let event = state
+            .apply(PainterMessage::StrokePoints {
+                stroke_id: "s1".into(),
+                offset: 0,
+                pts: vec![p0, p1, p2],
+            })
+            .unwrap();
+        assert!(!event.contains("offset"));
+        assert!(event.contains("\"pts\":[[0.3,0.4,0.5,32.0]]"));
+        let CanvasItem::Stroke { stroke } = &state.items[0] else {
+            panic!("expected stroke");
+        };
+        assert_eq!(stroke.pts, [p0, p1, p2]);
+
+        let revision = state.revision;
+        assert!(state
+            .apply(PainterMessage::StrokePoints {
+                stroke_id: "s1".into(),
+                offset: 0,
+                pts: vec![p0, p1, p2],
+            })
+            .is_none());
+        assert!(state
+            .apply(PainterMessage::StrokePoints {
+                stroke_id: "s1".into(),
+                offset: 4,
+                pts: vec![(0.5, 0.6, 0.5, 48.0)],
+            })
+            .is_none());
+        assert!(state
+            .apply(PainterMessage::StrokePoints {
+                stroke_id: "s1".into(),
+                offset: 1,
+                pts: vec![(0.9, 0.9, 0.5, 16.0)],
+            })
+            .is_none());
+        assert_eq!(state.revision, revision);
+        let CanvasItem::Stroke { stroke } = &state.items[0] else {
+            panic!("expected stroke");
+        };
+        assert_eq!(stroke.pts, [p0, p1, p2]);
+    }
+
+    #[tokio::test]
+    async fn stroke_begin_recovery_does_not_duplicate_the_pending_prefix() {
+        let mut engine = CanvasEngine::new();
+        let source_items = engine.shared_items();
+        let (server, hub, rx, recovery) = queued_server(1, Arc::clone(&source_items));
+
+        // stale commandで容量を埋め、StrokeBeginをsnapshot復旧へ切り替える。
+        server.send_all(vec![PainterMessage::Clear {}]);
+        let begin = engine.begin(7, brush(), 0.1, 0.2, 0.5, 1000.0);
+        server.send_all(begin);
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
+
+        tokio::spawn(run_hub(rx, Arc::clone(&recovery)));
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
+
+        // begin時点からpendingに残る先頭点と新規点を同時にflushする。
+        engine.move_to(7, 0.3, 0.4, 0.5, 1016.0);
+        let flushed = engine.flush();
+        assert!(matches!(
+            &flushed[..],
+            [PainterMessage::StrokePoints { offset: 0, pts, .. }] if pts.len() == 2
+        ));
+        server.send_all(flushed);
+
+        let actual = current_hub_items(&hub).await;
+        let expected = source_items.lock().unwrap().clone();
+        assert_eq!(actual, expected);
+        let CanvasItem::Stroke { stroke } = &actual[0] else {
+            panic!("expected stroke");
+        };
+        assert_eq!(stroke.pts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_during_chunked_stroke_points_preserves_later_offsets() {
+        let mut engine = CanvasEngine::new();
+        let source_items = engine.shared_items();
+        let begin = engine.begin(7, brush(), 0.0, 0.0, 0.5, 1000.0);
+        for index in 1..=600 {
+            engine.move_to(7, index as f64 * 0.001, 0.0, 0.5, 1000.0 + index as f64);
+        }
+        let chunks = engine.flush();
+        assert_eq!(chunks.len(), 2);
+
+        let (server, hub, rx, recovery) = queued_server(2, Arc::clone(&source_items));
+        server.send_all(begin);
+        // begin + 1 chunkで容量を使い切り、2 chunk目でsnapshotへ切り替わる。
+        server.send_all(chunks);
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
+
+        tokio::spawn(run_hub(rx, Arc::clone(&recovery)));
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
+
+        engine.move_to(7, 0.7, 0.0, 0.5, 1700.0);
+        let later = engine.flush();
+        assert!(matches!(
+            &later[..],
+            [PainterMessage::StrokePoints { offset: 601, pts, .. }] if pts.len() == 1
+        ));
+        server.send_all(later);
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn shape_update_queue_recovery_preserves_source_state() {
+        let mut engine = CanvasEngine::new();
+        let source_items = engine.shared_items();
+        let begin = engine.begin_shape(
+            7,
+            ShapeKind::Rectangle,
+            LineStyle {
+                color: "#ffffff".into(),
+                opacity: 1.0,
+                width_n: 0.005,
+            },
+            0.1,
+            0.2,
+        );
+        let (server, hub, rx, recovery) = queued_server(1, Arc::clone(&source_items));
+        server.send_all(begin);
+        engine.move_to(7, 0.8, 0.7, 0.5, 1016.0);
+        server.send_all(engine.flush());
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
+
+        tokio::spawn(run_hub(rx, Arc::clone(&recovery)));
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
+
+        server.send_all(engine.end(7, 1100.0));
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn stamp_preview_queue_recovery_preserves_source_state() {
+        let mut engine = CanvasEngine::new();
+        let source_items = engine.shared_items();
+        let add = engine.add_stamp("stamp-1".into(), (0.2, 0.3), 0.1, 0.2, 1.0, 10.0);
+        let item_id = engine.stamp_at(0.2, 0.3).unwrap().item_id;
+        let (server, hub, rx, recovery) = queued_server(1, Arc::clone(&source_items));
+        server.send_all(add);
+
+        assert!(engine.begin_stamp_move(&item_id));
+        assert!(engine.preview_stamp_move(&item_id, (0.7, 0.6)));
+        server.send_all(engine.flush());
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
+
+        tokio::spawn(run_hub(rx, Arc::clone(&recovery)));
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
+
+        server.send_all(engine.end_stamp_move(30.0));
+        assert_eq!(current_hub_items(&hub).await, *source_items.lock().unwrap());
     }
 
     #[tokio::test]

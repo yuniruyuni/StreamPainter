@@ -143,6 +143,12 @@ pub enum PainterMessage {
     #[serde(rename_all = "camelCase")]
     StrokePoints {
         stroke_id: String,
+        /// source canvas 上で `pts[0]` が占める点番号。
+        ///
+        /// snapshot 復旧との重複を避けるためのプロセス内 metadata であり、
+        /// WebSocket protocol には含めない。
+        #[serde(skip)]
+        offset: usize,
         pts: Vec<Point>,
     },
     #[serde(rename_all = "camelCase")]
@@ -271,6 +277,7 @@ mod tests {
     fn stroke_points_serializes_as_arrays() {
         let msg = PainterMessage::StrokePoints {
             stroke_id: "s1".into(),
+            offset: 0,
             pts: vec![(0.1, 0.2, 0.5, 0.0), (0.15, 0.25, 0.6, 16.0)],
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -282,6 +289,7 @@ mod tests {
                 "pts": [[0.1, 0.2, 0.5, 0.0], [0.15, 0.25, 0.6, 16.0]],
             })
         );
+        assert_eq!(serde_json::from_value::<PainterMessage>(json).unwrap(), msg);
     }
 
     #[test]

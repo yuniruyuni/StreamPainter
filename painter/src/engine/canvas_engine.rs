@@ -22,6 +22,8 @@ struct ActiveStroke {
     stroke_id: String,
     started_at: f64, // epoch ms
     pending: Vec<Point>,
+    /// 次の flush が source stroke の何点目から始まるか。
+    next_point_offset: usize,
     last: Option<Point>,
 }
 
@@ -183,6 +185,7 @@ impl CanvasEngine {
             stroke_id: stroke_id.clone(),
             started_at: now_ms,
             pending: vec![first],
+            next_point_offset: 0,
             last: Some(first),
         }));
         vec![PainterMessage::StrokeBegin { stroke_id, brush }]
@@ -428,10 +431,14 @@ impl CanvasEngine {
                 if active.pending.is_empty() {
                     return Vec::new();
                 }
+                let first_offset = active.next_point_offset;
                 let pts = std::mem::take(&mut active.pending);
+                active.next_point_offset = active.next_point_offset.saturating_add(pts.len());
                 pts.chunks(MAX_POINTS_PER_MESSAGE)
-                    .map(|chunk| PainterMessage::StrokePoints {
+                    .enumerate()
+                    .map(|(index, chunk)| PainterMessage::StrokePoints {
                         stroke_id: active.stroke_id.clone(),
+                        offset: first_offset + index * MAX_POINTS_PER_MESSAGE,
                         pts: chunk.to_vec(),
                     })
                     .collect()
@@ -1060,13 +1067,44 @@ mod tests {
     }
 
     #[test]
+    fn stroke_point_offsets_remain_absolute_across_flushes() {
+        let mut engine = CanvasEngine::new();
+        engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 0.0);
+        engine.move_to(POINTER_ID, 0.2, 0.1, 0.5, 16.0);
+
+        let first = engine.flush();
+        assert!(matches!(
+            &first[..],
+            [PainterMessage::StrokePoints { offset: 0, pts, .. }] if pts.len() == 2
+        ));
+
+        engine.move_to(POINTER_ID, 0.3, 0.1, 0.5, 32.0);
+        let second = engine.flush();
+        assert!(matches!(
+            &second[..],
+            [PainterMessage::StrokePoints { offset: 2, pts, .. }] if pts.len() == 1
+        ));
+    }
+
+    #[test]
     fn flush_chunks_large_batches() {
         let mut engine = CanvasEngine::new();
         engine.begin(POINTER_ID, brush(), 0.0, 0.0, 0.5, 0.0);
         for i in 1..=600 {
             engine.move_to(POINTER_ID, i as f64 * 0.001, 0.0, 0.5, i as f64);
         }
-        assert_eq!(engine.flush().len(), 2);
+        let flushed = engine.flush();
+        assert_eq!(flushed.len(), 2);
+        assert!(matches!(
+            &flushed[0],
+            PainterMessage::StrokePoints { offset: 0, pts, .. }
+                if pts.len() == MAX_POINTS_PER_MESSAGE
+        ));
+        assert!(matches!(
+            &flushed[1],
+            PainterMessage::StrokePoints { offset, pts, .. }
+                if *offset == MAX_POINTS_PER_MESSAGE && pts.len() == 89
+        ));
     }
 
     #[test]
