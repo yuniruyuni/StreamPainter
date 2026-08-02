@@ -6,6 +6,7 @@
 - [webapp.md](webapp.md): OBS Browser Sourceの描画実装
 - [protocol.md](protocol.md): ローカルWebSocketプロトコル
 - [security.md](security.md): loopbackサービスの脅威モデルと防御
+- [code-signing.md](code-signing.md): Code signing policy、SignPath準備、署名検証手順
 - [obs-smoke-test.md](obs-smoke-test.md): 実OBSを使うWindows定期smoke test
 - [roadmap.md](roadmap.md): 現在の到達点と今後の候補
 

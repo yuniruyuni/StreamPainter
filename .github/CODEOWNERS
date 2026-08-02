@@ -1,0 +1,14 @@
+# Release trust boundary. Enforce these entries with a protected-main ruleset.
+/.github/CODEOWNERS @yuniruyuni
+/.github/workflows/ @yuniruyuni
+/scripts/verify-release-on-main.sh @yuniruyuni
+/scripts/windows/release-signing-lib.psm1 @yuniruyuni
+/scripts/windows/assert-signpath-configuration.ps1 @yuniruyuni
+/scripts/windows/test-release-signing.ps1 @yuniruyuni
+/bun.lock @yuniruyuni
+/package.json @yuniruyuni
+/client/package.json @yuniruyuni
+/painter/build.rs @yuniruyuni
+/painter/Cargo.toml @yuniruyuni
+/painter/Cargo.lock @yuniruyuni
+/docs/code-signing.md @yuniruyuni

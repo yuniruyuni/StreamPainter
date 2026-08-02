@@ -13,11 +13,15 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     timeout-minutes: 40
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      package-version: ${{ steps.package.outputs.version }}
+      release-asset: ${{ steps.package.outputs.asset }}
+      unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
 
     steps:
       - name: Checkout tagged source
@@ -31,6 +35,18 @@ jobs:
         env:
           RELEASE_COMMIT: ${{ github.sha }}
         run: bash scripts/verify-release-on-main.sh "$RELEASE_COMMIT" refs/remotes/origin/main
+
+      - name: Validate code-signing mode
+        shell: pwsh
+        env:
+          SIGNPATH_ENABLED: ${{ vars.SIGNPATH_ENABLED }}
+        run: |
+          Import-Module ./scripts/windows/release-signing-lib.psm1 -Force
+          $null = Assert-SignPathToggle -Value ([string] $env:SIGNPATH_ENABLED)
+
+      - name: Test release signing helpers
+        shell: pwsh
+        run: ./scripts/windows/test-release-signing.ps1
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -76,7 +92,8 @@ jobs:
         working-directory: painter
         run: cargo build --release --locked
 
-      - name: Verify version and package assets
+      - name: Verify version and stage unsigned executable
+        id: package
         shell: pwsh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -96,13 +113,81 @@ jobs:
             throw "Tag $env:RELEASE_TAG does not match Cargo version v$($package.version)"
           }
 
-          New-Item -ItemType Directory -Force dist | Out-Null
+          New-Item -ItemType Directory -Force unsigned | Out-Null
           $asset = "StreamPainter-$env:RELEASE_TAG-windows-x64.exe"
-          Copy-Item painter/target/release/stream-painter.exe "dist/$asset"
-          $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -Path "dist/$asset.sha256" -Value "$hash  $asset" -Encoding ascii
+          Copy-Item painter/target/release/stream-painter.exe "unsigned/$asset"
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "version=$($package.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Retain packaged assets
+      - name: Upload unsigned artifact for trusted signing
+        id: upload-unsigned
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stream-painter-unsigned-${{ github.ref_name }}
+          path: unsigned/${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sign:
+    if: ${{ vars.SIGNPATH_ENABLED == 'true' }}
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 75
+    environment: code-signing
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout tagged verification helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Validate SignPath configuration
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN_PRESENT: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          SIGNPATH_EXPECTED_SIGNER_SUBJECT: ${{ vars.SIGNPATH_EXPECTED_SIGNER_SUBJECT }}
+          SIGNPATH_EXPECTED_SIGNER_SHA256: ${{ vars.SIGNPATH_EXPECTED_SIGNER_SHA256 }}
+        run: ./scripts/windows/assert-signpath-configuration.ps1
+
+      - name: Submit trusted SignPath signing request
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ needs.build.outputs.unsigned-artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+          parameters: |
+            version: ${{ toJSON(needs.build.outputs.package-version) }}
+
+      - name: Verify signed executable and generate final checksum
+        shell: pwsh
+        env:
+          RELEASE_ASSET: ${{ needs.build.outputs.release-asset }}
+          SIGNPATH_EXPECTED_SIGNER_SUBJECT: ${{ vars.SIGNPATH_EXPECTED_SIGNER_SUBJECT }}
+          SIGNPATH_EXPECTED_SIGNER_SHA256: ${{ vars.SIGNPATH_EXPECTED_SIGNER_SHA256 }}
+        run: |
+          Import-Module ./scripts/windows/release-signing-lib.psm1 -Force
+          Complete-SignedReleaseAsset `
+            -SignedPath "signed/$env:RELEASE_ASSET" `
+            -OutputDirectory dist `
+            -AssetName $env:RELEASE_ASSET `
+            -ExpectedSignerSubject $env:SIGNPATH_EXPECTED_SIGNER_SUBJECT `
+            -ExpectedSignerSha256 $env:SIGNPATH_EXPECTED_SIGNER_SHA256
+
+      - name: Retain signed release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: stream-painter-release-${{ github.ref_name }}
@@ -110,17 +195,103 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  unsigned:
+    if: ${{ vars.SIGNPATH_ENABLED != 'true' }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout tagged release helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download unsigned executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stream-painter-unsigned-${{ github.ref_name }}
+          path: unsigned
+
+      - name: Generate current unsigned release assets
+        shell: pwsh
+        env:
+          RELEASE_ASSET: ${{ needs.build.outputs.release-asset }}
+        run: |
+          Import-Module ./scripts/windows/release-signing-lib.psm1 -Force
+          Complete-UnsignedReleaseAsset `
+            -UnsignedPath "unsigned/$env:RELEASE_ASSET" `
+            -OutputDirectory dist `
+            -AssetName $env:RELEASE_ASSET
+
+      - name: Retain unsigned release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: stream-painter-release-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: >-
+      ${{
+        always() &&
+        needs.build.result == 'success' &&
+        (
+          (vars.SIGNPATH_ENABLED == 'true' && needs.sign.result == 'success' && needs.unsigned.result == 'skipped') ||
+          (vars.SIGNPATH_ENABLED != 'true' && needs.sign.result == 'skipped' && needs.unsigned.result == 'success')
+        )
+      }}
+    needs: [build, sign, unsigned]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Checkout tagged release helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Download final release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: stream-painter-release-${{ github.ref_name }}
+          path: dist
+
+      - name: Verify final release asset set
+        shell: pwsh
+        env:
+          RELEASE_ASSET: ${{ needs.build.outputs.release-asset }}
+        run: |
+          Import-Module ./scripts/windows/release-signing-lib.psm1 -Force
+          Assert-ReleaseAssetBundle -Directory dist -AssetName $env:RELEASE_ASSET
+
       - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ASSET: ${{ needs.build.outputs.release-asset }}
           RELEASE_TAG: ${{ github.ref_name }}
+          SIGNPATH_ENABLED: ${{ vars.SIGNPATH_ENABLED }}
         run: |
-          $asset = "StreamPainter-$env:RELEASE_TAG-windows-x64.exe"
+          $signingNote = if ($env:SIGNPATH_ENABLED -ceq "true") {
+            "Free code signing provided by SignPath.io, certificate by SignPath Foundation. " +
+              "See the Code signing policy: https://github.com/yuniruyuni/StreamPainter/blob/$env:RELEASE_TAG/docs/code-signing.md"
+          } else {
+            "The Windows executable in this release is not code signed. " +
+              "See the Code signing policy: https://github.com/yuniruyuni/StreamPainter/blob/$env:RELEASE_TAG/docs/code-signing.md"
+          }
           gh release create $env:RELEASE_TAG `
-            "dist/$asset#StreamPainter for Windows x64" `
-            "dist/$asset.sha256#SHA-256 checksum" `
+            "dist/$env:RELEASE_ASSET#StreamPainter for Windows x64" `
+            "dist/$env:RELEASE_ASSET.sha256#SHA-256 checksum" `
             --verify-tag `
             --generate-notes `
+            --notes $signingNote `
             --fail-on-no-commits `
             --title "StreamPainter $env:RELEASE_TAG"

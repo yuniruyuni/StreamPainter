@@ -59,8 +59,9 @@ Git管理せず、続くrelease buildが両方をexeへ埋め込みます。配�
 `painter/target/release/stream-painter.exe` です。
 
 公式Releaseではバージョン付きexeとSHA-256チェックサムを配布します。リリース手順は
-[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。現在の配布バイナリはコード署名して
-いません。
+[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。現在はSignPath Foundationの承認・設定前の
+ため配布バイナリはコード署名していません。適格性、脅威モデル、署名有効化条件、利用者による
+確認方法は[Code signing policy](docs/code-signing.md)に記録しています。
 
 詳しい設計と設定は [docs/README.md](docs/README.md) を参照してください。
 開発への参加方法は [CONTRIBUTING.md](CONTRIBUTING.md) にまとめています。

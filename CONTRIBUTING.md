@@ -28,6 +28,7 @@ cargo test --locked
 Windows固有コードは、Windows上で次も実行してください。
 
 ```powershell
+./scripts/windows/test-release-signing.ps1
 cd painter
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --release --locked
@@ -52,8 +53,13 @@ cargo build --release --locked
 Release workflowは完全なGit履歴を取得し、tagが指すcommitがorigin/mainに含まれることをbuild前に
 検証します。含まれない場合、タグとCargoのバージョンが一致しない場合、または検証・asset
 uploadのいずれかが失敗した場合はReleaseを公開しません。公開後の同じタグ・assetの上書きは
-行わず、新しい修正版としてバージョンを上げてください。Windowsコード署名は現在のフローには
-含まれません。
+行わず、新しい修正版としてバージョンを上げてください。
+
+Windowsコード署名は[Code signing policy](docs/code-signing.md)の外部承認・保護設定が完了するまで
+無効です。`SIGNPATH_ENABLED`が未設定または`false`なら現行のunsigned Releaseを維持します。
+承認後に`true`へ切り替えた場合、SignPath request、manual approval、Authenticodeのpublisher/
+certificate/timestamp/chain検証がすべて成功した後にSHA-256を生成します。失敗時にunsigned assetを
+公開しません。SignPath API tokenや証明書秘密鍵をrepositoryへ追加しないでください。
 
 ## ライセンス
 

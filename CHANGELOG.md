@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- SignPath Foundation承認後にだけ有効化するfail-closedなWindowsコード署名scaffoldと、
+  Cargo versionから生成するWindows VERSIONINFO
+
+### Changed
+
+- Windows Release workflowをbuild、署名またはunsigned確定、publishへ分離。外部承認前は
+  `SIGNPATH_ENABLED`を設定せず、従来どおりunsigned配布を維持
+
 ## [0.6.0] - 2026-08-03
 
 ### Added

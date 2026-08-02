@@ -65,6 +65,7 @@ features = [
 # (ターゲット判定は build.rs 内の CARGO_CFG_WINDOWS で行う)
 [build-dependencies]
 embed-manifest = "1.4"
+winresource = { version = "0.1.31", default-features = false }
 
 [profile.release]
 lto = true
