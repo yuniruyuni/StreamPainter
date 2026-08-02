@@ -21,9 +21,11 @@ release buildには `client/static/` のHTML/CSS/JavaScriptと、lockfileから�
 
 ## 設定
 
-タスクトレイアイコンの「設定...」から編集します。保存した設定はアプリの再起動後に反映
-されます。OBS Browser SourceのURLは設定画面またはタスクトレイから1操作でコピーでき、
-ローカルサーバーの到達状態とBrowser Source WebSocketの接続状態も別々に表示されます。
+タスクトレイアイコンの「設定...」から編集します。この画面で保存したグローバルホットキーは
+実行中のアプリへすぐに反映され、その他の設定は再起動後に反映されます。別processの
+`--settings`で保存した場合はホットキーも再起動後に反映されます。OBS Browser SourceのURLは
+設定画面またはタスクトレイから1操作でコピーでき、ローカルサーバーの到達状態とBrowser Source
+WebSocketの接続状態も別々に表示されます。
 
 ```text
 http://127.0.0.1:16873/overlay

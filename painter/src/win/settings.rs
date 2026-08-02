@@ -1,5 +1,5 @@
 //! タスクトレイから開くネイティブ設定画面。
-//! 保存内容は config.toml に反映し、実行中の描画状態は変更しない。
+//! 保存内容は config.toml に反映し、hotkeyだけは実行中の登録へtransactionalに反映する。
 
 #![allow(clippy::too_many_arguments)]
 
@@ -25,7 +25,9 @@ use windows::Win32::UI::Controls::Dialogs::{
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDesktopWindow, GetDlgItem,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
@@ -36,16 +38,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ES_AUTOHSCROLL, ES_NUMBER, ES_PASSWORD, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW,
     LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT,
     LB_SETCURSEL, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, SW_SHOW, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_KEYDOWN, WM_KEYUP, WM_NCDESTROY, WM_SETFONT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
+    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
-use crate::config::{self, Config, StampConfig, MAX_STAMPS};
+use crate::config::{
+    self, Config, HotkeyConfig, StampConfig, HOTKEY_MOD_ALT, HOTKEY_MOD_CTRL, HOTKEY_MOD_SHIFT,
+    HOTKEY_MOD_WIN, MAX_STAMPS,
+};
 use crate::net::local_server::{
     LocalServerDiagnostics, LocalServerDiagnosticsSnapshot, LocalServerDiagnosticsSubscription,
     LocalServerReachability,
 };
+use crate::win::hotkey::{self, ChangeCommand, ProbeRegistration};
 use crate::win::monitor::{self, Monitor};
 
 const CLASS_NAME: PCWSTR = w!("stream-painter-settings");
@@ -74,17 +81,24 @@ const ID_STAMP_OPACITY: i32 = 118;
 const ID_COPY_OVERLAY_URL: i32 = 119;
 const ID_SERVER_STATUS: i32 = 120;
 const ID_BROWSER_STATUS: i32 = 121;
+const ID_HOTKEY_CAPTURE: i32 = 122;
+const ID_HOTKEY_CLEAR: i32 = 123;
+const ID_HOTKEY_DEFAULT: i32 = 124;
 
 const WM_DIAGNOSTICS_CHANGED: u32 = WM_APP + 1;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
 struct SettingsState {
+    /// Someなら起動中overlayへhotkey変更をtransactionalに反映する。
+    live_owner: Option<HWND>,
+    original_config: Config,
     monitors: Vec<Monitor>,
     font: Option<HFONT>,
     stamps: Vec<StampConfig>,
     selected_stamp: Option<usize>,
     new_stamp_files: Vec<PathBuf>,
+    hotkey: HotkeyConfig,
     saved: bool,
     diagnostics: Option<LocalServerDiagnostics>,
     _diagnostics_subscription: Option<LocalServerDiagnosticsSubscription>,
@@ -132,11 +146,90 @@ pub fn is_open() -> bool {
 /// モデルレス設定画面に Tab / Enter / Esc のダイアログ操作を提供する。
 pub fn handle_dialog_message(message: &MSG) -> bool {
     let raw = SETTINGS_HWND.load(Ordering::SeqCst);
-    raw != 0
-        && unsafe {
-            let hwnd = hwnd_from_raw(raw);
-            IsWindow(Some(hwnd)).as_bool() && IsDialogMessageW(hwnd, message).as_bool()
+    if raw == 0 {
+        return false;
+    }
+    unsafe {
+        let hwnd = hwnd_from_raw(raw);
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return false;
         }
+        if capture_hotkey_message(hwnd, message) {
+            return true;
+        }
+        IsDialogMessageW(hwnd, message).as_bool()
+    }
+}
+
+fn key_is_down(key: u32) -> bool {
+    (unsafe { GetKeyState(key as i32) }) < 0
+}
+
+unsafe fn capture_hotkey_message(settings_hwnd: HWND, message: &MSG) -> bool {
+    let Ok(capture) = control(settings_hwnd, ID_HOTKEY_CAPTURE) else {
+        return false;
+    };
+    if message.hwnd != capture
+        || !matches!(
+            message.message,
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+        )
+    {
+        return false;
+    }
+
+    let key = message.wParam.0 as u32;
+    let mut modifiers = 0_u32;
+    if key_is_down(VK_CONTROL.0.into()) {
+        modifiers |= HOTKEY_MOD_CTRL;
+    }
+    if key_is_down(VK_MENU.0.into()) {
+        modifiers |= HOTKEY_MOD_ALT;
+    }
+    if key_is_down(VK_SHIFT.0.into()) {
+        modifiers |= HOTKEY_MOD_SHIFT;
+    }
+    if key_is_down(VK_LWIN.0.into()) || key_is_down(VK_RWIN.0.into()) {
+        modifiers |= HOTKEY_MOD_WIN;
+    }
+
+    // Tab / Esc は修飾なしなら通常のdialog移動・キャンセルとして扱う。
+    if modifiers == 0 && (key == u32::from(VK_TAB.0) || key == u32::from(VK_ESCAPE.0)) {
+        return false;
+    }
+    if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) {
+        return true;
+    }
+    if [
+        u32::from(VK_CONTROL.0),
+        u32::from(VK_MENU.0),
+        u32::from(VK_SHIFT.0),
+        u32::from(VK_LWIN.0),
+        u32::from(VK_RWIN.0),
+    ]
+    .contains(&key)
+    {
+        return true;
+    }
+
+    let state_ptr = GetWindowLongPtrW(settings_hwnd, GWLP_USERDATA) as *mut SettingsState;
+    let Some(state) = state_ptr.as_mut() else {
+        return true;
+    };
+    match HotkeyConfig::from_virtual_key(key, modifiers) {
+        Ok(config) => {
+            state.hotkey = config;
+            let _ = update_hotkey_control(settings_hwnd, state);
+        }
+        Err(error) => {
+            let _ = set_control_text(
+                settings_hwnd,
+                ID_HOTKEY_CAPTURE,
+                &format!("使用できないキー: {error}"),
+            );
+        }
+    }
+    true
 }
 
 /// 通常起動できない場合にも `stream-painter.exe --settings` で設定だけを編集できる。
@@ -144,7 +237,7 @@ pub fn run_standalone() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    open(unsafe { GetDesktopWindow() }, None)?;
+    open_internal(unsafe { GetDesktopWindow() }, None, false)?;
 
     unsafe {
         let mut message = MSG::default();
@@ -168,6 +261,14 @@ pub fn run_standalone() -> Result<()> {
 
 /// 設定画面を開く。すでに開いている場合は既存画面を前面へ出す。
 pub fn open(owner: HWND, diagnostics: Option<LocalServerDiagnostics>) -> Result<()> {
+    open_internal(owner, diagnostics, true)
+}
+
+fn open_internal(
+    owner: HWND,
+    diagnostics: Option<LocalServerDiagnostics>,
+    live_hotkey: bool,
+) -> Result<()> {
     if is_open() {
         let hwnd = hwnd_from_raw(SETTINGS_HWND.load(Ordering::SeqCst));
         unsafe {
@@ -217,11 +318,14 @@ pub fn open(owner: HWND, diagnostics: Option<LocalServerDiagnostics>) -> Result<
         .context("設定ウィンドウを作成できません")?;
 
         let state = Box::new(SettingsState {
+            live_owner: live_hotkey.then_some(owner),
+            original_config: config.clone(),
             monitors,
             font: None,
             stamps: config.stamps.clone(),
             selected_stamp: None,
             new_stamp_files: Vec::new(),
+            hotkey: config.hotkey.clone(),
             saved: false,
             diagnostics,
             _diagnostics_subscription: None,
@@ -456,7 +560,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             hwnd,
             font,
             ID_OBS_CONTROL,
-            "F9でOBSプロジェクターを自動的に開く（obs-websocket）",
+            "ホットキーでOBSプロジェクターを自動的に開く（obs-websocket）",
             config.obs_control,
             label_x,
             s(218),
@@ -543,7 +647,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         create_label(
             hwnd,
             font,
-            "標準ブラシ色（#RRGGBB）",
+            "切替キー（欄を選びキー入力）",
             label_x,
             s(397),
             label_width,
@@ -552,19 +656,41 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         create_edit(
             hwnd,
             font,
-            ID_BRUSH_COLOR,
-            &config.brush.color,
+            ID_HOTKEY_CAPTURE,
+            &state.hotkey.display_name(),
             field_x,
             s(394),
-            s(160),
+            s(220),
             row_height,
-            ES_AUTOHSCROLL,
+            ES_READONLY,
+        )?;
+        create_button(
+            hwnd,
+            font,
+            ID_HOTKEY_CLEAR,
+            "解除",
+            s(440),
+            s(393),
+            s(85),
+            s(28),
+            false,
+        )?;
+        create_button(
+            hwnd,
+            font,
+            ID_HOTKEY_DEFAULT,
+            "既定(F9)",
+            s(535),
+            s(393),
+            s(105),
+            s(28),
+            false,
         )?;
 
         create_label(
             hwnd,
             font,
-            "標準ブラシ幅（正規化値）",
+            "標準ブラシ色（#RRGGBB）",
             label_x,
             s(431),
             label_width,
@@ -573,8 +699,8 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         create_edit(
             hwnd,
             font,
-            ID_BRUSH_WIDTH,
-            &config.brush.width_n.to_string(),
+            ID_BRUSH_COLOR,
+            &config.brush.color,
             field_x,
             s(428),
             s(160),
@@ -585,13 +711,34 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         create_label(
             hwnd,
             font,
+            "標準ブラシ幅（正規化値）",
+            label_x,
+            s(465),
+            label_width,
+            row_height,
+        )?;
+        create_edit(
+            hwnd,
+            font,
+            ID_BRUSH_WIDTH,
+            &config.brush.width_n.to_string(),
+            field_x,
+            s(462),
+            s(160),
+            row_height,
+            ES_AUTOHSCROLL,
+        )?;
+
+        create_label(
+            hwnd,
+            font,
             &format!("登録スタンプ（最大 {MAX_STAMPS} 個、PNGのみ）"),
             label_x,
-            s(468),
+            s(502),
             s(280),
             row_height,
         )?;
-        create_listbox(hwnd, font, ID_STAMP_LIST, label_x, s(494), s(285), s(132))?;
+        create_listbox(hwnd, font, ID_STAMP_LIST, label_x, s(528), s(285), s(98))?;
         create_button(
             hwnd,
             font,
@@ -615,14 +762,14 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             false,
         )?;
 
-        create_label(hwnd, font, "スタンプ名", s(330), s(494), s(130), row_height)?;
+        create_label(hwnd, font, "スタンプ名", s(330), s(528), s(130), row_height)?;
         create_edit(
             hwnd,
             font,
             ID_STAMP_NAME,
             "",
             s(330),
-            s(518),
+            s(552),
             s(310),
             row_height,
             ES_AUTOHSCROLL,
@@ -632,7 +779,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             font,
             "表示サイズ（キャンバス高の%）",
             s(330),
-            s(554),
+            s(582),
             s(220),
             row_height,
         )?;
@@ -642,7 +789,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_STAMP_SIZE,
             "",
             s(550),
-            s(551),
+            s(579),
             s(90),
             row_height,
             ES_AUTOHSCROLL | ES_NUMBER,
@@ -652,7 +799,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             font,
             "不透明度（%）",
             s(330),
-            s(590),
+            s(614),
             s(150),
             row_height,
         )?;
@@ -662,7 +809,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_STAMP_OPACITY,
             "",
             s(550),
-            s(587),
+            s(611),
             s(90),
             row_height,
             ES_AUTOHSCROLL | ES_NUMBER,
@@ -672,9 +819,9 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             font,
             "右クリックメニューの「スタンプ」から選び、クリック位置へ配置します。",
             s(330),
-            s(626),
+            s(642),
             s(310),
-            s(40),
+            s(30),
         )?;
         refresh_stamp_list(hwnd, state, (!state.stamps.is_empty()).then_some(0))?;
 
@@ -1046,6 +1193,10 @@ fn set_control_text(hwnd: HWND, id: i32, text: &str) -> Result<()> {
     Ok(())
 }
 
+fn update_hotkey_control(hwnd: HWND, state: &SettingsState) -> Result<()> {
+    set_control_text(hwnd, ID_HOTKEY_CAPTURE, &state.hotkey.display_name())
+}
+
 fn selected_stamp_index(hwnd: HWND) -> Result<Option<usize>> {
     let list = control(hwnd, ID_STAMP_LIST)?;
     let selected = unsafe { SendMessageW(list, LB_GETCURSEL, None, None) }.0;
@@ -1262,6 +1413,7 @@ fn read_config(hwnd: HWND, state: &mut SettingsState) -> Result<Config> {
         obs_websocket_password: control_text(hwnd, ID_OBS_PASSWORD)?,
         projector_view: projector_view.to_owned(),
         close_projector: checked(hwnd, ID_CLOSE_PROJECTOR)?,
+        hotkey: state.hotkey.clone(),
         brush: crate::config::BrushConfig {
             color: control_text(hwnd, ID_BRUSH_COLOR)?
                 .trim()
@@ -1355,6 +1507,121 @@ fn copy_overlay_url(hwnd: HWND) -> Result<()> {
     set_control_text(hwnd, ID_COPY_OVERLAY_URL, "コピー済み")
 }
 
+fn send_hotkey_change(owner: HWND, command: ChangeCommand) -> Result<()> {
+    hotkey::request_change(owner, command)
+}
+
+enum PreparedHotkeyMode {
+    Live(HWND),
+    Standalone(Option<ProbeRegistration>),
+}
+
+struct PreparedHotkeyChange {
+    mode: PreparedHotkeyMode,
+    finished: bool,
+}
+
+impl PreparedHotkeyChange {
+    fn prepare(
+        live_owner: Option<HWND>,
+        settings_hwnd: HWND,
+        previous: &HotkeyConfig,
+        config: &HotkeyConfig,
+    ) -> Result<Self> {
+        let mode = if let Some(owner) = live_owner {
+            send_hotkey_change(owner, ChangeCommand::Prepare(config.clone()))?;
+            PreparedHotkeyMode::Live(owner)
+        } else {
+            // `--settings`を通常版と同時に開いた場合、変更していないキーは通常版自身が
+            // 保持している。再登録を試すと自己競合するため、意味が変わる時だけprobeする。
+            let changed = previous.chord()? != config.chord()?;
+            PreparedHotkeyMode::Standalone(
+                changed
+                    .then(|| ProbeRegistration::acquire(settings_hwnd, config))
+                    .transpose()?,
+            )
+        };
+        Ok(Self {
+            mode,
+            finished: false,
+        })
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        if let PreparedHotkeyMode::Live(owner) = &self.mode {
+            send_hotkey_change(*owner, ChangeCommand::Commit)?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> Result<()> {
+        if let PreparedHotkeyMode::Live(owner) = &self.mode {
+            send_hotkey_change(*owner, ChangeCommand::Rollback)?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedHotkeyChange {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let PreparedHotkeyMode::Live(owner) = &self.mode {
+                let _ = send_hotkey_change(*owner, ChangeCommand::Rollback);
+            }
+        }
+        // Standalone probeはfieldのDropで必ず解除される。
+        if let PreparedHotkeyMode::Standalone(probe) = &self.mode {
+            let _ = probe;
+        }
+    }
+}
+
+fn save_with_hotkey_transaction(
+    hwnd: HWND,
+    state: &mut SettingsState,
+    config: &Config,
+) -> Result<()> {
+    let mut hotkey_change = PreparedHotkeyChange::prepare(
+        state.live_owner,
+        hwnd,
+        &state.original_config.hotkey,
+        &config.hotkey,
+    )?;
+    if let Err(save_error) = config::save(config) {
+        let hotkey_rollback = hotkey_change.rollback().err();
+        // 保護資格情報の更新失敗など、設定ファイルcommit後に失敗する経路もあるため、
+        // 読み込み時の内容へbest-effortで戻す。
+        let config_rollback = config::save(&state.original_config).err();
+        let mut detail = format!("設定を保存できませんでした: {save_error:#}");
+        if let Some(error) = hotkey_rollback {
+            detail.push_str(&format!(
+                "\nホットキー登録の復元にも失敗しました: {error:#}"
+            ));
+        }
+        if let Some(error) = config_rollback {
+            detail.push_str(&format!("\n設定ファイルの復元にも失敗しました: {error:#}"));
+        }
+        anyhow::bail!(detail);
+    }
+    if let Err(commit_error) = hotkey_change.commit() {
+        let hotkey_rollback = hotkey_change.rollback().err();
+        let config_rollback = config::save(&state.original_config).err();
+        let mut detail = format!("保存後のホットキー変更を確定できませんでした: {commit_error:#}");
+        if let Some(error) = hotkey_rollback {
+            detail.push_str(&format!(
+                "\nホットキー登録の復元にも失敗しました: {error:#}"
+            ));
+        }
+        if let Some(error) = config_rollback {
+            detail.push_str(&format!("\n設定ファイルの復元にも失敗しました: {error:#}"));
+        }
+        anyhow::bail!(detail);
+    }
+    Ok(())
+}
+
 fn show_error(hwnd: HWND, error: &anyhow::Error) {
     show_operation_error(hwnd, "設定を更新できません", error);
 }
@@ -1393,6 +1660,27 @@ unsafe extern "system" fn window_proc(
             if id == ID_COPY_OVERLAY_URL {
                 if let Err(error) = copy_overlay_url(hwnd) {
                     show_operation_error(hwnd, "URLをコピーできません", &error);
+                }
+                return LRESULT(0);
+            }
+            if id == ID_HOTKEY_CLEAR || id == ID_HOTKEY_DEFAULT {
+                let state_ptr =
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+                let result = unsafe {
+                    state_ptr
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("設定画面の状態がありません"))
+                        .and_then(|state| {
+                            state.hotkey = if id == ID_HOTKEY_CLEAR {
+                                HotkeyConfig::disabled()
+                            } else {
+                                HotkeyConfig::default()
+                            };
+                            update_hotkey_control(hwnd, state)
+                        })
+                };
+                if let Err(error) = result {
+                    show_error(hwnd, &error);
                 }
                 return LRESULT(0);
             }
@@ -1439,16 +1727,22 @@ unsafe extern "system" fn window_proc(
                         .ok_or_else(|| anyhow!("設定画面の状態がありません"))
                         .and_then(|state| {
                             let config = read_config(hwnd, state)?;
-                            config::save(&config)?;
+                            save_with_hotkey_transaction(hwnd, state, &config)?;
+                            let live_hotkey = state.live_owner.is_some();
                             state.saved = true;
-                            Ok(())
+                            Ok(live_hotkey)
                         })
                 };
                 match result {
-                    Ok(()) => unsafe {
+                    Ok(live_hotkey) => unsafe {
+                        let message = if live_hotkey {
+                            "設定を保存しました。\nホットキーはすぐに反映されます。その他の設定は再起動すると反映されます。"
+                        } else {
+                            "設定を保存しました。\n--settingsで変更したホットキーを含め、StreamPainterの再起動後に反映されます。"
+                        };
                         MessageBoxW(
                             Some(hwnd),
-                            w!("設定を保存しました。\nStreamPainter を再起動すると反映されます。"),
+                            &HSTRING::from(message),
                             w!("StreamPainter 設定"),
                             MB_OK | MB_ICONINFORMATION,
                         );

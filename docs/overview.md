@@ -20,7 +20,7 @@ Windows透明オーバーレイへ即時表示し、同じ状態をOBS Browser S
 1. Windowsログイン後または配信前に `stream-painter.exe` を起動する。
 2. アプリが `http://127.0.0.1:16873/overlay` を配信する。
 3. OBS Browser SourceがページとWebSocketを同じloopback originから読み込む。
-4. `F9` で描画モードへ入り、入力イベントをCanvasItemへ変換する。
+4. 設定したグローバルホットキー（既定`F9`）で描画モードへ入り、入力イベントをCanvasItemへ変換する。
 5. ローカルエコーとOBS overlayが同じイベント列を描画する。
 6. Browser Sourceが再接続した場合は、接続時snapshotで現在状態を復元する。
 

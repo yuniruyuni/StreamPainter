@@ -22,6 +22,13 @@ pub const MAX_STAMP_PIXELS: u64 = 4_194_304;
 /// 全スタンプをRGBAへ展開した場合に約64 MiBとなる上限。
 pub const MAX_TOTAL_STAMP_PIXELS: u64 = 16_777_216;
 
+/// `RegisterHotKey` と同じ bit 配置。Win32 以外でも設定を検証できるよう、
+/// windows crate の型は設定層へ持ち込まない。
+pub const HOTKEY_MOD_ALT: u32 = 0x0001;
+pub const HOTKEY_MOD_CTRL: u32 = 0x0002;
+pub const HOTKEY_MOD_SHIFT: u32 = 0x0004;
+pub const HOTKEY_MOD_WIN: u32 = 0x0008;
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// OBS Browser Source を配信する loopback HTTP サーバーのポート
@@ -37,7 +44,7 @@ pub struct Config {
     /// OBS 全画面プロジェクターの表示に追従してオーバーレイを自動で有効/無効化する
     #[serde(default = "default_true")]
     pub follow_projector: bool,
-    /// obs-websocket 経由で F9 時にプロジェクターを自動で開く
+    /// obs-websocket 経由で描画モード切替時にプロジェクターを自動で開く
     #[serde(default = "default_true")]
     pub obs_control: bool,
     #[serde(default = "default_obs_url")]
@@ -51,6 +58,10 @@ pub struct Config {
     /// 描画モード終了時に、自動で開いたプロジェクターを閉じる (WM_CLOSE)
     #[serde(default = "default_true")]
     pub close_projector: bool,
+    /// 描画モードを切り替えるグローバルホットキー。
+    /// 旧版の設定には field がないため、serde default で F9 を維持する。
+    #[serde(default)]
+    pub hotkey: HotkeyConfig,
     #[serde(default)]
     pub brush: BrushConfig,
     /// 管理ディレクトリ内の PNG スタンプ。外部パスや URL は保持しない。
@@ -72,10 +83,278 @@ impl fmt::Debug for Config {
             .field("obs_websocket_password", &"[REDACTED]")
             .field("projector_view", &self.projector_view)
             .field("close_projector", &self.close_projector)
+            .field("hotkey", &self.hotkey)
             .field("brush", &self.brush)
             .field("stamps", &self.stamps)
             .finish()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HotkeyModifier {
+    Ctrl,
+    Alt,
+    Shift,
+    Win,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyConfig {
+    /// false の場合はグローバルホットキーを登録せず、トレイ操作だけを使う。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub modifiers: Vec<HotkeyModifier>,
+    #[serde(default = "default_hotkey_key")]
+    pub key: String,
+}
+
+/// Win32 登録へ渡せる、検証・正規化済みのキー組み合わせ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HotkeyChord {
+    pub modifiers: u32,
+    pub virtual_key: u32,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            modifiers: Vec::new(),
+            key: default_hotkey_key(),
+        }
+    }
+}
+
+impl HotkeyConfig {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn from_virtual_key(virtual_key: u32, modifiers: u32) -> Result<Self> {
+        let key = hotkey_key_name(virtual_key)
+            .ok_or_else(|| anyhow!("このキーはグローバルホットキーに使用できません"))?;
+        let mut configured_modifiers = Vec::new();
+        for (mask, modifier) in [
+            (HOTKEY_MOD_CTRL, HotkeyModifier::Ctrl),
+            (HOTKEY_MOD_ALT, HotkeyModifier::Alt),
+            (HOTKEY_MOD_SHIFT, HotkeyModifier::Shift),
+            (HOTKEY_MOD_WIN, HotkeyModifier::Win),
+        ] {
+            if modifiers & mask != 0 {
+                configured_modifiers.push(modifier);
+            }
+        }
+        let config = Self {
+            enabled: true,
+            modifiers: configured_modifiers,
+            key,
+        };
+        config.chord()?;
+        Ok(config)
+    }
+
+    pub fn chord(&self) -> Result<Option<HotkeyChord>> {
+        if self.key.len() > 16 || self.key.chars().any(char::is_control) {
+            anyhow::bail!("ホットキーのキー名が不正です");
+        }
+        let virtual_key = parse_hotkey_key(&self.key)
+            .ok_or_else(|| anyhow!("ホットキーのキー名が不正です: {}", self.key))?;
+        // F12 は Windows のデバッガー用に常時予約されている。
+        if virtual_key == 0x7b {
+            anyhow::bail!("F12 は Windows が予約しているため使用できません");
+        }
+
+        let mut modifiers = 0_u32;
+        for modifier in &self.modifiers {
+            let mask = match modifier {
+                HotkeyModifier::Ctrl => HOTKEY_MOD_CTRL,
+                HotkeyModifier::Alt => HOTKEY_MOD_ALT,
+                HotkeyModifier::Shift => HOTKEY_MOD_SHIFT,
+                HotkeyModifier::Win => HOTKEY_MOD_WIN,
+            };
+            if modifiers & mask != 0 {
+                anyhow::bail!("ホットキーの修飾キーが重複しています");
+            }
+            modifiers |= mask;
+        }
+
+        // 既定F9との互換性は保ちつつ、Enter等の通常入力を全体で奪わないようにする。
+        if modifiers == 0 && !(0x70..=0x87).contains(&virtual_key) {
+            anyhow::bail!("ファンクションキー以外には Ctrl / Alt / Shift / Win を追加してください");
+        }
+        Ok(self.enabled.then_some(HotkeyChord {
+            modifiers,
+            virtual_key,
+        }))
+    }
+
+    pub fn display_name(&self) -> String {
+        if !self.enabled {
+            return "なし（トレイから切替）".to_owned();
+        }
+        let mut parts = Vec::new();
+        for modifier in [
+            HotkeyModifier::Ctrl,
+            HotkeyModifier::Alt,
+            HotkeyModifier::Shift,
+            HotkeyModifier::Win,
+        ] {
+            if self.modifiers.contains(&modifier) {
+                parts.push(match modifier {
+                    HotkeyModifier::Ctrl => "Ctrl".to_owned(),
+                    HotkeyModifier::Alt => "Alt".to_owned(),
+                    HotkeyModifier::Shift => "Shift".to_owned(),
+                    HotkeyModifier::Win => "Win".to_owned(),
+                });
+            }
+        }
+        parts.push(canonical_hotkey_key(&self.key).unwrap_or_else(|| self.key.clone()));
+        parts.join("+")
+    }
+}
+
+fn default_hotkey_key() -> String {
+    "F9".to_owned()
+}
+
+fn canonical_hotkey_key(key: &str) -> Option<String> {
+    hotkey_key_name(parse_hotkey_key(key)?)
+}
+
+fn parse_hotkey_key(key: &str) -> Option<u32> {
+    let key = key.trim().to_ascii_uppercase();
+    if key.len() == 1 {
+        let byte = key.as_bytes()[0];
+        if byte.is_ascii_alphanumeric() {
+            return Some(u32::from(byte));
+        }
+    }
+    if let Some(number) = key
+        .strip_prefix('F')
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        if (1..=24).contains(&number) {
+            return Some(0x70 + number - 1);
+        }
+    }
+    Some(match key.as_str() {
+        "BACKSPACE" => 0x08,
+        "TAB" => 0x09,
+        "ENTER" => 0x0d,
+        "PAUSE" => 0x13,
+        "CAPSLOCK" => 0x14,
+        "ESCAPE" => 0x1b,
+        "SPACE" => 0x20,
+        "PAGEUP" => 0x21,
+        "PAGEDOWN" => 0x22,
+        "END" => 0x23,
+        "HOME" => 0x24,
+        "LEFT" => 0x25,
+        "UP" => 0x26,
+        "RIGHT" => 0x27,
+        "DOWN" => 0x28,
+        "PRINTSCREEN" => 0x2c,
+        "INSERT" => 0x2d,
+        "DELETE" => 0x2e,
+        "NUMPAD0" => 0x60,
+        "NUMPAD1" => 0x61,
+        "NUMPAD2" => 0x62,
+        "NUMPAD3" => 0x63,
+        "NUMPAD4" => 0x64,
+        "NUMPAD5" => 0x65,
+        "NUMPAD6" => 0x66,
+        "NUMPAD7" => 0x67,
+        "NUMPAD8" => 0x68,
+        "NUMPAD9" => 0x69,
+        "MULTIPLY" => 0x6a,
+        "ADD" => 0x6b,
+        "SUBTRACT" => 0x6d,
+        "DECIMAL" => 0x6e,
+        "DIVIDE" => 0x6f,
+        "NUMLOCK" => 0x90,
+        "SCROLLLOCK" => 0x91,
+        "SEMICOLON" => 0xba,
+        "EQUALS" => 0xbb,
+        "COMMA" => 0xbc,
+        "MINUS" => 0xbd,
+        "PERIOD" => 0xbe,
+        "SLASH" => 0xbf,
+        "BACKTICK" => 0xc0,
+        "LEFTBRACKET" => 0xdb,
+        "BACKSLASH" => 0xdc,
+        "RIGHTBRACKET" => 0xdd,
+        "QUOTE" => 0xde,
+        _ => return None,
+    })
+}
+
+fn hotkey_key_name(virtual_key: u32) -> Option<String> {
+    if (u32::from(b'A')..=u32::from(b'Z')).contains(&virtual_key)
+        || (u32::from(b'0')..=u32::from(b'9')).contains(&virtual_key)
+    {
+        return char::from_u32(virtual_key).map(|value| value.to_string());
+    }
+    if (0x70..=0x87).contains(&virtual_key) {
+        return Some(format!("F{}", virtual_key - 0x70 + 1));
+    }
+    Some(
+        match virtual_key {
+            0x08 => "Backspace",
+            0x09 => "Tab",
+            0x0d => "Enter",
+            0x13 => "Pause",
+            0x14 => "CapsLock",
+            0x1b => "Escape",
+            0x20 => "Space",
+            0x21 => "PageUp",
+            0x22 => "PageDown",
+            0x23 => "End",
+            0x24 => "Home",
+            0x25 => "Left",
+            0x26 => "Up",
+            0x27 => "Right",
+            0x28 => "Down",
+            0x2c => "PrintScreen",
+            0x2d => "Insert",
+            0x2e => "Delete",
+            0x60 => "Numpad0",
+            0x61 => "Numpad1",
+            0x62 => "Numpad2",
+            0x63 => "Numpad3",
+            0x64 => "Numpad4",
+            0x65 => "Numpad5",
+            0x66 => "Numpad6",
+            0x67 => "Numpad7",
+            0x68 => "Numpad8",
+            0x69 => "Numpad9",
+            0x6a => "Multiply",
+            0x6b => "Add",
+            0x6d => "Subtract",
+            0x6e => "Decimal",
+            0x6f => "Divide",
+            0x90 => "NumLock",
+            0x91 => "ScrollLock",
+            0xba => "Semicolon",
+            0xbb => "Equals",
+            0xbc => "Comma",
+            0xbd => "Minus",
+            0xbe => "Period",
+            0xbf => "Slash",
+            0xc0 => "Backtick",
+            0xdb => "LeftBracket",
+            0xdc => "Backslash",
+            0xdd => "RightBracket",
+            0xde => "Quote",
+            _ => return None,
+        }
+        .to_owned(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +392,7 @@ impl Default for Config {
             obs_websocket_password: String::new(),
             projector_view: default_projector_view(),
             close_projector: true,
+            hotkey: HotkeyConfig::default(),
             brush: BrushConfig::default(),
             stamps: Vec::new(),
         }
@@ -175,16 +455,23 @@ local_echo = true
 follow_projector = true
 
 # obs-websocket 連携 (OBS 28+: ツール → WebSocket サーバー設定 で有効化)。
-# F9 でプロジェクターが未表示なら自動で開く
+# 描画モード切替時にプロジェクターが未表示なら自動で開く
 obs_control = true
 obs_websocket_url = "ws://localhost:4455"
 # パスワードはWindows資格情報マネージャーへユーザー単位で保存します。
 # タスクトレイの「設定...」から入力してください。
 # "program" = 視聴者に見えている映像 / "preview" = スタジオモードの編集側
 projector_view = "program"
-# 描画モード終了時に、F9 で自動で開いたプロジェクターを閉じる
+# 描画モード終了時に、StreamPainterが自動で開いたプロジェクターを閉じる
 # (手動で開いたプロジェクターは閉じない)
 close_projector = true
+
+# 描画モード切替ホットキー。設定画面でキー入力をcaptureできます。
+# enabled = false にすると解除され、タスクトレイからの切替だけになります。
+[hotkey]
+enabled = true
+modifiers = []
+key = "F9"
 
 [brush]
 color = "#ff4d6d"
@@ -976,6 +1263,7 @@ impl Config {
         if !matches!(self.projector_view.as_str(), "program" | "preview") {
             anyhow::bail!("プロジェクター表示は program または preview を指定してください");
         }
+        self.hotkey.chord()?;
 
         let color = self.brush.color.as_bytes();
         if color.len() != 7 || color[0] != b'#' || !color[1..].iter().all(u8::is_ascii_hexdigit) {
@@ -1348,6 +1636,80 @@ mod tests {
         assert!(config.local_echo);
         assert_eq!(config.brush.width_n, 0.005);
         assert!(config.stamps.is_empty());
+        assert_eq!(config.hotkey, HotkeyConfig::default());
+        assert_eq!(config.hotkey.display_name(), "F9");
+    }
+
+    #[test]
+    fn legacy_config_without_hotkey_migrates_to_f9() {
+        let config: Config = toml::from_str(
+            r#"
+local_server_port = 16873
+canvas_aspect = "16:9"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.hotkey, HotkeyConfig::default());
+        assert_eq!(
+            config.hotkey.chord().unwrap(),
+            Some(HotkeyChord {
+                modifiers: 0,
+                virtual_key: 0x78,
+            })
+        );
+    }
+
+    #[test]
+    fn hotkey_round_trip_supports_modifiers_and_disabled_state() {
+        let configured = HotkeyConfig {
+            enabled: true,
+            modifiers: vec![HotkeyModifier::Ctrl, HotkeyModifier::Shift],
+            key: "k".to_owned(),
+        };
+        assert_eq!(configured.display_name(), "Ctrl+Shift+K");
+        assert_eq!(
+            configured.chord().unwrap(),
+            Some(HotkeyChord {
+                modifiers: HOTKEY_MOD_CTRL | HOTKEY_MOD_SHIFT,
+                virtual_key: u32::from(b'K'),
+            })
+        );
+        let text = toml::to_string(&configured).unwrap();
+        assert_eq!(toml::from_str::<HotkeyConfig>(&text).unwrap(), configured);
+        assert_eq!(HotkeyConfig::disabled().chord().unwrap(), None);
+    }
+
+    #[test]
+    fn hotkey_validation_rejects_unsafe_or_ambiguous_values() {
+        let letter_without_modifier = HotkeyConfig {
+            key: "A".to_owned(),
+            ..HotkeyConfig::default()
+        };
+        assert!(letter_without_modifier.chord().is_err());
+        let enter_without_modifier = HotkeyConfig {
+            key: "Enter".to_owned(),
+            ..HotkeyConfig::default()
+        };
+        assert!(enter_without_modifier.chord().is_err());
+
+        let duplicate_modifier = HotkeyConfig {
+            modifiers: vec![HotkeyModifier::Ctrl, HotkeyModifier::Ctrl],
+            ..HotkeyConfig::default()
+        };
+        assert!(duplicate_modifier.chord().is_err());
+
+        let reserved = HotkeyConfig {
+            key: "F12".to_owned(),
+            ..HotkeyConfig::default()
+        };
+        assert!(reserved.chord().is_err());
+
+        let unknown = HotkeyConfig {
+            modifiers: vec![HotkeyModifier::Ctrl],
+            key: "LaunchDragon".to_owned(),
+            ..HotkeyConfig::default()
+        };
+        assert!(unknown.chord().is_err());
     }
 
     #[test]
@@ -1796,6 +2158,16 @@ local_server_port = 18080
 
         let config = Config {
             obs_websocket_password: "x".repeat(MAX_OBS_PASSWORD_BYTES + 1),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = Config {
+            hotkey: HotkeyConfig {
+                modifiers: vec![HotkeyModifier::Ctrl],
+                key: "unknown".to_owned(),
+                ..HotkeyConfig::default()
+            },
             ..Config::default()
         };
         assert!(config.validate().is_err());

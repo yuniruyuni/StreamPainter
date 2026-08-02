@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
@@ -41,7 +42,19 @@ const MENU_EXIT: usize = 6;
 const MENU_SERVER_STATUS: usize = 100;
 const MENU_BROWSER_STATUS: usize = 101;
 
-pub fn add(hwnd: HWND, hotkey_registered: bool) -> Result<()> {
+fn set_tip(data: &mut NOTIFYICONDATAW, hotkey: Option<&str>) {
+    let tip_text = match hotkey {
+        Some(hotkey) => format!("StreamPainter ({hotkey}: 描画モード切替)"),
+        None => "StreamPainter (描画モードはトレイから切替)".to_owned(),
+    };
+    let tip: Vec<u16> = tip_text.encode_utf16().chain(std::iter::once(0)).collect();
+    let copy_len = tip.len().min(data.szTip.len());
+    data.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
+    // 上限で切れた場合も必ず終端する。
+    data.szTip[data.szTip.len() - 1] = 0;
+}
+
+pub fn add(hwnd: HWND, hotkey: Option<&str>) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -51,16 +64,25 @@ pub fn add(hwnd: HWND, hotkey_registered: bool) -> Result<()> {
         hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).context("LoadIconW")? },
         ..Default::default()
     };
-    let tip_text = if hotkey_registered {
-        "StreamPainter (F9: 描画モード切替)"
-    } else {
-        "StreamPainter (描画モードはトレイから切替)"
-    };
-    let tip: Vec<u16> = tip_text.encode_utf16().chain(std::iter::once(0)).collect();
-    data.szTip[..tip.len().min(128)].copy_from_slice(&tip[..tip.len().min(128)]);
+    set_tip(&mut data, hotkey);
 
     if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
         anyhow::bail!("Shell_NotifyIconW(NIM_ADD) failed");
+    }
+    Ok(())
+}
+
+pub fn update_hotkey(hwnd: HWND, hotkey: Option<&str>) -> Result<()> {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ID,
+        uFlags: NIF_TIP,
+        ..Default::default()
+    };
+    set_tip(&mut data, hotkey);
+    if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        anyhow::bail!("Shell_NotifyIconW(NIM_MODIFY) failed");
     }
     Ok(())
 }
@@ -104,7 +126,7 @@ fn diagnostics_labels(diagnostics: LocalServerDiagnosticsSnapshot) -> (String, S
 pub fn on_message(
     hwnd: HWND,
     lparam_low: u32,
-    hotkey_registered: bool,
+    hotkey: Option<&str>,
     diagnostics: LocalServerDiagnosticsSnapshot,
 ) -> Option<TrayCommand> {
     if lparam_low != WM_RBUTTONUP && lparam_low != WM_LBUTTONUP && lparam_low != WM_CONTEXTMENU {
@@ -114,12 +136,12 @@ pub fn on_message(
     let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();
     unsafe {
         let menu = CreatePopupMenu().ok()?;
-        let toggle_label = if hotkey_registered {
-            w!("描画モード切替 (F9)")
+        let toggle_label = if let Some(hotkey) = hotkey {
+            HSTRING::from(format!("描画モード切替 ({hotkey})"))
         } else {
-            w!("描画モード切替")
+            HSTRING::from("描画モード切替")
         };
-        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, &toggle_label);
         let _ = AppendMenuW(
             menu,
             MF_STRING,

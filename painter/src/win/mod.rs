@@ -1,5 +1,6 @@
 pub mod app;
 pub mod clipboard;
+pub mod hotkey;
 pub mod logging;
 pub mod menu;
 pub mod monitor;
@@ -17,7 +18,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
-    MB_YESNO, SW_SHOWNORMAL,
+    MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO, SW_SHOWNORMAL,
 };
 
 pub fn message_box(text: &str) {
@@ -40,6 +41,19 @@ pub fn message_box_info(text: &str) {
             &HSTRING::from(text),
             &HSTRING::from("StreamPainter"),
             MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+/// Topmost overlayの起動直後でも、競合通知をその前面へ確実に出す。
+pub fn message_box_warning(parent: HWND, text: &str) {
+    let _foreground_ui = projector::ForegroundUiGuard::new();
+    unsafe {
+        MessageBoxW(
+            Some(parent),
+            &HSTRING::from(text),
+            &HSTRING::from("StreamPainter"),
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
         );
     }
 }

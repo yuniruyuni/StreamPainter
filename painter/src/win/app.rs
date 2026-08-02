@@ -1,7 +1,8 @@
 //! オーバーレイウィンドウ・入力・アプリ統合 (docs/painter.md)。
 //!
 //! - WS_EX_NOREDIRECTIONBITMAP + WS_EX_TOPMOST + WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW
-//! - F9 (グローバルホットキー) でパススルー ⇔ 描画モードを切替 (WS_EX_TRANSPARENT)
+//! - 設定可能なグローバルホットキーでパススルー ⇔ 描画モードを切替
+//!   (既定F9、WS_EX_TRANSPARENT)
 //! - WM_POINTER* で入力を受け、CanvasEngine → local web hub + ローカルエコー描画
 //! - 16ms タイマで描画差分を約60fpsにバッチ送信
 
@@ -12,9 +13,6 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_F9,
 };
 use windows::Win32::UI::Input::Pointer::EnableMouseInPointer;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -36,6 +34,7 @@ use crate::engine::content_rect::{content_rect, parse_aspect, Rect};
 use crate::net::local_server::{self, LocalServerHandle};
 use crate::net::obs::{self, ObsSettings, ProjectorView};
 use crate::protocol::{Brush, LineStyle, ShapeKind, StampItem, Tool};
+use crate::win::hotkey::{self, ChangeCommand, HotkeyManager};
 use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
 use crate::win::projector;
@@ -44,7 +43,6 @@ use crate::win::render::Renderer;
 use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
 
-const HOTKEY_TOGGLE: i32 = 1;
 /// 現在はポインタ種別を区別しないため、マウス相当の一定入力として扱う。
 const POINTER_PRESSURE: f64 = 1.0;
 /// 動画フレームに合わせた約60fpsのバッチ送信。
@@ -92,18 +90,18 @@ struct App {
     local_echo: bool,
     /// OBS プロジェクター表示への追従 (config.follow_projector)
     follow_projector: bool,
-    /// プロジェクター検知結果。false の間はオーバーレイを隠し F9 も無効
+    /// プロジェクター検知結果。false の間はオーバーレイを隠し切替も無効
     projector_visible: bool,
     /// obs-websocket 設定 (None = 連携無効)
     obs: Option<ObsSettings>,
     /// 描画モード終了時にプロジェクターを閉じるか
     close_projector: bool,
-    /// F9 → プロジェクターを開いて描画モードに入る、の完了待ち (開始時刻)
+    /// hotkey → プロジェクターを開いて描画モードに入る、の完了待ち (開始時刻)
     pending_draw: Option<std::time::Instant>,
-    /// F9を確保できない場合もトレイ操作だけで継続する。
-    hotkey_registered: bool,
+    /// 登録競合時もトレイ操作だけで継続し、設定変更はtransactionalに反映する。
+    hotkey: HotkeyManager,
     /// 現在のプロジェクターを自分が obs-websocket で開いたか
-    /// (手動で開かれたものは F9 オフでも閉じない)
+    /// (手動で開かれたものは描画モード終了時にも閉じない)
     projector_opened_by_us: bool,
     /// OBSプロジェクターを前面化し、その直上にオーバーレイを保つ。
     projector_z_order: projector::ZOrderGuard,
@@ -192,6 +190,9 @@ pub fn run() -> Result<()> {
         &config.stamps,
     )?;
 
+    let mut hotkey = HotkeyManager::new(hwnd);
+    let startup_hotkey_error = hotkey.register_initial(&config.hotkey).err();
+
     let mut app = Box::new(App {
         engine,
         web,
@@ -214,7 +215,7 @@ pub fn run() -> Result<()> {
         obs,
         close_projector: config.close_projector,
         pending_draw: None,
-        hotkey_registered: false,
+        hotkey,
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
         radial_menu: None,
@@ -222,7 +223,7 @@ pub fn run() -> Result<()> {
     });
 
     // 起動時に透明フレームを 1 回描き、D2D シェーダコンパイル・swapchain 初回
-    // Present などの一時コストをここで消化する (初回 F9 の体感遅延対策)
+    // Present などの一時コストをここで消化する (初回切替の体感遅延対策)
     {
         let t = std::time::Instant::now();
         let renderer = app.renderer.as_mut().expect("renderer was initialized");
@@ -231,21 +232,10 @@ pub fn run() -> Result<()> {
         info!("renderer warmup: {:?}", t.elapsed());
     }
 
-    unsafe {
+    let active_hotkey_name = unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
         let app_ref = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App);
-        app_ref.hotkey_registered =
-            match RegisterHotKey(Some(hwnd), HOTKEY_TOGGLE, MOD_NOREPEAT, VK_F9.0 as u32) {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(
-                        "F9 global hotkey is unavailable ({error}); \
-                         use the task tray to toggle draw mode"
-                    );
-                    false
-                }
-            };
-        tray::add(hwnd, app_ref.hotkey_registered)?;
+        tray::add(hwnd, app_ref.hotkey.active_display_name())?;
         // 初期状態はパススルー
         set_transparent(hwnd, true);
         SetTimer(Some(hwnd), PROJECTOR_TIMER_ID, PROJECTOR_INTERVAL_MS, None);
@@ -256,8 +246,22 @@ pub fn run() -> Result<()> {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         app_ref.poll_projector(hwnd);
+        app_ref
+            .hotkey
+            .active_display_name()
+            .unwrap_or("tray only")
+            .to_owned()
+    };
+    if let Some(error) = startup_hotkey_error {
+        warn!("global hotkey is unavailable; using tray fallback: {error:#}");
+        crate::win::message_box_warning(
+            hwnd,
+            &format!(
+                "描画モード切替ホットキーを登録できませんでした。\n\n{error:#}\n\nStreamPainterは継続して動作します。タスクトレイの「描画モード切替」を使用するか、設定から別のキーを指定してください。"
+            ),
+        );
     }
-    info!("ready — 描画モードはF9またはタスクトレイから切り替えられます");
+    info!("ready — draw mode hotkey: {active_hotkey_name}");
 
     unsafe {
         let mut msg = MSG::default();
@@ -789,7 +793,20 @@ impl App {
         self.poll_projector(hwnd);
     }
 
-    /// F9 / トレイからの切替。プロジェクター未表示なら obs-websocket で開く
+    fn handle_hotkey_change(&mut self, hwnd: HWND, request: &mut hotkey::ChangeRequest) {
+        request.handled = true;
+        let result = match &request.command {
+            ChangeCommand::Prepare(config) => self.hotkey.prepare(config),
+            ChangeCommand::Commit => self.hotkey.commit(),
+            ChangeCommand::Rollback => self.hotkey.rollback(),
+        };
+        request.error = result.err().map(|error| format!("{error:#}"));
+        if let Err(error) = tray::update_hotkey(hwnd, self.hotkey.active_display_name()) {
+            warn!("failed to update tray hotkey label: {error:#}");
+        }
+    }
+
+    /// hotkey / トレイからの切替。プロジェクター未表示なら obs-websocket で開く
     fn toggle_mode(&mut self, hwnd: HWND) {
         if settings::is_open() {
             return;
@@ -1415,12 +1432,18 @@ unsafe extern "system" fn window_proc(
     }
 
     match msg {
-        WM_HOTKEY if wparam.0 as i32 == HOTKEY_TOGGLE => {
+        WM_HOTKEY if unsafe { &*app_ptr }.hotkey.handles_message(wparam.0 as i32) => {
             // popup menu の内部ループへ届いた hotkey は、メニューを閉じずに背後の
             // overlay 状態だけ変えることになるため無視する。
             if !projector::foreground_ui_active() {
                 unsafe { &mut *app_ptr }.toggle_mode(hwnd);
             }
+            LRESULT(0)
+        }
+        hotkey::WM_HOTKEY_CHANGE => {
+            hotkey::with_change_request(|request| {
+                unsafe { &mut *app_ptr }.handle_hotkey_change(hwnd, request);
+            });
             LRESULT(0)
         }
         // パススルー中は「処理済み」にせず DefWindowProc に流す (握りつぶすと
@@ -1550,7 +1573,7 @@ unsafe extern "system" fn window_proc(
             let command = tray::on_message(
                 hwnd,
                 (lparam.0 & 0xffff) as u32,
-                unsafe { &*app_ptr }.hotkey_registered,
+                unsafe { &*app_ptr }.hotkey.active_display_name(),
                 unsafe { &*app_ptr }.web.diagnostics().snapshot(),
             );
             let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
@@ -1635,11 +1658,6 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             tray::remove(hwnd);
-            if unsafe { &*app_ptr }.hotkey_registered {
-                unsafe {
-                    let _ = UnregisterHotKey(Some(hwnd), HOTKEY_TOGGLE);
-                }
-            }
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(app_ptr));
