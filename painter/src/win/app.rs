@@ -352,6 +352,27 @@ fn pointer_flags(wparam: WPARAM) -> u32 {
     ((wparam.0 >> 16) & 0xffff) as u32
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawingCancellation {
+    Pointer(u32),
+    AnyPointer,
+}
+
+/// Win32メッセージを通常描画セッションのキャンセル対象へ変換する。
+/// pointer固有メッセージはowner IDを照合し、汎用capture lossだけは現在のownerを対象にする。
+fn drawing_cancellation(message: u32, wparam: WPARAM) -> Option<DrawingCancellation> {
+    match message {
+        WM_POINTERUPDATE | WM_POINTERUP
+            if pointer_flags(wparam) & POINTER_MESSAGE_FLAG_CANCELED != 0 =>
+        {
+            Some(DrawingCancellation::Pointer(pointer_id(wparam)))
+        }
+        WM_POINTERCAPTURECHANGED => Some(DrawingCancellation::Pointer(pointer_id(wparam))),
+        WM_CAPTURECHANGED | WM_CANCELMODE => Some(DrawingCancellation::AnyPointer),
+        _ => None,
+    }
+}
+
 fn pointer_screen(lparam: LPARAM) -> (f64, f64) {
     (
         (lparam.0 & 0xffff) as i16 as f64,
@@ -998,7 +1019,7 @@ impl App {
             selection.stamp.item_id.clone()
         };
 
-        let messages = self.engine.end(now_ms());
+        let messages = self.engine.end_stamp_move(now_ms());
         if !messages.is_empty() {
             self.web.send_all(messages);
         }
@@ -1039,6 +1060,32 @@ impl App {
             self.render();
         }
         canceled
+    }
+
+    /// 通常のStroke / Shapeをキャンセルし、ローカルとBrowser Sourceを同じ状態へ戻す。
+    fn cancel_drawing_for_message(&mut self, hwnd: HWND, message: u32, wparam: WPARAM) -> bool {
+        let Some(cancellation) = drawing_cancellation(message, wparam) else {
+            return false;
+        };
+        let messages = match cancellation {
+            DrawingCancellation::Pointer(pointer_id) => self.engine.cancel_pointer(pointer_id),
+            DrawingCancellation::AnyPointer if self.engine.has_pointer_session() => {
+                self.engine.cancel()
+            }
+            DrawingCancellation::AnyPointer => return false,
+        };
+        if messages.is_empty() {
+            return false;
+        }
+        self.web.send_all(messages);
+        unsafe {
+            let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
+        }
+        if self.engine.take_rebuild_required() {
+            self.rebuild();
+        }
+        self.render();
+        true
     }
 
     fn begin_radial_menu(&mut self, pointer_id: u32, lparam: LPARAM) {
@@ -1180,24 +1227,37 @@ impl App {
                 let Some(brush) = self.current_brush() else {
                     return;
                 };
-                self.engine.begin(brush, u, v, POINTER_PRESSURE, now_ms())
-            }
-            DrawTool::Line => {
                 self.engine
-                    .begin_shape(ShapeKind::Line, self.current_line_style(), u, v)
+                    .begin(pointer_id, brush, u, v, POINTER_PRESSURE, now_ms())
             }
-            DrawTool::Arrow => {
-                self.engine
-                    .begin_shape(ShapeKind::Arrow, self.current_line_style(), u, v)
-            }
-            DrawTool::Rectangle => {
-                self.engine
-                    .begin_shape(ShapeKind::Rectangle, self.current_line_style(), u, v)
-            }
-            DrawTool::Ellipse => {
-                self.engine
-                    .begin_shape(ShapeKind::Ellipse, self.current_line_style(), u, v)
-            }
+            DrawTool::Line => self.engine.begin_shape(
+                pointer_id,
+                ShapeKind::Line,
+                self.current_line_style(),
+                u,
+                v,
+            ),
+            DrawTool::Arrow => self.engine.begin_shape(
+                pointer_id,
+                ShapeKind::Arrow,
+                self.current_line_style(),
+                u,
+                v,
+            ),
+            DrawTool::Rectangle => self.engine.begin_shape(
+                pointer_id,
+                ShapeKind::Rectangle,
+                self.current_line_style(),
+                u,
+                v,
+            ),
+            DrawTool::Ellipse => self.engine.begin_shape(
+                pointer_id,
+                ShapeKind::Ellipse,
+                self.current_line_style(),
+                u,
+                v,
+            ),
             DrawTool::Stamp(stamp_id) => {
                 let Some(stamp) = self
                     .stamps
@@ -1246,11 +1306,13 @@ impl App {
         if self.stamp_drag_active() {
             return;
         }
-        if !self.engine.is_drawing() {
+        if !self.engine.owns_pointer(pointer_id) {
             return;
         }
         let (u, v) = self.pointer_uv(lparam);
-        let msgs = self.engine.move_to(u, v, POINTER_PRESSURE, now_ms());
+        let msgs = self
+            .engine
+            .move_to(pointer_id, u, v, POINTER_PRESSURE, now_ms());
         let trimmed = self.engine.take_rebuild_required();
         if !msgs.is_empty() {
             // 総点数上限による強制確定
@@ -1276,10 +1338,10 @@ impl App {
         if self.stamp_drag_active() {
             return;
         }
-        if !self.engine.is_drawing() {
+        if !self.engine.owns_pointer(pointer_id) {
             return;
         }
-        let msgs = self.engine.end(now_ms());
+        let msgs = self.engine.end(pointer_id, now_ms());
         self.web.send_all(msgs);
         unsafe {
             let _ = KillTimer(Some(hwnd), FLUSH_TIMER_ID);
@@ -1392,9 +1454,11 @@ unsafe extern "system" fn window_proc(
             {
                 unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd);
                 LRESULT(0)
-            } else if unsafe { &mut *app_ptr }.update_radial_menu(id, lparam) {
+            } else if unsafe { &mut *app_ptr }.cancel_drawing_for_message(hwnd, msg, wparam)
+                || unsafe { &mut *app_ptr }.update_radial_menu(id, lparam)
+            {
                 LRESULT(0)
-            } else if unsafe { &*app_ptr }.engine.is_drawing()
+            } else if unsafe { &*app_ptr }.engine.owns_pointer(id)
                 || unsafe { &*app_ptr }.stamp_drag_owns(id)
             {
                 unsafe { &mut *app_ptr }.on_pointer_update(hwnd, id, lparam);
@@ -1415,6 +1479,8 @@ unsafe extern "system" fn window_proc(
             {
                 unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd);
                 LRESULT(0)
+            } else if unsafe { &mut *app_ptr }.cancel_drawing_for_message(hwnd, msg, wparam) {
+                LRESULT(0)
             } else if let Some(release) = unsafe { &mut *app_ptr }.release_radial_menu(id, lparam) {
                 match release {
                     RadialRelease::Action { action, .. } => {
@@ -1434,7 +1500,7 @@ unsafe extern "system" fn window_proc(
                     RadialRelease::Cancel => unsafe { &mut *app_ptr }.poll_projector(hwnd),
                 }
                 LRESULT(0)
-            } else if unsafe { &*app_ptr }.engine.is_drawing()
+            } else if unsafe { &*app_ptr }.engine.owns_pointer(id)
                 || unsafe { &*app_ptr }.stamp_drag_owns(id)
             {
                 unsafe { &mut *app_ptr }.on_pointer_up(hwnd, id, lparam);
@@ -1443,9 +1509,23 @@ unsafe extern "system" fn window_proc(
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
-        WM_POINTERCAPTURECHANGED | WM_CAPTURECHANGED => {
+        WM_POINTERCAPTURECHANGED => {
+            let id = pointer_id(wparam);
+            if (unsafe { &*app_ptr }.radial_menu_owns(id)
+                && unsafe { &mut *app_ptr }.cancel_radial_interaction())
+                || (unsafe { &*app_ptr }.stamp_drag_owns(id)
+                    && unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd))
+                || unsafe { &mut *app_ptr }.cancel_drawing_for_message(hwnd, msg, wparam)
+            {
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_CAPTURECHANGED => {
             if unsafe { &mut *app_ptr }.cancel_radial_interaction()
                 || unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd)
+                || unsafe { &mut *app_ptr }.cancel_drawing_for_message(hwnd, msg, wparam)
             {
                 LRESULT(0)
             } else {
@@ -1455,6 +1535,7 @@ unsafe extern "system" fn window_proc(
         WM_CANCELMODE => {
             if unsafe { &mut *app_ptr }.dismiss_radial_menu()
                 || unsafe { &mut *app_ptr }.cancel_stamp_drag(hwnd)
+                || unsafe { &mut *app_ptr }.cancel_drawing_for_message(hwnd, msg, wparam)
             {
                 LRESULT(0)
             } else {
@@ -1559,6 +1640,10 @@ unsafe extern "system" fn window_proc(
 mod tests {
     use super::*;
 
+    fn pointer_wparam(pointer_id: u32, flags: u32) -> WPARAM {
+        WPARAM((pointer_id as usize) | ((flags as usize) << 16))
+    }
+
     fn test_monitor(x: i32, primary: bool) -> Monitor {
         Monitor {
             x,
@@ -1592,5 +1677,35 @@ mod tests {
 
         assert_eq!(clamp_stamp_center(&stamp, (-0.3, 1.4)), (0.1, 0.8));
         assert_eq!(clamp_stamp_center(&stamp, (0.4, 0.6)), (0.4, 0.6));
+    }
+
+    #[test]
+    fn win32_cancel_messages_preserve_pointer_scope() {
+        let owner = 42;
+        let canceled = pointer_wparam(owner, POINTER_MESSAGE_FLAG_CANCELED);
+        let ordinary = pointer_wparam(owner, 0);
+
+        assert_eq!(
+            drawing_cancellation(WM_POINTERUPDATE, canceled),
+            Some(DrawingCancellation::Pointer(owner))
+        );
+        assert_eq!(
+            drawing_cancellation(WM_POINTERUP, canceled),
+            Some(DrawingCancellation::Pointer(owner))
+        );
+        assert_eq!(drawing_cancellation(WM_POINTERUPDATE, ordinary), None);
+        assert_eq!(drawing_cancellation(WM_POINTERUP, ordinary), None);
+        assert_eq!(
+            drawing_cancellation(WM_POINTERCAPTURECHANGED, ordinary),
+            Some(DrawingCancellation::Pointer(owner))
+        );
+        assert_eq!(
+            drawing_cancellation(WM_CAPTURECHANGED, ordinary),
+            Some(DrawingCancellation::AnyPointer)
+        );
+        assert_eq!(
+            drawing_cancellation(WM_CANCELMODE, ordinary),
+            Some(DrawingCancellation::AnyPointer)
+        );
     }
 }

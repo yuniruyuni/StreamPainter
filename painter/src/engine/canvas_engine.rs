@@ -18,6 +18,7 @@ const MIN_PRESSURE_DELTA: f64 = 0.05;
 pub type SharedItems = Arc<Mutex<Vec<CanvasItem>>>;
 
 struct ActiveStroke {
+    pointer_id: u32,
     stroke_id: String,
     started_at: f64, // epoch ms
     pending: Vec<Point>,
@@ -25,6 +26,7 @@ struct ActiveStroke {
 }
 
 struct ActiveShape {
+    pointer_id: u32,
     item_id: String,
     pending_end: Option<(f64, f64)>,
 }
@@ -40,6 +42,16 @@ enum ActiveItem {
     Stroke(ActiveStroke),
     Shape(ActiveShape),
     StampMove(ActiveStampMove),
+}
+
+impl ActiveItem {
+    fn pointer_id(&self) -> Option<u32> {
+        match self {
+            Self::Stroke(active) => Some(active.pointer_id),
+            Self::Shape(active) => Some(active.pointer_id),
+            Self::StampMove(_) => None,
+        }
+    }
 }
 
 /// 確定済み項目の追加とスタンプ移動を、ユーザー操作の順番で戻す。
@@ -114,6 +126,22 @@ impl CanvasEngine {
         self.active.is_some()
     }
 
+    /// 通常描画を開始したポインターだけが、そのセッションを更新・確定できる。
+    pub fn owns_pointer(&self, pointer_id: u32) -> bool {
+        self.active
+            .as_ref()
+            .and_then(ActiveItem::pointer_id)
+            .is_some_and(|owner| owner == pointer_id)
+    }
+
+    /// Stroke / Shape の入力セッションが存在するか。StampMove はApp側で所有権を管理する。
+    pub fn has_pointer_session(&self) -> bool {
+        self.active
+            .as_ref()
+            .and_then(ActiveItem::pointer_id)
+            .is_some()
+    }
+
     /// 上限トリムで baked 履歴から項目が消えたかを一度だけ通知する。
     pub fn take_rebuild_required(&mut self) -> bool {
         std::mem::take(&mut self.rebuild_required)
@@ -122,6 +150,7 @@ impl CanvasEngine {
     /// フリーハンドのペンダウン。stroke_begin を返す。
     pub fn begin(
         &mut self,
+        pointer_id: u32,
         brush: Brush,
         u: f64,
         v: f64,
@@ -150,6 +179,7 @@ impl CanvasEngine {
         self.trim();
 
         self.active = Some(ActiveItem::Stroke(ActiveStroke {
+            pointer_id,
             stroke_id: stroke_id.clone(),
             started_at: now_ms,
             pending: vec![first],
@@ -161,6 +191,7 @@ impl CanvasEngine {
     /// 図形のドラッグ開始。
     pub fn begin_shape(
         &mut self,
+        pointer_id: u32,
         shape_kind: ShapeKind,
         style: LineStyle,
         u: f64,
@@ -186,6 +217,7 @@ impl CanvasEngine {
         });
         self.trim();
         self.active = Some(ActiveItem::Shape(ActiveShape {
+            pointer_id,
             item_id,
             // shape_begin に初期終点が含まれるため、最初の flush では再送しない。
             pending_end: None,
@@ -308,7 +340,17 @@ impl CanvasEngine {
 
     /// ポインタ移動。ストロークでは点を追加し、図形では終点を更新する。
     /// ストロークの点数上限に達した場合のみ、ここから強制確定メッセージを返す。
-    pub fn move_to(&mut self, u: f64, v: f64, p: f64, now_ms: f64) -> Vec<PainterMessage> {
+    pub fn move_to(
+        &mut self,
+        pointer_id: u32,
+        u: f64,
+        v: f64,
+        p: f64,
+        now_ms: f64,
+    ) -> Vec<PainterMessage> {
+        if !self.owns_pointer(pointer_id) {
+            return Vec::new();
+        }
         let Some(active) = self.active.as_mut() else {
             return Vec::new();
         };
@@ -360,7 +402,7 @@ impl CanvasEngine {
                 self.total_points += 1;
                 self.trim();
                 if count >= MAX_STROKE_POINTS {
-                    return self.end(now_ms);
+                    return self.finish_active(now_ms);
                 }
                 Vec::new()
             }
@@ -409,8 +451,23 @@ impl CanvasEngine {
         }
     }
 
-    /// ポインタアップ。残バッファを flush し、アクティブ項目を確定する。
-    pub fn end(&mut self, now_ms: f64) -> Vec<PainterMessage> {
+    /// 所有ポインターのアップ時だけ、残バッファをflushして通常描画を確定する。
+    pub fn end(&mut self, pointer_id: u32, now_ms: f64) -> Vec<PainterMessage> {
+        if !self.owns_pointer(pointer_id) {
+            return Vec::new();
+        }
+        self.finish_active(now_ms)
+    }
+
+    /// StampMoveはApp側の選択状態でpointer所有権を管理する。
+    pub fn end_stamp_move(&mut self, now_ms: f64) -> Vec<PainterMessage> {
+        if !matches!(self.active.as_ref(), Some(ActiveItem::StampMove(_))) {
+            return Vec::new();
+        }
+        self.finish_active(now_ms)
+    }
+
+    fn finish_active(&mut self, now_ms: f64) -> Vec<PainterMessage> {
         // スタンプは中間previewをflushせず、確定イベントだけを即時送る。
         // それ以外の描画は従来どおり残バッファを確定前に送る。
         let stamp_move = matches!(self.active.as_ref(), Some(ActiveItem::StampMove(_)));
@@ -487,6 +544,14 @@ impl CanvasEngine {
             self.undo_actions.push(action);
         }
         messages
+    }
+
+    /// 所有ポインターのキャンセルだけを通常描画セッションへ適用する。
+    pub fn cancel_pointer(&mut self, pointer_id: u32) -> Vec<PainterMessage> {
+        if !self.owns_pointer(pointer_id) {
+            return Vec::new();
+        }
+        self.cancel()
     }
 
     /// 描画中項目の破棄 (モード切替時など)。スタンプ移動は元位置へ戻す。
@@ -715,6 +780,8 @@ mod tests {
     use super::*;
     use crate::protocol::Tool;
 
+    const POINTER_ID: u32 = 7;
+
     fn brush() -> Brush {
         Brush {
             tool: Tool::Pen,
@@ -764,10 +831,10 @@ mod tests {
     #[test]
     fn begin_move_flush_end_lifecycle() {
         let mut engine = CanvasEngine::new();
-        let msgs = engine.begin(brush(), 0.1, 0.1, 0.5, 1000.0);
+        let msgs = engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 1000.0);
         assert_eq!(drain_types(&msgs), ["begin"]);
 
-        engine.move_to(0.2, 0.2, 0.5, 1016.0);
+        engine.move_to(POINTER_ID, 0.2, 0.2, 0.5, 1016.0);
         let flushed = engine.flush();
         assert_eq!(drain_types(&flushed), ["points"]);
         if let PainterMessage::StrokePoints { pts, .. } = &flushed[0] {
@@ -775,7 +842,7 @@ mod tests {
             assert_eq!(pts[1].3, 16.0);
         }
 
-        let ended = engine.end(1100.0);
+        let ended = engine.end(POINTER_ID, 1100.0);
         assert_eq!(drain_types(&ended), ["end"]);
         let items = engine.shared_items();
         let items = items.lock().unwrap();
@@ -785,18 +852,69 @@ mod tests {
     }
 
     #[test]
+    fn foreign_pointer_cannot_update_end_or_cancel_a_stroke() {
+        let mut engine = CanvasEngine::new();
+        let owner = POINTER_ID;
+        let foreign = owner + 1;
+        engine.begin(owner, brush(), 0.1, 0.1, 0.5, 1000.0);
+
+        assert!(engine.owns_pointer(owner));
+        assert!(!engine.owns_pointer(foreign));
+        assert!(engine.move_to(foreign, 0.8, 0.8, 0.5, 1016.0).is_empty());
+        assert!(engine.end(foreign, 1020.0).is_empty());
+        assert!(engine.cancel_pointer(foreign).is_empty());
+        assert!(engine.owns_pointer(owner));
+        {
+            let items = engine.shared_items();
+            let items = items.lock().unwrap();
+            let stroke = first_stroke(&items);
+            assert_eq!(stroke.pts.len(), 1);
+            assert!(!stroke.done);
+        }
+
+        engine.move_to(owner, 0.2, 0.2, 0.5, 1032.0);
+        assert_eq!(drain_types(&engine.end(owner, 1040.0)), ["points", "end"]);
+        assert!(!engine.is_drawing());
+    }
+
+    #[test]
+    fn only_shape_owner_can_cancel_the_session() {
+        let mut engine = CanvasEngine::new();
+        let owner = POINTER_ID;
+        let foreign = owner + 1;
+        engine.begin_shape(owner, ShapeKind::Rectangle, line_style(), 0.1, 0.2);
+
+        assert!(engine.move_to(foreign, 0.8, 0.7, 0.5, 10.0).is_empty());
+        assert!(engine.end(foreign, 20.0).is_empty());
+        assert!(engine.cancel_pointer(foreign).is_empty());
+        assert!(engine.owns_pointer(owner));
+        {
+            let items = engine.shared_items();
+            let items = items.lock().unwrap();
+            match &items[0] {
+                CanvasItem::Shape { shape } => assert_eq!(shape.end, (0.1, 0.2)),
+                _ => panic!("expected shape"),
+            }
+        }
+
+        assert_eq!(drain_types(&engine.cancel_pointer(owner)), ["shape_cancel"]);
+        assert!(!engine.is_drawing());
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn shape_updates_are_coalesced_and_committed() {
         let mut engine = CanvasEngine::new();
         assert_eq!(
-            drain_types(&engine.begin_shape(ShapeKind::Arrow, line_style(), 0.1, 0.2)),
+            drain_types(&engine.begin_shape(POINTER_ID, ShapeKind::Arrow, line_style(), 0.1, 0.2,)),
             ["shape_begin"]
         );
-        engine.move_to(0.4, 0.5, 0.5, 10.0);
-        engine.move_to(0.8, 0.7, 0.5, 20.0);
+        engine.move_to(POINTER_ID, 0.4, 0.5, 0.5, 10.0);
+        engine.move_to(POINTER_ID, 0.8, 0.7, 0.5, 20.0);
         let flushed = engine.flush();
         assert_eq!(drain_types(&flushed), ["shape_update"]);
         assert!(engine.flush().is_empty());
-        assert_eq!(drain_types(&engine.end(30.0)), ["shape_end"]);
+        assert_eq!(drain_types(&engine.end(POINTER_ID, 30.0)), ["shape_end"]);
         let items = engine.shared_items();
         let items = items.lock().unwrap();
         match &items[0] {
@@ -811,8 +929,8 @@ mod tests {
     #[test]
     fn stamp_and_shape_participate_in_undo_order() {
         let mut engine = CanvasEngine::new();
-        engine.begin_shape(ShapeKind::Rectangle, line_style(), 0.1, 0.1);
-        engine.end(10.0);
+        engine.begin_shape(POINTER_ID, ShapeKind::Rectangle, line_style(), 0.1, 0.1);
+        engine.end(POINTER_ID, 10.0);
         assert_eq!(
             drain_types(&engine.add_stamp("stamp-1".into(), (0.5, 0.5), 0.1, 0.2, 1.0, 20.0)),
             ["stamp_add"]
@@ -857,7 +975,7 @@ mod tests {
         assert!(engine.flush().is_empty());
 
         assert!(engine.preview_stamp_move(&item_id, (0.75, 0.6)));
-        assert_eq!(drain_types(&engine.end(20.0)), ["stamp_move"]);
+        assert_eq!(drain_types(&engine.end_stamp_move(20.0)), ["stamp_move"]);
         assert_eq!(engine.stamp_by_id(&item_id).unwrap().center, (0.75, 0.6));
         assert_eq!(drain_types(&engine.undo()), ["stamp_move"]);
         assert_eq!(engine.stamp_by_id(&item_id).unwrap().center, (0.2, 0.3));
@@ -899,7 +1017,7 @@ mod tests {
         let first_id = engine.stamp_at(0.2, 0.3).unwrap().item_id;
 
         assert!(engine.begin_stamp_move(&first_id));
-        assert!(engine.end(30.0).is_empty());
+        assert!(engine.end_stamp_move(30.0).is_empty());
         assert!(engine.can_redo());
     }
 
@@ -914,7 +1032,7 @@ mod tests {
         assert_eq!(drain_types(&engine.flush()), ["stamp_move_preview"]);
         assert!(engine.preview_stamp_move(&item_id, (0.2, 0.3)));
 
-        let committed = engine.end(30.0);
+        let committed = engine.end_stamp_move(30.0);
         assert_eq!(drain_types(&committed), ["stamp_move"]);
         assert!(matches!(
             &committed[0],
@@ -930,9 +1048,9 @@ mod tests {
     #[test]
     fn thinning_drops_close_points() {
         let mut engine = CanvasEngine::new();
-        engine.begin(brush(), 0.1, 0.1, 0.5, 0.0);
-        engine.move_to(0.10001, 0.1, 0.5, 8.0);
-        engine.move_to(0.2, 0.1, 0.5, 16.0);
+        engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 0.0);
+        engine.move_to(POINTER_ID, 0.10001, 0.1, 0.5, 8.0);
+        engine.move_to(POINTER_ID, 0.2, 0.1, 0.5, 16.0);
         let flushed = engine.flush();
         if let PainterMessage::StrokePoints { pts, .. } = &flushed[0] {
             assert_eq!(pts.len(), 2);
@@ -944,9 +1062,9 @@ mod tests {
     #[test]
     fn flush_chunks_large_batches() {
         let mut engine = CanvasEngine::new();
-        engine.begin(brush(), 0.0, 0.0, 0.5, 0.0);
+        engine.begin(POINTER_ID, brush(), 0.0, 0.0, 0.5, 0.0);
         for i in 1..=600 {
-            engine.move_to(i as f64 * 0.001, 0.0, 0.5, i as f64);
+            engine.move_to(POINTER_ID, i as f64 * 0.001, 0.0, 0.5, i as f64);
         }
         assert_eq!(engine.flush().len(), 2);
     }
@@ -954,10 +1072,11 @@ mod tests {
     #[test]
     fn force_end_at_point_cap() {
         let mut engine = CanvasEngine::new();
-        engine.begin(brush(), 0.0, 0.0, 0.5, 0.0);
+        engine.begin(POINTER_ID, brush(), 0.0, 0.0, 0.5, 0.0);
         let mut ended = false;
         for i in 1..MAX_STROKE_POINTS + 10 {
             let msgs = engine.move_to(
+                POINTER_ID,
                 (i % 1000) as f64 * 0.001,
                 (i / 1000) as f64 * 0.01,
                 0.5,
@@ -975,9 +1094,9 @@ mod tests {
     #[test]
     fn undo_removes_last_done_only() {
         let mut engine = CanvasEngine::new();
-        engine.begin(brush(), 0.1, 0.1, 0.5, 0.0);
-        engine.end(10.0);
-        engine.begin(brush(), 0.2, 0.2, 0.5, 20.0);
+        engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 0.0);
+        engine.end(POINTER_ID, 10.0);
+        engine.begin(POINTER_ID, brush(), 0.2, 0.2, 0.5, 20.0);
 
         assert_eq!(drain_types(&engine.undo()), ["undo"]);
         assert_eq!(engine.shared_items().lock().unwrap().len(), 1);
@@ -1025,7 +1144,7 @@ mod tests {
     #[test]
     fn cancel_discards_active() {
         let mut engine = CanvasEngine::new();
-        engine.begin(brush(), 0.1, 0.1, 0.5, 0.0);
+        engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 0.0);
         assert_eq!(drain_types(&engine.cancel()), ["cancel"]);
         assert!(engine.shared_items().lock().unwrap().is_empty());
     }
@@ -1034,8 +1153,8 @@ mod tests {
     fn trim_keeps_item_cap() {
         let mut engine = CanvasEngine::new();
         for i in 0..MAX_ITEMS + 10 {
-            engine.begin(brush(), 0.1, 0.1, 0.5, i as f64);
-            engine.end(i as f64 + 1.0);
+            engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, i as f64);
+            engine.end(POINTER_ID, i as f64 + 1.0);
             engine.flush();
         }
         assert_eq!(engine.shared_items().lock().unwrap().len(), MAX_ITEMS);
