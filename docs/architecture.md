@@ -36,8 +36,8 @@ UI／worker共通の5秒絶対deadlineを持ち、接続・認証・モニター
 の順序が一意になり、snapshotと増分イベントの競合を避けます。
 
 - 新規接続: 現在の全CanvasItemをsnapshotとして最初に送信
-- 通常描画: `stroke_*`、`shape_*`、`stamp_add`、`stamp_move_preview`、`stamp_move`、`undo`、
-  `redo`、`clear` を増分配信
+- 通常描画: `stroke_*`、`shape_*`、`stamp_add`、legacy互換の`stamp_move_*`、
+  `item_transform_*`、`undo`、`redo`、`clear` を増分配信
 - 再接続: 古いクライアント状態をsnapshotで全置換
 - backpressure: 各接続は256メッセージの上限を持つ
 - 遅延時: 接続をハブから除外し、Browser Source側の再接続に任せる
@@ -52,13 +52,13 @@ CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000�
 します。増分イベントにはrevisionを付け、欠落を検出したoverlayは再接続snapshotで復旧します。
 
 ローカルDirect2DとBrowser SourceのCanvas 2Dは、通常の確定操作では新しい1項目だけを
-bakedレイヤーへ追記します。全履歴の再構築はUndo、スタンプ移動、Clear、上限トリム、
-再接続snapshot、キャンバスのリサイズ時に限定します。スタンプのドラッグ中はネイティブ側の
-選択レイヤーを即時更新し、最新座標だけを16ms間隔（約60fps）の`stamp_move_preview`として
-送ります。Browser Source側は開始時に対象スタンプをbakedレイヤーから除き、その後はactive
-レイヤー上の1枚だけを更新します。同一描画フレーム内の更新は最新状態へ畳み込み、確定座標は
-`stamp_move`としてポインタを離した時点で即時送信します。履歴全体の再構築はドラッグの開始時と
-確定時に各1回だけ行います。
+bakedレイヤーへ追記します。全履歴の再構築はUndo、item transform、Clear、上限トリム、
+再接続snapshot、キャンバスのリサイズ時に限定します。図形／スタンプのtransform中はネイティブ側の
+対象より前の履歴をprefixとしてcacheし、対象と後続履歴を元の順序で即時再合成します。最新状態だけを
+16ms間隔（約60fps）の`item_transform_preview`として送り、Browser Source側も開始時に同じprefixを
+offscreen cacheへ構築して、対象以降だけを同一canvasへ履歴順に再合成します。後続eraserがprefixにも
+作用するため、previewと確定後の前後関係・alpha合成は一致します。同一描画フレーム内の更新は最新状態へ
+畳み込み、確定状態は`item_transform_commit`としてポインタを離した時点で即時送信します。
 
 `WM_POINTER`のpointer IDはmessage処理中だけWin32 APIへ渡し、取得したscalar metadataだけを
 platform非依存のengineへ渡します。mouse、touch、pen、touchpadを分類し、penの有効なmaskが示す

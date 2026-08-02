@@ -44,6 +44,8 @@ const SERVER_MESSAGE_TYPES = [
   "stamp_add",
   "stamp_move_preview",
   "stamp_move",
+  "item_transform_preview",
+  "item_transform_commit",
   "undo",
   "redo",
   "clear",
@@ -58,11 +60,13 @@ const MESSAGE_FIELDS = {
   stroke_cancel: ["rev", "strokeId", "type"],
   shape_begin: ["rev", "shape", "type"],
   shape_update: ["end", "itemId", "rev", "type"],
-  shape_end: ["endedAt", "itemId", "rev", "type"],
+  shape_end: ["endedAt", "itemId", "rev", "transform", "type"],
   shape_cancel: ["itemId", "rev", "type"],
   stamp_add: ["rev", "stamp", "type"],
   stamp_move_preview: ["center", "itemId", "rev", "type"],
   stamp_move: ["center", "itemId", "rev", "type"],
+  item_transform_preview: ["itemId", "rev", "transform", "type"],
+  item_transform_commit: ["itemId", "rev", "transform", "type"],
   undo: ["rev", "type"],
   redo: ["item", "rev", "type"],
   clear: ["rev", "type"],
@@ -90,6 +94,7 @@ const OBJECT_FIELDS = {
     "shape",
     "start",
     "style",
+    "transform",
   ],
   stampItem: [
     "center",
@@ -99,6 +104,7 @@ const OBJECT_FIELDS = {
     "itemId",
     "kind",
     "opacity",
+    "rotation",
     "stampId",
     "widthN",
   ],
@@ -351,6 +357,19 @@ function validateLineStyle(value: unknown, label: string): void {
   expectFiniteNumber(style.widthN, `${label}.widthN`);
 }
 
+function validateItemTransform(value: unknown, label: string): void {
+  const transform = expectObject(value, label);
+  expectExactFields(
+    transform,
+    ["center", "heightN", "rotation", "widthN"],
+    label,
+  );
+  expectNumberTuple(transform.center, 2, `${label}.center`);
+  expectFiniteNumber(transform.widthN, `${label}.widthN`);
+  expectFiniteNumber(transform.heightN, `${label}.heightN`);
+  expectFiniteNumber(transform.rotation, `${label}.rotation`);
+}
+
 function validateStrokeItem(value: unknown, label: string): void {
   const stroke = expectObject(value, label);
   expectExactFields(stroke, OBJECT_FIELDS.strokeItem, label);
@@ -370,9 +389,12 @@ function validateShapeItem(
   canvasItem: boolean,
 ): void {
   const shape = expectObject(value, label);
-  const fields = canvasItem
+  let fields: readonly string[] = canvasItem
     ? OBJECT_FIELDS.shapeItem
     : OBJECT_FIELDS.shapeItem.filter((field) => field !== "kind");
+  if (shape.transform === undefined) {
+    fields = fields.filter((field) => field !== "transform");
+  }
   expectExactFields(shape, fields, label);
   if (canvasItem) expectEnum(shape.kind, ["shape"], `${label}.kind`);
   expectString(shape.itemId, `${label}.itemId`);
@@ -380,6 +402,9 @@ function validateShapeItem(
   validateLineStyle(shape.style, `${label}.style`);
   expectNumberTuple(shape.start, 2, `${label}.start`);
   expectNumberTuple(shape.end, 2, `${label}.end`);
+  if (shape.transform !== undefined) {
+    validateItemTransform(shape.transform, `${label}.transform`);
+  }
   expectBoolean(shape.done, `${label}.done`);
   expectNullableNumber(shape.endedAt, `${label}.endedAt`);
 }
@@ -390,9 +415,12 @@ function validateStampItem(
   canvasItem: boolean,
 ): void {
   const stamp = expectObject(value, label);
-  const fields = canvasItem
+  let fields: readonly string[] = canvasItem
     ? OBJECT_FIELDS.stampItem
     : OBJECT_FIELDS.stampItem.filter((field) => field !== "kind");
+  if (stamp.rotation === undefined) {
+    fields = fields.filter((field) => field !== "rotation");
+  }
   expectExactFields(stamp, fields, label);
   if (canvasItem) expectEnum(stamp.kind, ["stamp"], `${label}.kind`);
   expectString(stamp.itemId, `${label}.itemId`);
@@ -400,6 +428,9 @@ function validateStampItem(
   expectNumberTuple(stamp.center, 2, `${label}.center`);
   expectFiniteNumber(stamp.widthN, `${label}.widthN`);
   expectFiniteNumber(stamp.heightN, `${label}.heightN`);
+  if (stamp.rotation !== undefined) {
+    expectFiniteNumber(stamp.rotation, `${label}.rotation`);
+  }
   expectFiniteNumber(stamp.opacity, `${label}.opacity`);
   expectBoolean(stamp.done, `${label}.done`);
   expectNullableNumber(stamp.endedAt, `${label}.endedAt`);
@@ -478,6 +509,7 @@ function decodeServerMessage(value: unknown): ServerToOverlayMessage {
     case "shape_end":
       expectString(message.itemId, "shape_end.itemId");
       expectFiniteNumber(message.endedAt, "shape_end.endedAt");
+      validateItemTransform(message.transform, "shape_end.transform");
       break;
     case "shape_cancel":
       expectString(message.itemId, "shape_cancel.itemId");
@@ -492,6 +524,11 @@ function decodeServerMessage(value: unknown): ServerToOverlayMessage {
     case "stamp_move":
       expectString(message.itemId, "stamp_move.itemId");
       expectNumberTuple(message.center, 2, "stamp_move.center");
+      break;
+    case "item_transform_preview":
+    case "item_transform_commit":
+      expectString(message.itemId, `${type}.itemId`);
+      validateItemTransform(message.transform, `${type}.transform`);
       break;
     case "undo":
     case "clear":

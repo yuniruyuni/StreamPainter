@@ -53,6 +53,15 @@
             "color": "#fedcba",
             "opacity": 0.625,
             "widthN": 0.01
+          },
+          "transform": {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "heightN": 0.15,
+            "rotation": 0.375,
+            "widthN": 0.2
           }
         },
         {
@@ -66,11 +75,12 @@
           "itemId": "fixture-snapshot-stamp",
           "kind": "stamp",
           "opacity": 0.875,
+          "rotation": 0.375,
           "stampId": "fixture-stamp",
           "widthN": 0.125
         }
       ],
-      "protocolVersion": 6,
+      "protocolVersion": 7,
       "rev": 40,
       "type": "snapshot"
     },
@@ -112,6 +122,7 @@
             "itemId": "fixture-preserved-stamp",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           },
@@ -149,11 +160,12 @@
             "itemId": "fixture-preserved-stamp",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -252,7 +264,7 @@
             "strokeId": "fixture-stroke-points"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -359,7 +371,7 @@
             "strokeId": "fixture-stroke-end"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -414,7 +426,7 @@
             "strokeId": "fixture-stroke-cancel"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -507,7 +519,7 @@
             "strokeId": "fixture-preserved-stroke"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -586,7 +598,7 @@
             }
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -622,6 +634,15 @@
               "color": "#aabbcc",
               "opacity": 0.7,
               "widthN": 0.01
+            },
+            "transform": {
+              "center": [
+                0.45,
+                0.55
+              ],
+              "heightN": 0.15,
+              "rotation": 0.375,
+              "widthN": 0.2
             }
           }
         ],
@@ -651,7 +672,7 @@
             }
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -659,6 +680,15 @@
         "endedAt": 1700000000456.0,
         "itemId": "fixture-shape-end",
         "rev": 41,
+        "transform": {
+          "center": [
+            0.45,
+            0.55
+          ],
+          "heightN": 0.15,
+          "rotation": 0.375,
+          "widthN": 0.2
+        },
         "type": "shape_end"
       },
       "name": "shape_end"
@@ -692,7 +722,7 @@
             }
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -737,6 +767,7 @@
             "itemId": "fixture-stamp-add",
             "kind": "stamp",
             "opacity": 0.875,
+            "rotation": 0.375,
             "stampId": "fixture-stamp",
             "widthN": 0.125
           }
@@ -767,7 +798,7 @@
             }
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -783,6 +814,7 @@
           "heightN": 0.225,
           "itemId": "fixture-stamp-add",
           "opacity": 0.875,
+          "rotation": 0.375,
           "stampId": "fixture-stamp",
           "widthN": 0.125
         },
@@ -804,6 +836,7 @@
             "itemId": "fixture-stamp-preview",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
@@ -824,11 +857,12 @@
             "itemId": "fixture-stamp-preview",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -857,6 +891,7 @@
             "itemId": "fixture-stamp-move",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
@@ -877,11 +912,12 @@
             "itemId": "fixture-stamp-move",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -895,6 +931,164 @@
         "type": "stamp_move"
       },
       "name": "stamp_move"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-transform-preview",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            },
+            "transform": {
+              "center": [
+                0.45,
+                0.55
+              ],
+              "heightN": 0.15,
+              "rotation": 0.375,
+              "widthN": 0.2
+            }
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-transform-preview",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 7,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "itemId": "fixture-transform-preview",
+        "rev": 41,
+        "transform": {
+          "center": [
+            0.45,
+            0.55
+          ],
+          "heightN": 0.15,
+          "rotation": 0.375,
+          "widthN": 0.2
+        },
+        "type": "item_transform_preview"
+      },
+      "name": "item_transform_preview"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-transform-commit",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            },
+            "transform": {
+              "center": [
+                0.45,
+                0.55
+              ],
+              "heightN": 0.15,
+              "rotation": 0.375,
+              "widthN": 0.2
+            }
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-transform-commit",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 7,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "itemId": "fixture-transform-commit",
+        "rev": 41,
+        "transform": {
+          "center": [
+            0.45,
+            0.55
+          ],
+          "heightN": 0.15,
+          "rotation": 0.375,
+          "widthN": 0.2
+        },
+        "type": "item_transform_commit"
+      },
+      "name": "item_transform_commit"
     },
     {
       "expected": {
@@ -980,7 +1174,7 @@
             }
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1024,6 +1218,7 @@
             "itemId": "fixture-redo",
             "kind": "stamp",
             "opacity": 0.875,
+            "rotation": 0.375,
             "stampId": "fixture-stamp",
             "widthN": 0.125
           }
@@ -1054,7 +1249,7 @@
             }
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1070,6 +1265,7 @@
           "itemId": "fixture-redo",
           "kind": "stamp",
           "opacity": 0.875,
+          "rotation": 0.375,
           "stampId": "fixture-stamp",
           "widthN": 0.125
         },
@@ -1143,11 +1339,12 @@
             "itemId": "fixture-clear-stamp",
             "kind": "stamp",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1168,6 +1365,18 @@
   "messageFields": {
     "clear": [
       "rev",
+      "type"
+    ],
+    "item_transform_commit": [
+      "itemId",
+      "rev",
+      "transform",
+      "type"
+    ],
+    "item_transform_preview": [
+      "itemId",
+      "rev",
+      "transform",
       "type"
     ],
     "pong": [
@@ -1193,6 +1402,7 @@
       "endedAt",
       "itemId",
       "rev",
+      "transform",
       "type"
     ],
     "shape_update": [
@@ -1277,7 +1487,8 @@
       "kind",
       "shape",
       "start",
-      "style"
+      "style",
+      "transform"
     ],
     "stampItem": [
       "center",
@@ -1287,6 +1498,7 @@
       "itemId",
       "kind",
       "opacity",
+      "rotation",
       "stampId",
       "widthN"
     ],
@@ -1299,7 +1511,7 @@
       "strokeId"
     ]
   },
-  "protocolVersion": 6,
+  "protocolVersion": 7,
   "revisionCases": [
     {
       "expected": {
@@ -1364,7 +1576,7 @@
             "strokeId": "fixture-revision-preserved"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 10,
         "type": "snapshot"
       },
@@ -1437,7 +1649,7 @@
             "strokeId": "fixture-revision-preserved"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 10,
         "type": "snapshot"
       },
@@ -1510,14 +1722,14 @@
             "strokeId": "fixture-revision-preserved"
           }
         ],
-        "protocolVersion": 6,
+        "protocolVersion": 7,
         "rev": 10,
         "type": "snapshot"
       },
       "message": {
         "fadeAfterMs": 1000.0,
         "items": [],
-        "protocolVersion": 7,
+        "protocolVersion": 8,
         "rev": 99,
         "type": "snapshot"
       },
@@ -1538,6 +1750,8 @@
     "stamp_add",
     "stamp_move_preview",
     "stamp_move",
+    "item_transform_preview",
+    "item_transform_commit",
     "undo",
     "redo",
     "clear"
@@ -2571,6 +2785,7 @@
             "heightN": 0.2,
             "itemId": "fixture-limit-item-new",
             "opacity": 0.9,
+            "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           },

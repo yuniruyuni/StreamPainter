@@ -6,10 +6,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::item_transform::{
+    apply_item_transform, item_hit_test, item_transform, normalize_item_transform,
+    shape_transform_from_legacy,
+};
 use crate::engine::pointer_input::PointerDynamics;
 use crate::protocol::{
-    Brush, CanvasItem, LineStyle, PainterMessage, Point, ShapeItem, ShapeKind, StampItem, Stroke,
-    MAX_ITEMS, MAX_POINTS_PER_MESSAGE, MAX_STROKE_POINTS, MAX_TOTAL_POINTS,
+    Brush, CanvasItem, ItemTransform, LineStyle, PainterMessage, Point, ShapeItem, ShapeKind,
+    StampItem, Stroke, MAX_ITEMS, MAX_POINTS_PER_MESSAGE, MAX_STROKE_POINTS, MAX_TOTAL_POINTS,
 };
 
 /// 間引き閾値: 距離 (正規化)・筆圧・傾きの変化がすべて小さい点は捨てる。
@@ -32,20 +36,31 @@ struct ActiveStroke {
 struct ActiveShape {
     pointer_id: u32,
     item_id: String,
+    canvas_aspect: f64,
     pending_end: Option<(f64, f64)>,
 }
 
-struct ActiveStampMove {
+#[derive(Clone, Copy)]
+enum TransformWire {
+    Generic,
+    // Kept for the v5 stamp-move API and wire-event compatibility exercised by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    LegacyStampMove,
+}
+
+struct ActiveTransform {
     item_id: String,
-    origin: (f64, f64),
-    pending_center: Option<(f64, f64)>,
+    origin: ItemTransform,
+    pending_transform: Option<ItemTransform>,
     sent_any: bool,
+    canvas_aspect: f64,
+    wire: TransformWire,
 }
 
 enum ActiveItem {
     Stroke(ActiveStroke),
     Shape(ActiveShape),
-    StampMove(ActiveStampMove),
+    Transform(ActiveTransform),
 }
 
 impl ActiveItem {
@@ -53,21 +68,22 @@ impl ActiveItem {
         match self {
             Self::Stroke(active) => Some(active.pointer_id),
             Self::Shape(active) => Some(active.pointer_id),
-            Self::StampMove(_) => None,
+            Self::Transform(_) => None,
         }
     }
 }
 
-/// 確定済み項目の追加とスタンプ移動を、ユーザー操作の順番で戻す。
+/// 確定済み項目の追加とshape/stamp transformを、ユーザー操作の順番で戻す。
 /// Add は項目本体を items 側に保持しているため ID だけを持つ。
 enum UndoAction {
     Add {
         item_id: String,
     },
-    MoveStamp {
+    Transform {
         item_id: String,
-        from: (f64, f64),
-        to: (f64, f64),
+        from: ItemTransform,
+        to: ItemTransform,
+        wire: TransformWire,
     },
 }
 
@@ -76,17 +92,18 @@ enum RedoAction {
     Add {
         item: CanvasItem,
     },
-    MoveStamp {
+    Transform {
         item_id: String,
-        from: (f64, f64),
-        to: (f64, f64),
+        from: ItemTransform,
+        to: ItemTransform,
+        wire: TransformWire,
     },
 }
 
 impl UndoAction {
     fn item_id(&self) -> &str {
         match self {
-            Self::Add { item_id } | Self::MoveStamp { item_id, .. } => item_id,
+            Self::Add { item_id } | Self::Transform { item_id, .. } => item_id,
         }
     }
 }
@@ -95,7 +112,7 @@ impl RedoAction {
     fn item_id(&self) -> &str {
         match self {
             Self::Add { item } => item.item_id(),
-            Self::MoveStamp { item_id, .. } => item_id,
+            Self::Transform { item_id, .. } => item_id,
         }
     }
 }
@@ -224,8 +241,9 @@ impl CanvasEngine {
         style: LineStyle,
         u: f64,
         v: f64,
+        canvas_aspect: f64,
     ) -> Vec<PainterMessage> {
-        if self.active.is_some() {
+        if self.active.is_some() || !canvas_aspect.is_finite() || canvas_aspect <= 0.0 {
             return Vec::new();
         }
         self.redo_actions.clear();
@@ -237,6 +255,7 @@ impl CanvasEngine {
             style,
             start: position,
             end: position,
+            transform: None,
             done: false,
             ended_at: None,
         };
@@ -247,6 +266,7 @@ impl CanvasEngine {
         self.active = Some(ActiveItem::Shape(ActiveShape {
             pointer_id,
             item_id,
+            canvas_aspect,
             // shape_begin に初期終点が含まれるため、最初の flush では再送しない。
             pending_end: None,
         }));
@@ -273,6 +293,7 @@ impl CanvasEngine {
             center: (round5(center.0), round5(center.1)),
             width_n,
             height_n,
+            rotation: 0.0,
             opacity,
             done: true,
             ended_at: Some(now_ms),
@@ -286,7 +307,39 @@ impl CanvasEngine {
         vec![PainterMessage::StampAdd { stamp }]
     }
 
-    /// 指定位置に重なる最前面の確定済みスタンプを返す。
+    /// 指定位置に重なる最前面の確定済みshape / stampを返す。
+    pub fn transformable_at(
+        &self,
+        u: f64,
+        v: f64,
+        canvas_aspect: f64,
+        tolerance_n: f64,
+    ) -> Option<CanvasItem> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|item| item_hit_test(item, (u, v), canvas_aspect, tolerance_n))
+            .cloned()
+    }
+
+    /// IDで確定済みshape / stampを取得する。
+    pub fn transformable_by_id(&self, item_id: &str) -> Option<CanvasItem> {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|item| {
+                item.is_done()
+                    && item.item_id() == item_id
+                    && matches!(item, CanvasItem::Shape { .. } | CanvasItem::Stamp { .. })
+            })
+            .cloned()
+    }
+
+    /// v5 API互換: 指定位置に重なる最前面の確定済みスタンプを返す。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stamp_at(&self, u: f64, v: f64) -> Option<StampItem> {
         if !u.is_finite() || !v.is_finite() {
             return None;
@@ -298,9 +351,7 @@ impl CanvasEngine {
             .rev()
             .find_map(|item| match item {
                 CanvasItem::Stamp { stamp }
-                    if stamp.done
-                        && (u - stamp.center.0).abs() <= stamp.width_n / 2.0
-                        && (v - stamp.center.1).abs() <= stamp.height_n / 2.0 =>
+                    if stamp.done && item_hit_test(item, (u, v), 1.0, 0.0) =>
                 {
                     Some(stamp.clone())
                 }
@@ -309,6 +360,7 @@ impl CanvasEngine {
     }
 
     /// ID で確定済みスタンプを取得する。選択プレビューの確定後同期に使う。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stamp_by_id(&self, item_id: &str) -> Option<StampItem> {
         self.items
             .lock()
@@ -322,48 +374,104 @@ impl CanvasEngine {
             })
     }
 
-    /// スタンプのドラッグ移動を開始する。Redo履歴は実際の移動確定まで保持する。
-    pub fn begin_stamp_move(&mut self, item_id: &str) -> bool {
-        if self.active.is_some() {
+    /// shape / stamp transformを開始する。Redo履歴は実際の確定まで保持する。
+    pub fn begin_item_transform(&mut self, item_id: &str, canvas_aspect: f64) -> bool {
+        self.begin_transform(item_id, canvas_aspect, TransformWire::Generic)
+    }
+
+    fn begin_transform(&mut self, item_id: &str, canvas_aspect: f64, wire: TransformWire) -> bool {
+        if self.active.is_some() || !canvas_aspect.is_finite() || canvas_aspect <= 0.0 {
             return false;
         }
-        let Some(origin) = self.stamp_by_id(item_id).map(|stamp| stamp.center) else {
+        let Some(item) = self.transformable_by_id(item_id) else {
             return false;
         };
-        self.active = Some(ActiveItem::StampMove(ActiveStampMove {
+        if matches!(wire, TransformWire::LegacyStampMove)
+            && !matches!(item, CanvasItem::Stamp { .. })
+        {
+            return false;
+        }
+        let Some(origin) = item_transform(&item, canvas_aspect) else {
+            return false;
+        };
+        self.active = Some(ActiveItem::Transform(ActiveTransform {
             item_id: item_id.to_owned(),
             origin,
-            pending_center: None,
+            pending_transform: None,
             sent_any: false,
+            canvas_aspect,
+            wire,
         }));
         true
     }
 
-    /// ドラッグ中のローカル状態を更新し、次のflushで最新位置だけをOBSへ送る。
+    /// transform中のローカル状態を更新し、次のflushで最新値だけをOBSへ送る。
+    pub fn preview_item_transform(
+        &mut self,
+        item_id: &str,
+        transform: ItemTransform,
+    ) -> Option<ItemTransform> {
+        let Some(ActiveItem::Transform(active)) = self.active.as_mut() else {
+            return None;
+        };
+        if active.item_id != item_id {
+            return None;
+        }
+
+        let mut items = self.items.lock().unwrap();
+        let item = items
+            .iter_mut()
+            .find(|item| item.is_done() && item.item_id() == item_id)?;
+        let current = item_transform(item, active.canvas_aspect);
+        // click-only interactionはauthoritative originをそのまま返す。normalize前に
+        // 比較し、古いsnapshotの高精度値を丸めただけの擬似変更を作らない。
+        if current == Some(transform) {
+            return None;
+        }
+        // drag後にpointerを開始点へ戻した場合も、session開始時のauthoritative
+        // originを丸めず復元する。既にpreview送信済みならfinish側がfinal commitを送り、
+        // 履歴上はno-opのままbrowserだけをtransform modeから戻す。
+        let transform = if transform == active.origin {
+            active.origin
+        } else {
+            normalize_item_transform(item, transform, active.canvas_aspect)?
+        };
+        if current == Some(transform) {
+            return None;
+        }
+        if !apply_item_transform(item, transform) {
+            return None;
+        }
+        active.pending_transform = Some(transform);
+        Some(transform)
+    }
+
+    /// v5 API互換: スタンプのドラッグ移動を開始する。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn begin_stamp_move(&mut self, item_id: &str) -> bool {
+        self.begin_transform(item_id, 1.0, TransformWire::LegacyStampMove)
+    }
+
+    /// v5 API互換: centerだけを更新する。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn preview_stamp_move(&mut self, item_id: &str, center: (f64, f64)) -> bool {
         let Some(center) = normalized_stamp_center(center) else {
             return false;
         };
-        let Some(ActiveItem::StampMove(active)) = self.active.as_mut() else {
+        let Some(ActiveItem::Transform(active)) = self.active.as_ref() else {
             return false;
         };
-        if active.item_id != item_id {
+        if active.item_id != item_id || !matches!(active.wire, TransformWire::LegacyStampMove) {
             return false;
         }
-
-        let mut items = self.items.lock().unwrap();
-        let Some(stamp) = items.iter_mut().find_map(|item| match item {
-            CanvasItem::Stamp { stamp } if stamp.done && stamp.item_id == item_id => Some(stamp),
-            _ => None,
-        }) else {
+        let Some(item) = self.transformable_by_id(item_id) else {
             return false;
         };
-        if stamp.center == center {
+        let Some(mut transform) = item_transform(&item, 1.0) else {
             return false;
-        }
-        stamp.center = center;
-        active.pending_center = Some(center);
-        true
+        };
+        transform.center = center;
+        self.preview_item_transform(item_id, transform).is_some()
     }
 
     /// ポインタ移動。ストロークでは点を追加し、図形では終点を更新する。
@@ -405,7 +513,7 @@ impl CanvasEngine {
         };
 
         match active {
-            ActiveItem::StampMove(_) => Vec::new(),
+            ActiveItem::Transform(_) => Vec::new(),
             ActiveItem::Shape(active) => {
                 let end = (round5(u), round5(v));
                 active.pending_end = Some(end);
@@ -462,7 +570,7 @@ impl CanvasEngine {
         }
     }
 
-    /// UIタイマから呼ぶバッチ送信。図形とスタンプ移動は最新座標だけを送る。
+    /// UIタイマから呼ぶバッチ送信。図形描画とitem transformは最新状態だけを送る。
     pub fn flush(&mut self) -> Vec<PainterMessage> {
         let Some(active) = self.active.as_mut() else {
             return Vec::new();
@@ -493,15 +601,12 @@ impl CanvasEngine {
                     })
                     .collect()
             }
-            ActiveItem::StampMove(active) => active
-                .pending_center
+            ActiveItem::Transform(active) => active
+                .pending_transform
                 .take()
-                .map(|center| {
+                .map(|transform| {
                     active.sent_any = true;
-                    PainterMessage::StampMovePreview {
-                        item_id: active.item_id.clone(),
-                        center,
-                    }
+                    transform_message(active.wire, active.item_id.clone(), transform, true)
                 })
                 .into_iter()
                 .collect(),
@@ -516,19 +621,39 @@ impl CanvasEngine {
         self.finish_active(now_ms)
     }
 
-    /// StampMoveはApp側の選択状態でpointer所有権を管理する。
+    /// transformはApp側の選択状態でpointer所有権を管理する。
+    pub fn end_item_transform(&mut self, now_ms: f64) -> Vec<PainterMessage> {
+        if !matches!(
+            self.active.as_ref(),
+            Some(ActiveItem::Transform(active)) if matches!(active.wire, TransformWire::Generic)
+        ) {
+            return Vec::new();
+        }
+        self.finish_active(now_ms)
+    }
+
+    /// v5 API互換: StampMoveはApp側の選択状態でpointer所有権を管理する。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn end_stamp_move(&mut self, now_ms: f64) -> Vec<PainterMessage> {
-        if !matches!(self.active.as_ref(), Some(ActiveItem::StampMove(_))) {
+        if !matches!(
+            self.active.as_ref(),
+            Some(ActiveItem::Transform(active))
+                if matches!(active.wire, TransformWire::LegacyStampMove)
+        ) {
             return Vec::new();
         }
         self.finish_active(now_ms)
     }
 
     fn finish_active(&mut self, now_ms: f64) -> Vec<PainterMessage> {
-        // スタンプは中間previewをflushせず、確定イベントだけを即時送る。
+        // transformは中間previewをflushせず、確定イベントだけを即時送る。
         // それ以外の描画は従来どおり残バッファを確定前に送る。
-        let stamp_move = matches!(self.active.as_ref(), Some(ActiveItem::StampMove(_)));
-        let mut messages = if stamp_move { Vec::new() } else { self.flush() };
+        let transforming = matches!(self.active.as_ref(), Some(ActiveItem::Transform(_)));
+        let mut messages = if transforming {
+            Vec::new()
+        } else {
+            self.flush()
+        };
         let Some(active) = self.active.take() else {
             return messages;
         };
@@ -553,45 +678,53 @@ impl CanvasEngine {
                 committed.then_some(UndoAction::Add { item_id })
             }
             ActiveItem::Shape(active) => {
-                let committed = if let Some(CanvasItem::Shape { shape }) = items
+                let transform = if let Some(CanvasItem::Shape { shape }) = items
                     .iter_mut()
                     .find(|item| item.item_id() == active.item_id)
                 {
                     shape.done = true;
                     shape.ended_at = Some(now_ms);
-                    true
+                    let transform = shape_transform_from_legacy(shape, active.canvas_aspect)
+                        .and_then(|legacy| {
+                            let candidate = CanvasItem::Shape {
+                                shape: shape.clone(),
+                            };
+                            normalize_item_transform(&candidate, legacy, active.canvas_aspect)
+                        });
+                    shape.transform = transform;
+                    transform
                 } else {
-                    false
+                    None
                 };
                 let item_id = active.item_id;
                 messages.push(PainterMessage::ShapeEnd {
                     item_id: item_id.clone(),
                     ended_at: now_ms,
+                    transform,
                 });
-                committed.then_some(UndoAction::Add { item_id })
+                transform.map(|_| UndoAction::Add { item_id })
             }
-            ActiveItem::StampMove(active) => {
-                let center = items.iter().find_map(|item| match item {
-                    CanvasItem::Stamp { stamp }
-                        if stamp.done && stamp.item_id == active.item_id =>
-                    {
-                        Some(stamp.center)
-                    }
-                    _ => None,
-                });
-                let Some(center) = center else {
+            ActiveItem::Transform(active) => {
+                let transform = items
+                    .iter()
+                    .find(|item| item.is_done() && item.item_id() == active.item_id)
+                    .and_then(|item| item_transform(item, active.canvas_aspect));
+                let Some(transform) = transform else {
                     return messages;
                 };
-                if center != active.origin || active.sent_any {
-                    messages.push(PainterMessage::StampMove {
-                        item_id: active.item_id.clone(),
-                        center,
-                    });
+                if transform != active.origin || active.sent_any {
+                    messages.push(transform_message(
+                        active.wire,
+                        active.item_id.clone(),
+                        transform,
+                        false,
+                    ));
                 }
-                (center != active.origin).then_some(UndoAction::MoveStamp {
+                (transform != active.origin).then_some(UndoAction::Transform {
                     item_id: active.item_id,
                     from: active.origin,
-                    to: center,
+                    to: transform,
+                    wire: active.wire,
                 })
             }
         };
@@ -611,7 +744,7 @@ impl CanvasEngine {
         self.cancel()
     }
 
-    /// 描画中項目の破棄 (モード切替時など)。スタンプ移動は元位置へ戻す。
+    /// 描画中項目の破棄 (モード切替時など)。transformは元状態へ戻す。
     pub fn cancel(&mut self) -> Vec<PainterMessage> {
         let Some(active) = self.active.take() else {
             return Vec::new();
@@ -625,25 +758,25 @@ impl CanvasEngine {
                 let id = active.item_id;
                 (id.clone(), PainterMessage::ShapeCancel { item_id: id })
             }
-            ActiveItem::StampMove(active) => {
+            ActiveItem::Transform(active) => {
                 let mut items = self.items.lock().unwrap();
-                let Some(stamp) = items.iter_mut().find_map(|item| match item {
-                    CanvasItem::Stamp { stamp }
-                        if stamp.done && stamp.item_id == active.item_id =>
-                    {
-                        Some(stamp)
-                    }
-                    _ => None,
-                }) else {
+                let Some(item) = items
+                    .iter_mut()
+                    .find(|item| item.is_done() && item.item_id() == active.item_id)
+                else {
                     return Vec::new();
                 };
-                let moved = stamp.center != active.origin;
-                stamp.center = active.origin;
-                if moved || active.sent_any {
-                    return vec![PainterMessage::StampMove {
-                        item_id: active.item_id,
-                        center: active.origin,
-                    }];
+                let changed = item_transform(item, active.canvas_aspect) != Some(active.origin);
+                if !apply_item_transform(item, active.origin) {
+                    return Vec::new();
+                }
+                if changed || active.sent_any {
+                    return vec![transform_message(
+                        active.wire,
+                        active.item_id,
+                        active.origin,
+                        false,
+                    )];
                 }
                 return Vec::new();
             }
@@ -656,7 +789,7 @@ impl CanvasEngine {
         vec![message]
     }
 
-    /// 最後の確定操作（項目追加またはスタンプ移動）を戻す。
+    /// 最後の確定操作（項目追加またはshape/stamp transform）を戻す。
     pub fn undo(&mut self) -> Vec<PainterMessage> {
         while let Some(action) = self.undo_actions.pop() {
             match action {
@@ -675,30 +808,31 @@ impl CanvasEngine {
                     self.redo_actions.push(RedoAction::Add { item: removed });
                     return vec![PainterMessage::Undo {}];
                 }
-                UndoAction::MoveStamp { item_id, from, to } => {
+                UndoAction::Transform {
+                    item_id,
+                    from,
+                    to,
+                    wire,
+                } => {
                     {
                         let mut items = self.items.lock().unwrap();
-                        let Some(stamp) = items.iter_mut().find_map(|item| match item {
-                            CanvasItem::Stamp { stamp }
-                                if stamp.done && stamp.item_id == item_id =>
-                            {
-                                Some(stamp)
-                            }
-                            _ => None,
-                        }) else {
+                        let Some(item) = items
+                            .iter_mut()
+                            .find(|item| item.is_done() && item.item_id() == item_id)
+                        else {
                             continue;
                         };
-                        stamp.center = from;
+                        if !apply_item_transform(item, from) {
+                            continue;
+                        }
                     }
-                    self.redo_actions.push(RedoAction::MoveStamp {
+                    self.redo_actions.push(RedoAction::Transform {
                         item_id: item_id.clone(),
                         from,
                         to,
+                        wire,
                     });
-                    return vec![PainterMessage::StampMove {
-                        item_id,
-                        center: from,
-                    }];
+                    return vec![transform_message(wire, item_id, from, false)];
                 }
             }
         }
@@ -729,30 +863,31 @@ impl CanvasEngine {
                     self.trim();
                     return vec![PainterMessage::Redo { item }];
                 }
-                RedoAction::MoveStamp { item_id, from, to } => {
+                RedoAction::Transform {
+                    item_id,
+                    from,
+                    to,
+                    wire,
+                } => {
                     {
                         let mut items = self.items.lock().unwrap();
-                        let Some(stamp) = items.iter_mut().find_map(|item| match item {
-                            CanvasItem::Stamp { stamp }
-                                if stamp.done && stamp.item_id == item_id =>
-                            {
-                                Some(stamp)
-                            }
-                            _ => None,
-                        }) else {
+                        let Some(item) = items
+                            .iter_mut()
+                            .find(|item| item.is_done() && item.item_id() == item_id)
+                        else {
                             continue;
                         };
-                        stamp.center = to;
+                        if !apply_item_transform(item, to) {
+                            continue;
+                        }
                     }
-                    self.undo_actions.push(UndoAction::MoveStamp {
+                    self.undo_actions.push(UndoAction::Transform {
                         item_id: item_id.clone(),
                         from,
                         to,
+                        wire,
                     });
-                    return vec![PainterMessage::StampMove {
-                        item_id,
-                        center: to,
-                    }];
+                    return vec![transform_message(wire, item_id, to, false)];
                 }
             }
         }
@@ -815,6 +950,31 @@ impl CanvasEngine {
     }
 }
 
+fn transform_message(
+    wire: TransformWire,
+    item_id: String,
+    transform: ItemTransform,
+    preview: bool,
+) -> PainterMessage {
+    match (wire, preview) {
+        (TransformWire::Generic, true) => {
+            PainterMessage::ItemTransformPreview { item_id, transform }
+        }
+        (TransformWire::Generic, false) => {
+            PainterMessage::ItemTransformCommit { item_id, transform }
+        }
+        (TransformWire::LegacyStampMove, true) => PainterMessage::StampMovePreview {
+            item_id,
+            center: transform.center,
+        },
+        (TransformWire::LegacyStampMove, false) => PainterMessage::StampMove {
+            item_id,
+            center: transform.center,
+        },
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn normalized_stamp_center(center: (f64, f64)) -> Option<(f64, f64)> {
     (center.0.is_finite() && center.1.is_finite()).then(|| {
         (
@@ -861,6 +1021,9 @@ fn point(u: f64, v: f64, dynamics: PointerDynamics, dt: f64) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::item_transform::{
+        selection_half_extents, TransformCorner, TransformHandle, TransformInteraction,
+    };
     use crate::protocol::Tool;
 
     const POINTER_ID: u32 = 7;
@@ -900,6 +1063,8 @@ mod tests {
                 PainterMessage::StampAdd { .. } => "stamp_add",
                 PainterMessage::StampMovePreview { .. } => "stamp_move_preview",
                 PainterMessage::StampMove { .. } => "stamp_move",
+                PainterMessage::ItemTransformPreview { .. } => "item_transform_preview",
+                PainterMessage::ItemTransformCommit { .. } => "item_transform_commit",
                 PainterMessage::Undo {} => "undo",
                 PainterMessage::Redo { .. } => "redo",
                 PainterMessage::Clear {} => "clear",
@@ -1027,7 +1192,7 @@ mod tests {
         let mut engine = CanvasEngine::new();
         let owner = POINTER_ID;
         let foreign = owner + 1;
-        engine.begin_shape(owner, ShapeKind::Rectangle, line_style(), 0.1, 0.2);
+        engine.begin_shape(owner, ShapeKind::Rectangle, line_style(), 0.1, 0.2, 1.0);
 
         assert!(engine.move_to(foreign, 0.8, 0.7, 0.5, 10.0).is_empty());
         assert!(engine.end(foreign, 20.0).is_empty());
@@ -1051,7 +1216,14 @@ mod tests {
     fn shape_updates_are_coalesced_and_committed() {
         let mut engine = CanvasEngine::new();
         assert_eq!(
-            drain_types(&engine.begin_shape(POINTER_ID, ShapeKind::Arrow, line_style(), 0.1, 0.2,)),
+            drain_types(&engine.begin_shape(
+                POINTER_ID,
+                ShapeKind::Arrow,
+                line_style(),
+                0.1,
+                0.2,
+                1.0,
+            )),
             ["shape_begin"]
         );
         engine.move_to(POINTER_ID, 0.4, 0.5, 0.5, 10.0);
@@ -1074,7 +1246,14 @@ mod tests {
     #[test]
     fn stamp_and_shape_participate_in_undo_order() {
         let mut engine = CanvasEngine::new();
-        engine.begin_shape(POINTER_ID, ShapeKind::Rectangle, line_style(), 0.1, 0.1);
+        engine.begin_shape(
+            POINTER_ID,
+            ShapeKind::Rectangle,
+            line_style(),
+            0.1,
+            0.1,
+            1.0,
+        );
         engine.end(POINTER_ID, 10.0);
         assert_eq!(
             drain_types(&engine.add_stamp("stamp-1".into(), (0.5, 0.5), 0.1, 0.2, 1.0, 20.0)),
@@ -1167,6 +1346,104 @@ mod tests {
     }
 
     #[test]
+    fn generic_click_only_scale_preserves_item_bytes_and_redo_history() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.2, 0.3), 0.17, 0.11, 1.0, 10.0);
+        engine.add_stamp("two".into(), (0.7, 0.6), 0.1, 0.1, 1.0, 20.0);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(engine.can_redo());
+
+        let item_id = engine.stamp_at(0.2, 0.3).unwrap().item_id;
+        {
+            let items = engine.shared_items();
+            let mut items = items.lock().unwrap();
+            let CanvasItem::Stamp { stamp } = &mut items[0] else {
+                panic!("expected stamp");
+            };
+            // v6/external snapshot由来の6桁を超える値でもclickだけでは丸めない。
+            stamp.center = (0.2345674, 0.3456784);
+            stamp.width_n = 0.1765434;
+            stamp.height_n = 0.1165434;
+            stamp.rotation = 0.1234564;
+        }
+        let item = engine.transformable_by_id(&item_id).unwrap();
+        let item_id = item.item_id().to_owned();
+        let origin = item.clone();
+        let transform = item_transform(&item, 1.0).unwrap();
+        let (half_width, half_height) = selection_half_extents(transform, &item, 1.0);
+        let handle = (
+            transform.center.0 + half_width,
+            transform.center.1 + half_height,
+        );
+        let interaction = TransformInteraction::begin(
+            &item,
+            TransformHandle::Scale(TransformCorner::SouthEast),
+            handle,
+            1.0,
+        )
+        .unwrap();
+
+        assert!(engine.begin_item_transform(&item_id, 1.0));
+        let click_only = interaction
+            .update((handle.0 + 1e-7, handle.1 - 1e-7))
+            .unwrap();
+        assert!(engine
+            .preview_item_transform(&item_id, click_only)
+            .is_none());
+        assert!(engine.end_item_transform(30.0).is_empty());
+        assert_eq!(engine.transformable_by_id(&item_id), Some(origin));
+        assert!(engine.can_redo());
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+    }
+
+    #[test]
+    fn generic_return_to_high_precision_origin_finalizes_without_undo_or_redo_loss() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.2, 0.3), 0.17, 0.11, 1.0, 10.0);
+        engine.add_stamp("two".into(), (0.7, 0.6), 0.1, 0.1, 1.0, 20.0);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(engine.can_redo());
+
+        let item_id = engine.stamp_at(0.2, 0.3).unwrap().item_id;
+        {
+            let items = engine.shared_items();
+            let mut items = items.lock().unwrap();
+            let CanvasItem::Stamp { stamp } = &mut items[0] else {
+                panic!("expected stamp");
+            };
+            stamp.center = (0.2345674, 0.3456784);
+            stamp.width_n = 0.1765434;
+            stamp.height_n = 0.1165434;
+            stamp.rotation = 0.1234564;
+        }
+        let origin_item = engine.transformable_by_id(&item_id).unwrap();
+        let origin = item_transform(&origin_item, 1.0).unwrap();
+        let changed = ItemTransform {
+            center: (0.6, 0.55),
+            width_n: 0.25,
+            height_n: 0.15,
+            rotation: 0.4,
+        };
+
+        assert!(engine.begin_item_transform(&item_id, 1.0));
+        assert_eq!(
+            engine.preview_item_transform(&item_id, changed),
+            Some(changed)
+        );
+        assert_eq!(drain_types(&engine.flush()), ["item_transform_preview"]);
+        assert_eq!(
+            engine.preview_item_transform(&item_id, origin),
+            Some(origin)
+        );
+
+        let committed = engine.end_item_transform(30.0);
+        assert_eq!(drain_types(&committed), ["item_transform_commit"]);
+        assert_eq!(engine.transformable_by_id(&item_id), Some(origin_item));
+        assert!(engine.can_redo());
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+    }
+
+    #[test]
     fn returning_to_origin_after_preview_finalizes_browser_without_history() {
         let mut engine = CanvasEngine::new();
         engine.add_stamp("one".into(), (0.2, 0.3), 0.1, 0.1, 1.0, 10.0);
@@ -1188,6 +1465,110 @@ mod tests {
         ));
         assert_eq!(drain_types(&engine.undo()), ["undo"]);
         assert!(engine.stamp_by_id(&item_id).is_none());
+    }
+
+    #[test]
+    fn generic_transform_previews_once_and_commits_one_undo_action() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.3, 0.4), 0.2, 0.1, 1.0, 10.0);
+        let item = engine.transformable_at(0.3, 0.4, 1.0, 0.0).unwrap();
+        let item_id = item.item_id().to_owned();
+        let origin = item_transform(&item, 1.0).unwrap();
+        let changed = ItemTransform {
+            center: (0.65, 0.55),
+            width_n: 0.3,
+            height_n: 0.15,
+            rotation: 0.4,
+        };
+
+        assert!(engine.begin_item_transform(&item_id, 1.0));
+        assert_eq!(
+            engine.preview_item_transform(&item_id, changed),
+            Some(changed)
+        );
+        assert_eq!(drain_types(&engine.flush()), ["item_transform_preview"]);
+        assert!(engine.flush().is_empty());
+        assert_eq!(
+            drain_types(&engine.end_item_transform(20.0)),
+            ["item_transform_commit"]
+        );
+        assert_eq!(
+            item_transform(&engine.transformable_by_id(&item_id).unwrap(), 1.0),
+            Some(changed)
+        );
+
+        assert_eq!(drain_types(&engine.undo()), ["item_transform_commit"]);
+        assert_eq!(
+            item_transform(&engine.transformable_by_id(&item_id).unwrap(), 1.0),
+            Some(origin)
+        );
+        assert_eq!(drain_types(&engine.redo()), ["item_transform_commit"]);
+        assert_eq!(
+            item_transform(&engine.transformable_by_id(&item_id).unwrap(), 1.0),
+            Some(changed)
+        );
+    }
+
+    #[test]
+    fn canceled_generic_transform_restores_shape_after_browser_preview() {
+        let mut engine = CanvasEngine::new();
+        engine.begin_shape(
+            POINTER_ID,
+            ShapeKind::Rectangle,
+            line_style(),
+            0.2,
+            0.3,
+            1.0,
+        );
+        engine.move_to(POINTER_ID, 0.5, 0.6, 1.0, 10.0);
+        engine.end(POINTER_ID, 20.0);
+        let item = engine.transformable_at(0.35, 0.45, 1.0, 0.0).unwrap();
+        let item_id = item.item_id().to_owned();
+        let origin = item_transform(&item, 1.0).unwrap();
+        let changed = ItemTransform {
+            center: (0.7, 0.65),
+            rotation: 0.25,
+            ..origin
+        };
+
+        assert!(engine.begin_item_transform(&item_id, 1.0));
+        assert_eq!(
+            engine.preview_item_transform(&item_id, changed),
+            Some(changed)
+        );
+        assert_eq!(drain_types(&engine.flush()), ["item_transform_preview"]);
+        assert_eq!(drain_types(&engine.cancel()), ["item_transform_commit"]);
+        assert_eq!(
+            item_transform(&engine.transformable_by_id(&item_id).unwrap(), 1.0),
+            Some(origin)
+        );
+        // cancel自身は履歴を増やさず、次のundoは元のshape追加を戻す。
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+    }
+
+    #[test]
+    fn transform_hit_test_prefers_topmost_shape_or_stamp() {
+        let mut engine = CanvasEngine::new();
+        engine.begin_shape(
+            POINTER_ID,
+            ShapeKind::Rectangle,
+            line_style(),
+            0.2,
+            0.2,
+            1.0,
+        );
+        engine.move_to(POINTER_ID, 0.8, 0.8, 1.0, 10.0);
+        engine.end(POINTER_ID, 20.0);
+        engine.add_stamp("top".into(), (0.5, 0.5), 0.2, 0.2, 1.0, 30.0);
+
+        assert!(matches!(
+            engine.transformable_at(0.5, 0.5, 1.0, 0.0),
+            Some(CanvasItem::Stamp { .. })
+        ));
+        assert!(matches!(
+            engine.transformable_at(0.25, 0.25, 1.0, 0.0),
+            Some(CanvasItem::Shape { .. })
+        ));
     }
 
     #[test]

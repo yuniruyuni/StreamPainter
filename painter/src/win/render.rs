@@ -49,11 +49,14 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::config::{self, StampConfig};
 use crate::engine::content_rect::Rect;
 use crate::engine::geometry::{dot, full_segments, stable_segments, tail_segment, Segment};
+use crate::engine::item_transform::{
+    item_transform, selection_half_extents, ROTATE_HANDLE_OFFSET_N,
+};
 use crate::protocol::{
     Brush, CanvasItem, LineStyle, ShapeItem, ShapeKind, StampItem, Stroke, Tool,
 };
@@ -335,23 +338,36 @@ impl Renderer {
 
     /// 確定 CanvasItem 一覧から baked を再構築する。
     pub fn rebuild_baked(&mut self, items: &[CanvasItem]) -> Result<()> {
-        self.rebuild_baked_excluding(items, None)
+        self.rebuild_baked_prefix(items, None)
     }
 
-    /// 選択中スタンプだけをフレーム側へ分離して baked を再構築する。
-    pub fn rebuild_baked_excluding(
+    /// transform対象より前の確定履歴だけをbakedへcacheする。対象とsuffixは
+    /// frame target上へ元の順序で再合成し、後続eraserの意味を維持する。
+    pub fn rebuild_baked_prefix(
         &mut self,
         items: &[CanvasItem],
-        excluded_item_id: Option<&str>,
+        transformed_item_id: Option<&str>,
     ) -> Result<()> {
         // rebuild/device recovery 後は現在の点列から scratch を再同期する。
         self.active_stroke = None;
         self.clear_baked_bitmap()?;
 
-        let visible = items
+        let prefix_end = transformed_item_id
+            .and_then(|item_id| items.iter().position(|item| item.item_id() == item_id))
+            .unwrap_or(items.len());
+        let visible = items[..prefix_end]
             .iter()
-            .filter(|item| item.is_done() && excluded_item_id != Some(item.item_id()))
+            .filter(|item| item.is_done())
             .collect::<Vec<_>>();
+        let baked = self.baked.clone();
+        self.append_composited_items(&baked, &visible)
+    }
+
+    fn append_composited_items(
+        &self,
+        target: &ID2D1Bitmap1,
+        visible: &[&CanvasItem],
+    ) -> Result<()> {
         let mut direct_start = 0;
         for (index, item) in visible.iter().enumerate() {
             let CanvasItem::Stroke { stroke } = item else {
@@ -360,11 +376,11 @@ impl Renderer {
             if !stroke_uses_opacity_scratch(stroke) {
                 continue;
             }
-            self.append_baked_items(&visible[direct_start..index])?;
-            self.composite_translucent_stroke(stroke)?;
+            self.append_bitmap_items(target, &visible[direct_start..index])?;
+            self.composite_translucent_stroke_to(target, stroke)?;
             direct_start = index + 1;
         }
-        self.append_baked_items(&visible[direct_start..])
+        self.append_bitmap_items(target, &visible[direct_start..])
     }
 
     fn clear_baked_bitmap(&self) -> Result<()> {
@@ -380,12 +396,12 @@ impl Renderer {
         })
     }
 
-    fn append_baked_items(&self, items: &[&CanvasItem]) -> Result<()> {
+    fn append_bitmap_items(&self, target: &ID2D1Bitmap1, items: &[&CanvasItem]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         unsafe {
-            self.dc.SetTarget(&self.baked);
+            self.dc.SetTarget(target);
         }
         let dc = self.dc.clone();
         draw_transaction(&dc, || {
@@ -425,6 +441,14 @@ impl Renderer {
     /// Browser Sourceと同じく、半透明strokeは不透明scratchへ全体を描いてから
     /// opacityを1回だけ掛ける。rebuild後もactive確定時と同じ見た目を保つ。
     fn composite_translucent_stroke(&self, stroke: &Stroke) -> Result<()> {
+        self.composite_translucent_stroke_to(&self.baked, stroke)
+    }
+
+    fn composite_translucent_stroke_to(
+        &self,
+        target: &ID2D1Bitmap1,
+        stroke: &Stroke,
+    ) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.active);
         }
@@ -440,7 +464,7 @@ impl Renderer {
         })?;
 
         unsafe {
-            self.dc.SetTarget(&self.baked);
+            self.dc.SetTarget(target);
         }
         let dc = self.dc.clone();
         draw_transaction(&dc, || {
@@ -485,10 +509,34 @@ impl Renderer {
         &mut self,
         items: &[CanvasItem],
         draw_mode: bool,
-        selected_stamp: Option<&StampItem>,
+        selected_item: Option<&CanvasItem>,
         radial: Option<(&RadialMenu, &DrawTool, &str, &[StampConfig])>,
     ) -> Result<()> {
         self.sync_active_stroke(items)?;
+        if let Some(item) = selected_item {
+            if self.draw_transform_history_preview(items, item)? {
+                unsafe {
+                    self.dc.SetTarget(&self.target);
+                }
+                let dc = self.dc.clone();
+                draw_transaction(&dc, || {
+                    // 選択枠・枠・ラジアルメニューは履歴合成後の操作UIとして描く。
+                    self.draw_item_selection(item)?;
+                    if draw_mode {
+                        self.draw_mode_border()?;
+                    }
+                    if let Some((menu, tool, color, stamps)) = radial {
+                        self.draw_radial_menu(menu, tool, color, stamps)?;
+                    }
+                    Ok(())
+                })?;
+                unsafe {
+                    self.swapchain.Present(1, Default::default()).ok()?;
+                }
+                return Ok(());
+            }
+        }
+
         unsafe {
             self.dc.SetTarget(&self.target);
         }
@@ -507,15 +555,15 @@ impl Renderer {
                         self.draw_item(item)?;
                     }
                 }
-                if let Some(stamp) = selected_stamp {
-                    self.draw_stamp(stamp)?;
+                if let Some(item) = selected_item {
+                    self.draw_item(item)?;
                 }
                 Ok(())
             })?;
             // 選択枠・枠・ラジアルメニューは操作 UI なので、端でも欠けないよう
             // content clip の後に描く。
-            if let Some(stamp) = selected_stamp {
-                self.draw_stamp_selection(stamp)?;
+            if let Some(item) = selected_item {
+                self.draw_item_selection(item)?;
             }
             if draw_mode {
                 self.draw_mode_border()?;
@@ -529,6 +577,63 @@ impl Renderer {
             self.swapchain.Present(1, Default::default()).ok()?;
         }
         Ok(())
+    }
+
+    /// cached prefixをtargetへ転写し、transform対象と後続履歴を元の順序で再合成する。
+    /// targetより後のeraserや半透明strokeも、commit後の完全rebuildと同じ意味になる。
+    fn draw_transform_history_preview(
+        &mut self,
+        items: &[CanvasItem],
+        selected_item: &CanvasItem,
+    ) -> Result<bool> {
+        let Some(transformed_index) = items
+            .iter()
+            .position(|item| item.is_done() && item.item_id() == selected_item.item_id())
+        else {
+            return Ok(false);
+        };
+        // Select toolは描画sessionと排他的。違反時は通常frameへfallbackする。
+        if self.active_stroke.is_some() {
+            return Ok(false);
+        }
+
+        let target = self.target.clone();
+        unsafe {
+            self.dc.SetTarget(&target);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+            }
+            with_content_clip(&self.dc, self.content, || {
+                unsafe {
+                    self.dc.DrawBitmap(
+                        &self.baked,
+                        None,
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+                Ok(())
+            })
+        })?;
+
+        let suffix = items[transformed_index..]
+            .iter()
+            .filter(|item| item.is_done())
+            .map(|item| {
+                if item.item_id() == selected_item.item_id() {
+                    selected_item
+                } else {
+                    item
+                }
+            })
+            .collect::<Vec<_>>();
+        self.append_composited_items(&target, &suffix)?;
+        Ok(true)
     }
 
     /// 最新の active stroke と GPU scratch を同期する。1-origin の cursor より前の
@@ -824,6 +929,12 @@ impl Renderer {
     }
 
     fn draw_shape(&self, shape: &ShapeItem) -> Result<()> {
+        if let Some(transform) = shape.transform {
+            let center = self.normalized_to_local(transform.center);
+            return self.with_rotation(transform.rotation, center, || {
+                self.draw_transformed_shape(shape, transform)
+            });
+        }
         let brush = self.line_brush(&shape.style)?;
         let width = (shape.style.width_n * self.content.height) as f32;
         let start = self.normalized_to_local(shape.start);
@@ -886,22 +997,94 @@ impl Renderer {
         Ok(())
     }
 
+    fn draw_transformed_shape(
+        &self,
+        shape: &ShapeItem,
+        transform: crate::protocol::ItemTransform,
+    ) -> Result<()> {
+        let brush = self.line_brush(&shape.style)?;
+        let line_width = (shape.style.width_n * self.content.height) as f32;
+        let center = self.normalized_to_local(transform.center);
+        let width = (transform.width_n * self.content.width) as f32;
+        let height = (transform.height_n * self.content.height) as f32;
+        let start = Vector2 {
+            X: center.X - width / 2.0,
+            Y: center.Y,
+        };
+        let end = Vector2 {
+            X: center.X + width / 2.0,
+            Y: center.Y,
+        };
+        unsafe {
+            match shape.shape {
+                ShapeKind::Line => {
+                    self.dc
+                        .DrawLine(start, end, &brush, line_width, &self.stroke_style);
+                }
+                ShapeKind::Arrow => {
+                    self.dc
+                        .DrawLine(start, end, &brush, line_width, &self.stroke_style);
+                    let head_length = (f64::from(width) * 0.4)
+                        .min((f64::from(line_width) * 4.0).max(self.content.height * 0.02));
+                    let spread = std::f64::consts::PI / 6.0;
+                    for head_angle in [-spread, spread] {
+                        let point = Vector2 {
+                            X: end.X - (head_length * head_angle.cos()) as f32,
+                            Y: end.Y - (head_length * head_angle.sin()) as f32,
+                        };
+                        self.dc
+                            .DrawLine(end, point, &brush, line_width, &self.stroke_style);
+                    }
+                }
+                ShapeKind::Rectangle => {
+                    self.dc.DrawRectangle(
+                        &D2D_RECT_F {
+                            left: center.X - width / 2.0,
+                            top: center.Y - height / 2.0,
+                            right: center.X + width / 2.0,
+                            bottom: center.Y + height / 2.0,
+                        },
+                        &brush,
+                        line_width,
+                        &self.stroke_style,
+                    );
+                }
+                ShapeKind::Ellipse => {
+                    self.dc.DrawEllipse(
+                        &D2D1_ELLIPSE {
+                            point: center,
+                            radiusX: width / 2.0,
+                            radiusY: height / 2.0,
+                        },
+                        &brush,
+                        line_width,
+                        &self.stroke_style,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn draw_stamp(&self, stamp: &StampItem) -> Result<()> {
         let Some(bitmap) = self.stamp_bitmaps.get(&stamp.stamp_id) else {
             return Ok(());
         };
         let destination = self.stamp_rect(stamp);
-        unsafe {
-            self.dc.DrawBitmap(
-                bitmap,
-                Some(&destination),
-                stamp.opacity as f32,
-                D2D1_INTERPOLATION_MODE_LINEAR,
-                None,
-                None,
-            );
-        }
-        Ok(())
+        let center = self.normalized_to_local(stamp.center);
+        self.with_rotation(stamp.rotation, center, || {
+            unsafe {
+                self.dc.DrawBitmap(
+                    bitmap,
+                    Some(&destination),
+                    stamp.opacity as f32,
+                    D2D1_INTERPOLATION_MODE_LINEAR,
+                    None,
+                    None,
+                );
+            }
+            Ok(())
+        })
     }
 
     fn stamp_rect(&self, stamp: &StampItem) -> D2D_RECT_F {
@@ -916,8 +1099,21 @@ impl Renderer {
         }
     }
 
-    fn draw_stamp_selection(&self, stamp: &StampItem) -> Result<()> {
-        let rect = self.stamp_rect(stamp);
+    fn draw_item_selection(&self, item: &CanvasItem) -> Result<()> {
+        let aspect = self.content.width / self.content.height;
+        let Some(transform) = item_transform(item, aspect) else {
+            return Ok(());
+        };
+        let center = self.normalized_to_local(transform.center);
+        let (half_width_n, half_height_n) = selection_half_extents(transform, item, aspect);
+        let half_width = (half_width_n * self.content.height) as f32;
+        let half_height = (half_height_n * self.content.height) as f32;
+        let rect = D2D_RECT_F {
+            left: center.X - half_width,
+            top: center.Y - half_height,
+            right: center.X + half_width,
+            bottom: center.Y + half_height,
+        };
         let shadow = unsafe {
             self.dc.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
@@ -940,38 +1136,112 @@ impl Renderer {
                 None,
             )?
         };
-        unsafe {
-            self.dc
-                .DrawRectangle(&rect, &shadow, 5.0, &self.stroke_style);
-            self.dc
-                .DrawRectangle(&rect, &accent, 2.0, &self.stroke_style);
-        }
-
-        let handle = (self.content.height as f32 * 0.007).clamp(5.0, 9.0);
-        for (x, y) in [
-            (rect.left, rect.top),
-            (rect.right, rect.top),
-            (rect.right, rect.bottom),
-            (rect.left, rect.bottom),
-        ] {
-            let outer = D2D_RECT_F {
-                left: x - handle,
-                top: y - handle,
-                right: x + handle,
-                bottom: y + handle,
-            };
-            let inner = D2D_RECT_F {
-                left: x - handle + 2.0,
-                top: y - handle + 2.0,
-                right: x + handle - 2.0,
-                bottom: y + handle - 2.0,
-            };
+        self.with_rotation(transform.rotation, center, || {
             unsafe {
-                self.dc.FillRectangle(&outer, &shadow);
-                self.dc.FillRectangle(&inner, &accent);
+                self.dc
+                    .DrawRectangle(&rect, &shadow, 5.0, &self.stroke_style);
+                self.dc
+                    .DrawRectangle(&rect, &accent, 2.0, &self.stroke_style);
             }
+
+            let handle = (self.content.height as f32 * 0.007).clamp(5.0, 9.0);
+            for (x, y) in [
+                (rect.left, rect.top),
+                (rect.right, rect.top),
+                (rect.right, rect.bottom),
+                (rect.left, rect.bottom),
+            ] {
+                let outer = D2D_RECT_F {
+                    left: x - handle,
+                    top: y - handle,
+                    right: x + handle,
+                    bottom: y + handle,
+                };
+                let inner = D2D_RECT_F {
+                    left: x - handle + 2.0,
+                    top: y - handle + 2.0,
+                    right: x + handle - 2.0,
+                    bottom: y + handle - 2.0,
+                };
+                unsafe {
+                    self.dc.FillRectangle(&outer, &shadow);
+                    self.dc.FillRectangle(&inner, &accent);
+                }
+            }
+            let rotate_y = rect.top - (ROTATE_HANDLE_OFFSET_N * self.content.height) as f32;
+            unsafe {
+                self.dc.DrawLine(
+                    Vector2 {
+                        X: center.X,
+                        Y: rect.top,
+                    },
+                    Vector2 {
+                        X: center.X,
+                        Y: rotate_y,
+                    },
+                    &shadow,
+                    5.0,
+                    &self.stroke_style,
+                );
+                self.dc.DrawLine(
+                    Vector2 {
+                        X: center.X,
+                        Y: rect.top,
+                    },
+                    Vector2 {
+                        X: center.X,
+                        Y: rotate_y,
+                    },
+                    &accent,
+                    2.0,
+                    &self.stroke_style,
+                );
+                self.dc.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: Vector2 {
+                            X: center.X,
+                            Y: rotate_y,
+                        },
+                        radiusX: handle,
+                        radiusY: handle,
+                    },
+                    &shadow,
+                );
+                self.dc.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: Vector2 {
+                            X: center.X,
+                            Y: rotate_y,
+                        },
+                        radiusX: handle - 2.0,
+                        radiusY: handle - 2.0,
+                    },
+                    &accent,
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn with_rotation<T>(
+        &self,
+        rotation_radians: f64,
+        center: Vector2,
+        draw: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut previous = Matrix3x2::identity();
+        unsafe {
+            self.dc.GetTransform(&mut previous);
+            self.dc.SetTransform(&Matrix3x2::rotation_around(
+                rotation_radians.to_degrees() as f32,
+                center,
+            ));
         }
-        Ok(())
+        let result = draw();
+        unsafe {
+            self.dc.SetTransform(&previous);
+        }
+        result
     }
 
     fn draw_radial_menu(
@@ -1813,6 +2083,30 @@ mod tests {
         }
     }
 
+    fn transformed_line_item(id: &str, color: &str, center_y: f64) -> CanvasItem {
+        CanvasItem::Shape {
+            shape: ShapeItem {
+                item_id: id.into(),
+                shape: ShapeKind::Line,
+                style: LineStyle {
+                    color: color.into(),
+                    opacity: 1.0,
+                    width_n: 0.12,
+                },
+                start: (0.1, center_y),
+                end: (0.9, center_y),
+                transform: Some(crate::protocol::ItemTransform {
+                    center: (0.5, center_y),
+                    width_n: 0.8,
+                    height_n: 0.0,
+                    rotation: 0.0,
+                }),
+                done: true,
+                ended_at: Some(1.0),
+            },
+        }
+    }
+
     fn fill(dc: &ID2D1DeviceContext, rect: D2D_RECT_F, color: D2D1_COLOR_F) -> Result<()> {
         unsafe {
             let brush = dc.CreateSolidColorBrush(&color, None)?;
@@ -1876,6 +2170,52 @@ mod tests {
             b: 1.0,
             a: 1.0,
         }
+    }
+
+    #[test]
+    fn native_transform_preview_keeps_suffix_eraser_and_stroke_history_order() -> Result<()> {
+        let (mut renderer, _window) = test_renderer()?;
+        let prefix = transformed_line_item("prefix", "#0000ff", 0.35);
+        let selected = transformed_line_item("selected", "#00ff00", 0.5);
+        let mut eraser = test_stroke(
+            "later-eraser",
+            Tool::Eraser,
+            1.0,
+            vec![
+                (0.5, 0.2, 1.0, 0.0, 0.0, 0.0),
+                (0.5, 0.8, 1.0, 1.0, 0.0, 0.0),
+            ],
+        );
+        eraser.done = true;
+        eraser.ended_at = Some(2.0);
+        let mut later_pen = test_stroke(
+            "later-pen",
+            Tool::Pen,
+            1.0,
+            vec![(0.5, 0.5, 1.0, 0.0, 0.0, 0.0)],
+        );
+        later_pen.done = true;
+        later_pen.ended_at = Some(3.0);
+        let items = vec![
+            prefix,
+            selected.clone(),
+            stroke_item(&eraser),
+            stroke_item(&later_pen),
+        ];
+
+        renderer.rebuild_baked_prefix(&items, Some(selected.item_id()))?;
+        assert!(renderer.draw_transform_history_preview(&items, &selected)?);
+        let preview_pixel = read_pixels(&renderer.dc, &renderer.target)?.bgra(32, 24);
+
+        renderer.rebuild_baked(&items)?;
+        let committed_pixel = read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24);
+        assert_eq!(preview_pixel, committed_pixel);
+        assert!(preview_pixel[2] > 220, "later red pen must remain visible");
+        assert!(
+            preview_pixel[1] < 32,
+            "selected green line must not move on top"
+        );
+        Ok(())
     }
 
     #[test]

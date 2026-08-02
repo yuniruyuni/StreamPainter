@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- 選択ツールで最前面の図形／スタンプを選び、専用ハンドルとカーソルで移動・縦横比固定の
+  拡大縮小・回転を行い、`Escape`で操作前へ戻せるtransform機能
+- 最新値へ集約した約60fpsのBrowser Sourceプレビューと、1ドラッグを1回として扱うUndo／Redo
+
+### Changed
+
+- transform中も元の描画順と後続の半透明stroke／eraserを維持し、線幅・矢印headを含むvisible inkを
+  キャンバス内へ収めながら最小表示寸法と縦横比を保持
+- ローカルWebSocketプロトコルを図形／スタンプtransform対応のversion 7へ更新。version 6 snapshotを
+  移行可能とし、更新後はOBS Browser Sourceの「現在のページを再読み込み」を1回実行する必要あり
+
 ## [0.6.1] - 2026-08-03
 
 ### Added

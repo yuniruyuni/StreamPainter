@@ -3,6 +3,7 @@
 
 import type {
   CanvasItem,
+  ItemTransform,
   ServerToOverlayMessage,
   ShapeItem,
   StampItem,
@@ -12,6 +13,7 @@ import {
   MAX_ITEMS,
   MAX_STROKE_POINTS,
   MAX_TOTAL_POINTS,
+  MIN_COMPATIBLE_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
 } from "~/protocol";
 
@@ -28,6 +30,7 @@ export type RenderEffect =
   | { kind: "cancel"; strokeId: string }
   | { kind: "preview" }
   | { kind: "stamp_preview"; stamp: StampItem; rebuildBaked: boolean }
+  | { kind: "item_preview"; item: CanvasItem; rebuildBaked: boolean }
   | { kind: "rebuild" }
   | { kind: "resync" };
 
@@ -37,6 +40,7 @@ export class OverlayState {
   rev = 0;
   private synchronized = false;
   private movingStampId: string | null = null;
+  private transformingItemId: string | null = null;
 
   /** ストロークだけを必要とする描画処理向けの読み取りビュー。 */
   get strokes(): Stroke[] {
@@ -55,15 +59,24 @@ export class OverlayState {
     this.rev = 0;
     this.synchronized = false;
     this.movingStampId = null;
+    this.transformingItemId = null;
   }
 
   apply(msg: ServerToOverlayMessage): RenderEffect {
     if (msg.type === "pong") return { kind: "none" };
 
     if (msg.type === "snapshot") {
-      if (msg.protocolVersion !== PROTOCOL_VERSION) {
+      const protocolVersion = (msg as { protocolVersion?: unknown })
+        .protocolVersion;
+      if (
+        typeof protocolVersion !== "number" ||
+        !Number.isSafeInteger(protocolVersion) ||
+        protocolVersion < MIN_COMPATIBLE_PROTOCOL_VERSION ||
+        protocolVersion > PROTOCOL_VERSION
+      ) {
         this.synchronized = false;
         this.movingStampId = null;
+        this.transformingItemId = null;
         return { kind: "resync" };
       }
       this.items = msg.items;
@@ -71,12 +84,14 @@ export class OverlayState {
       this.rev = msg.rev;
       this.synchronized = true;
       this.movingStampId = null;
+      this.transformingItemId = null;
       return { kind: "rebuild" };
     }
 
     if (!this.synchronized || msg.rev !== this.rev + 1) {
       this.synchronized = false;
       this.movingStampId = null;
+      this.transformingItemId = null;
       return { kind: "resync" };
     }
     this.rev = msg.rev;
@@ -146,6 +161,7 @@ export class OverlayState {
         if (!shape) return { kind: "none" };
         shape.done = true;
         shape.endedAt = msg.endedAt;
+        if (msg.transform) shape.transform = msg.transform;
         return { kind: "bake_item", item: shape };
       }
       case "shape_cancel": {
@@ -189,8 +205,28 @@ export class OverlayState {
         if (this.movingStampId === msg.itemId) this.movingStampId = null;
         return { kind: "rebuild" };
       }
+      case "item_transform_preview": {
+        const item = this.findTransformableItem(msg.itemId);
+        if (!item) return { kind: "none" };
+        applyTransform(item, msg.transform);
+        const rebuildBaked = this.transformingItemId !== msg.itemId;
+        this.transformingItemId = msg.itemId;
+        this.movingStampId = null;
+        return { kind: "item_preview", item, rebuildBaked };
+      }
+      case "item_transform_commit": {
+        const item = this.findTransformableItem(msg.itemId);
+        if (!item) return { kind: "none" };
+        applyTransform(item, msg.transform);
+        if (this.transformingItemId === msg.itemId) {
+          this.transformingItemId = null;
+        }
+        this.movingStampId = null;
+        return { kind: "rebuild" };
+      }
       case "undo": {
         this.movingStampId = null;
+        this.transformingItemId = null;
         let index = -1;
         for (let i = this.items.length - 1; i >= 0; i--) {
           if (this.items[i]?.done) {
@@ -204,6 +240,7 @@ export class OverlayState {
       }
       case "redo": {
         this.movingStampId = null;
+        this.transformingItemId = null;
         if (
           !msg.item.done ||
           this.items.some(
@@ -219,6 +256,7 @@ export class OverlayState {
       }
       case "clear": {
         this.movingStampId = null;
+        this.transformingItemId = null;
         if (this.items.length === 0) return { kind: "none" };
         this.items = [];
         return { kind: "rebuild" };
@@ -269,6 +307,14 @@ export class OverlayState {
     return item?.kind === "shape" ? item : null;
   }
 
+  private findTransformableItem(itemId: string): CanvasItem | null {
+    return (
+      this.items.find(
+        (item) => item.kind !== "stroke" && item.itemId === itemId && item.done,
+      ) ?? null
+    );
+  }
+
   // ローカルハブと同じトリム規則。確定項目を捨てたら true (要 rebuild)。
   private trim(): boolean {
     let dropped = false;
@@ -293,5 +339,16 @@ export class OverlayState {
     const index = this.items.findIndex((item) => item.done);
     if (index === -1) return null;
     return this.items.splice(index, 1)[0] ?? null;
+  }
+}
+
+function applyTransform(item: CanvasItem, transform: ItemTransform): void {
+  if (item.kind === "shape") {
+    item.transform = transform;
+  } else if (item.kind === "stamp") {
+    item.center = transform.center;
+    item.widthN = transform.widthN;
+    item.heightN = transform.heightN;
+    item.rotation = transform.rotation;
   }
 }

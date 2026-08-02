@@ -30,6 +30,7 @@ use tracing::{info, warn};
 
 use crate::config::{StampConfig, MAX_STAMP_FILE_BYTES};
 use crate::engine::canvas_engine::SharedItems;
+use crate::engine::item_transform::apply_item_transform;
 use crate::protocol::{
     CanvasItem, OverlayClientMessage, OverlayControlMessage, OverlayEvent, PainterMessage, Stroke,
     MAX_ITEMS, MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
@@ -698,7 +699,11 @@ impl HubState {
                 shape.end = end;
                 (PainterMessage::ShapeUpdate { item_id, end }, false)
             }
-            PainterMessage::ShapeEnd { item_id, ended_at } => {
+            PainterMessage::ShapeEnd {
+                item_id,
+                ended_at,
+                transform,
+            } => {
                 let shape = self.items.iter_mut().find_map(|item| match item {
                     CanvasItem::Shape { shape } if shape.item_id == item_id && !shape.done => {
                         Some(shape)
@@ -707,7 +712,17 @@ impl HubState {
                 })?;
                 shape.done = true;
                 shape.ended_at = Some(ended_at);
-                (PainterMessage::ShapeEnd { item_id, ended_at }, false)
+                if let Some(transform) = transform {
+                    shape.transform = Some(transform);
+                }
+                (
+                    PainterMessage::ShapeEnd {
+                        item_id,
+                        ended_at,
+                        transform,
+                    },
+                    false,
+                )
             }
             PainterMessage::ShapeCancel { item_id } => {
                 let index = self.items.iter().position(|item| {
@@ -754,6 +769,32 @@ impl HubState {
                 })?;
                 stamp.center = center;
                 (PainterMessage::StampMove { item_id, center }, false)
+            }
+            PainterMessage::ItemTransformPreview { item_id, transform } => {
+                let item = self
+                    .items
+                    .iter_mut()
+                    .find(|item| item.is_done() && item.item_id() == item_id)?;
+                if !apply_item_transform(item, transform) {
+                    return None;
+                }
+                (
+                    PainterMessage::ItemTransformPreview { item_id, transform },
+                    false,
+                )
+            }
+            PainterMessage::ItemTransformCommit { item_id, transform } => {
+                let item = self
+                    .items
+                    .iter_mut()
+                    .find(|item| item.is_done() && item.item_id() == item_id)?;
+                if !apply_item_transform(item, transform) {
+                    return None;
+                }
+                (
+                    PainterMessage::ItemTransformCommit { item_id, transform },
+                    false,
+                )
             }
             PainterMessage::Undo {} => {
                 let index = self.items.iter().rposition(CanvasItem::is_done)?;
@@ -989,6 +1030,7 @@ mod protocol_conformance {
                 },
                 start: (0.15, 0.25),
                 end: (0.35, 0.45),
+                transform: None,
                 done,
                 ended_at: done.then_some(1_700_000_000_200.0),
             },
@@ -1003,6 +1045,7 @@ mod protocol_conformance {
                 center: (0.45, 0.55),
                 width_n: 0.1,
                 height_n: 0.2,
+                rotation: 0.0,
                 opacity: 0.9,
                 done,
                 ended_at: done.then_some(1_700_000_000_300.0),
@@ -1049,6 +1092,10 @@ mod protocol_conformance {
             PainterMessage::StampMovePreview { item_id, .. }
             | PainterMessage::StampMove { item_id, .. } => {
                 vec![stamp_item(item_id, true)]
+            }
+            PainterMessage::ItemTransformPreview { item_id, .. }
+            | PainterMessage::ItemTransformCommit { item_id, .. } => {
+                vec![shape_item(item_id, ShapeKind::Rectangle, true)]
             }
             PainterMessage::Undo {} => vec![
                 stroke_item("fixture-undo-target", Tool::Pen, true, 2),
@@ -1752,6 +1799,7 @@ mod tests {
             },
             0.1,
             0.2,
+            1.0,
         );
         let (server, hub, rx, recovery) = queued_server(1, Arc::clone(&source_items));
         server.send_all(begin);
@@ -1796,6 +1844,7 @@ mod tests {
                 center: (0.5, 0.5),
                 width_n: 0.1,
                 height_n: 0.2,
+                rotation: 0.0,
                 opacity: 1.0,
                 done: true,
                 ended_at: Some(10.0),
@@ -1848,6 +1897,7 @@ mod tests {
             },
             start: (0.1, 0.2),
             end: (0.1, 0.2),
+            transform: None,
             done: false,
             ended_at: None,
         };
@@ -1865,6 +1915,7 @@ mod tests {
             PainterMessage::ShapeEnd {
                 item_id: "shape-1".into(),
                 ended_at: 10.0,
+                transform: None,
             },
         )
         .await;
@@ -1877,6 +1928,7 @@ mod tests {
                     center: (0.5, 0.5),
                     width_n: 0.1,
                     height_n: 0.2,
+                    rotation: 0.0,
                     opacity: 1.0,
                     done: true,
                     ended_at: Some(20.0),
@@ -1913,6 +1965,7 @@ mod tests {
                     center: (0.2, 0.3),
                     width_n: 0.1,
                     height_n: 0.2,
+                    rotation: 0.0,
                     opacity: 1.0,
                     done: true,
                     ended_at: Some(20.0),
@@ -1971,6 +2024,7 @@ mod tests {
                 center: (0.5, 0.5),
                 width_n: 0.1,
                 height_n: 0.2,
+                rotation: 0.0,
                 opacity: 1.0,
                 done: true,
                 ended_at: Some(20.0),

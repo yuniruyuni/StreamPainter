@@ -75,6 +75,7 @@ interface ContextOperation {
   alpha: number;
   compositeOperation: GlobalCompositeOperation;
   image?: CanvasImageSource;
+  strokeStyle?: string;
 }
 
 class FakeCanvasContext {
@@ -110,6 +111,8 @@ class FakeCanvasContext {
   arc(): void {}
   rect(): void {}
   ellipse(): void {}
+  translate(): void {}
+  rotate(): void {}
 
   fill(): void {
     this.record("fill");
@@ -147,6 +150,7 @@ class FakeCanvasContext {
       kind,
       alpha: this.globalAlpha,
       compositeOperation: this.globalCompositeOperation,
+      ...(kind === "stroke" ? { strokeStyle: String(this.strokeStyle) } : {}),
       ...(image ? { image } : {}),
     });
   }
@@ -269,6 +273,22 @@ function lineShape(): Extract<CanvasItem, { kind: "shape" }> {
     style: { color: "#00ffff", opacity: 0.7, widthN: 0.01 },
     start: [0.2, 0.8],
     end: [0.8, 0.2],
+    done: true,
+    endedAt: 1,
+  };
+}
+
+function rectangleShape(
+  itemId: string,
+  color: string,
+): Extract<CanvasItem, { kind: "shape" }> {
+  return {
+    kind: "shape",
+    itemId,
+    shape: "rectangle",
+    style: { color, opacity: 1, widthN: 0.01 },
+    start: [0.2, 0.2],
+    end: [0.4, 0.4],
     done: true,
     endedAt: 1,
   };
@@ -427,6 +447,161 @@ describe("OverlayLayers marker compositing scratch", () => {
   });
 });
 
+describe("OverlayLayers item transform history ordering", () => {
+  test("prefix cache後もtarget・後続marker・eraser・shapeを元の順で再合成する", () => {
+    const { layers, baked, active, runtime } = harness();
+    const target = rectangleShape("target", "#00ff00");
+    const laterShape = rectangleShape("later", "#0000ff");
+    const history: CanvasItem[] = [
+      marker(1, 0.4),
+      target,
+      marker(2, 0.6),
+      eraser(3),
+      laterShape,
+    ];
+    layers.rebuild(history);
+    const transformed = {
+      ...target,
+      transform: {
+        center: [0.65, 0.55] as [number, number],
+        widthN: 0.3,
+        heightN: 0.2,
+        rotation: 0.3,
+      },
+    };
+
+    baked.context.resetLogs();
+    active.context.resetLogs();
+    layers.prepareItemPreview(transformed);
+    layers.previewItem(transformed, true);
+    layers.renderActive();
+
+    // visible bakedは空。prefixをactiveへ写してからsuffixを履歴順に合成するため、
+    // 後続eraserはtargetとprefixの両方へ作用し、later shapeはその後に残る。
+    expect(baked.context.operations.map((operation) => operation.kind)).toEqual(
+      ["clear"],
+    );
+    const prefix = runtime.canvases.at(-1) as FakeCanvas;
+    expect(
+      active.context.operations.map((operation) => [
+        operation.kind,
+        operation.alpha,
+        operation.compositeOperation,
+        operation.strokeStyle,
+        operation.image === prefix.asCanvas() ? "prefix" : undefined,
+      ]),
+    ).toEqual([
+      ["clear", 1, "source-over", undefined, undefined],
+      ["draw_image", 1, "source-over", undefined, "prefix"],
+      ["stroke", 1, "source-over", "#00ff00", undefined],
+      ["draw_image", 0.6, "source-over", undefined, undefined],
+      ["stroke", 1, "destination-out", "#000000", undefined],
+      ["stroke", 1, "source-over", "#0000ff", undefined],
+    ]);
+
+    // commit時のsuffix順もpreviewと同一で、targetが最前面へ移動しない。
+    baked.context.resetLogs();
+    layers.rebuild([
+      history[0] as CanvasItem,
+      transformed,
+      ...history.slice(2),
+    ]);
+    expect(
+      baked.context.operations
+        .filter((operation) => operation.kind !== "clear")
+        .map((operation) => [
+          operation.kind,
+          operation.alpha,
+          operation.compositeOperation,
+          operation.strokeStyle,
+        ]),
+    ).toEqual([
+      ["draw_image", 0.4, "source-over", undefined],
+      ["stroke", 1, "source-over", "#00ff00"],
+      ["draw_image", 0.6, "source-over", undefined],
+      ["stroke", 1, "destination-out", "#000000"],
+      ["stroke", 1, "source-over", "#0000ff"],
+    ]);
+  });
+
+  test("first previewのRAF前resizeでもbaked ghostを作らずtransformと順序を維持する", () => {
+    const { layers, baked, active } = harness();
+    const target = rectangleShape("target", "#00ff00");
+    const later = rectangleShape("later", "#0000ff");
+    const prefix = marker(1, 0.4);
+    layers.rebuild([prefix, target, later]);
+    const transformed = {
+      ...target,
+      transform: {
+        center: [0.75, 0.6] as [number, number],
+        widthN: 0.2,
+        heightN: 0.15,
+        rotation: 0.5,
+      },
+    };
+
+    // componentは受信直後にprepareし、実描画だけをRAFへ遅延する。
+    layers.prepareItemPreview(transformed);
+    baked.context.resetLogs();
+    active.context.resetLogs();
+    layers.resize(1_200, 600, [prefix, transformed, later]);
+    expect(
+      baked.context.operations.filter(
+        (operation) => operation.kind === "stroke",
+      ),
+    ).toEqual([]);
+
+    // resizeが最初のqueueを取り消した後のrebuildBaked=false previewでも、
+    // resize時に作ったprefixを保持してtargetを一度だけ正しい位置へ描く。
+    active.context.resetLogs();
+    layers.previewItem(transformed, false);
+    layers.renderActive();
+    const strokes = active.context.operations.filter(
+      (operation) => operation.kind === "stroke",
+    );
+    expect(strokes.map((operation) => operation.strokeStyle)).toEqual([
+      "#00ff00",
+      "#0000ff",
+    ]);
+  });
+
+  test("preview後のcommitがRAF待ちでもresizeは確定履歴を通常bakedへ再構築する", () => {
+    const { layers, baked, active } = harness();
+    const prefix = rectangleShape("prefix", "#ff0000");
+    const target = rectangleShape("target", "#00ff00");
+    const later = rectangleShape("later", "#0000ff");
+    layers.rebuild([prefix, target, later]);
+    const transformed = {
+      ...target,
+      transform: {
+        center: [0.75, 0.6] as [number, number],
+        widthN: 0.2,
+        heightN: 0.15,
+        rotation: 0.5,
+      },
+    };
+
+    // componentはpreviewとcommitを同一RAFへqueueし得る。commit受信時に
+    // transform状態だけ同期終了し、resizeがqueueを破棄しても確定履歴を使う。
+    layers.prepareItemPreview(transformed);
+    layers.prepareRebuild();
+    baked.context.resetLogs();
+    active.context.resetLogs();
+    layers.resize(1_200, 600, [prefix, transformed, later]);
+
+    expect(
+      baked.context.operations
+        .filter((operation) => operation.kind === "stroke")
+        .map((operation) => operation.strokeStyle),
+    ).toEqual(["#ff0000", "#00ff00", "#0000ff"]);
+    expect(
+      active.context.operations.filter(
+        (operation) => operation.kind === "stroke",
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe("OverlayLayers stamp image retry", () => {
   test("一時失敗後にretry成功するとbakedへ再描画する", () => {
     const { layers, baked, active, runtime } = harness();
@@ -461,12 +636,10 @@ describe("OverlayLayers stamp image retry", () => {
     runtime.images[1]?.succeed();
 
     expect(baked.context.drawImageCalls).toHaveLength(0);
-    expect(active.context.drawImageCalls).toEqual([
-      {
-        image: runtime.images[1]?.asImage(),
-        args: [750, 300, 100, 100],
-      },
-    ]);
+    expect(active.context.drawImageCalls.at(-1)).toEqual({
+      image: runtime.images[1]?.asImage(),
+      args: [-50, -50, 100, 100],
+    });
   });
 
   test("連続失敗は30秒上限のexponential backoffでrebuild時も重複しない", () => {

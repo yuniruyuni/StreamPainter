@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use anyhow::{anyhow, Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_APP};
 
@@ -17,6 +17,24 @@ use crate::config::{HotkeyChord, HotkeyConfig};
 const PRIMARY_ID: i32 = 1;
 const SECONDARY_ID: i32 = 2;
 pub const SETTINGS_PROBE_ID: i32 = 3;
+/// WS_EX_NOACTIVATE overlayでもtransformをEscapeで取り消せる一時global hotkey。
+pub const TRANSFORM_ESCAPE_ID: i32 = 4;
+
+pub fn register_transform_escape(hwnd: HWND) -> Result<()> {
+    unsafe {
+        RegisterHotKey(
+            Some(hwnd),
+            TRANSFORM_ESCAPE_ID,
+            HOT_KEY_MODIFIERS(MOD_NOREPEAT.0),
+            u32::from(VK_ESCAPE.0),
+        )
+    }
+    .with_context(|| "register transform Escape hotkey")
+}
+
+pub fn unregister_transform_escape(hwnd: HWND) {
+    let _ = unsafe { UnregisterHotKey(Some(hwnd), TRANSFORM_ESCAPE_ID) };
+}
 
 /// 設定画面からoverlayへ同期送信する。request本体はUI thread-localへ置き、外部processが
 /// 任意pointerを送ってAppにdereferenceさせる経路を作らない。

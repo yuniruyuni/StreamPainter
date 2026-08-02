@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 pub type Point = (f64, f64, f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
+/// v6は筆圧・傾き対応済みで、transform field/eventだけが存在しない。
+pub const MIN_COMPATIBLE_PROTOCOL_VERSION: u32 = 6;
+const _: () = assert!(MIN_COMPATIBLE_PROTOCOL_VERSION <= PROTOCOL_VERSION);
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
@@ -55,6 +58,19 @@ pub struct Stroke {
 /// キャンバス内の正規化座標 [u, v]。
 pub type Position = (f64, f64);
 
+/// shape / stampで共有する永続transform。
+///
+/// `width_n`はcontent幅、`height_n`はcontent高さに対する比率、`rotation`はcanvas上の
+/// 時計回りradian。shapeの旧`start`/`end`はv6 snapshotのfallbackとして残す。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemTransform {
+    pub center: Position,
+    pub width_n: f64,
+    pub height_n: f64,
+    pub rotation: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ShapeKind {
@@ -80,6 +96,9 @@ pub struct ShapeItem {
     pub style: LineStyle,
     pub start: Position,
     pub end: Position,
+    /// v6 snapshotでは存在しない。Noneの場合はstart/endから回転なしのgeometryを復元する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<ItemTransform>,
     pub done: bool,
     pub ended_at: Option<f64>,
 }
@@ -93,6 +112,9 @@ pub struct StampItem {
     /// キャンバス幅・高さに対する正規化表示サイズ。
     pub width_n: f64,
     pub height_n: f64,
+    /// v6 snapshotでは存在せず、serde defaultの0 radianとして移行する。
+    #[serde(default)]
+    pub rotation: f64,
     pub opacity: f64,
     pub done: bool,
     pub ended_at: Option<f64>,
@@ -222,7 +244,7 @@ define_painter_messages! {
     ShapeBegin {
         shape: ShapeItem,
     } => PainterMessage::ShapeBegin {
-        shape: fixture_shape("fixture-shape-begin", ShapeKind::Arrow, true),
+        shape: fixture_shape("fixture-shape-begin", ShapeKind::Arrow, false),
     },
     #[serde(rename_all = "camelCase")]
     ShapeUpdate {
@@ -236,9 +258,13 @@ define_painter_messages! {
     ShapeEnd {
         item_id: String,
         ended_at: f64,
+        /// v6 eventには存在しない。v7で確定shapeのsize/rotationを永続化する。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transform: Option<ItemTransform>,
     } => PainterMessage::ShapeEnd {
         item_id: "fixture-shape-end".into(),
         ended_at: 1_700_000_000_456.0,
+        transform: Some(fixture_transform()),
     },
     #[serde(rename_all = "camelCase")]
     ShapeCancel {
@@ -267,6 +293,22 @@ define_painter_messages! {
     } => PainterMessage::StampMove {
         item_id: "fixture-stamp-move".into(),
         center: (0.75, 0.6),
+    },
+    #[serde(rename_all = "camelCase")]
+    ItemTransformPreview {
+        item_id: String,
+        transform: ItemTransform,
+    } => PainterMessage::ItemTransformPreview {
+        item_id: "fixture-transform-preview".into(),
+        transform: fixture_transform(),
+    },
+    #[serde(rename_all = "camelCase")]
+    ItemTransformCommit {
+        item_id: String,
+        transform: ItemTransform,
+    } => PainterMessage::ItemTransformCommit {
+        item_id: "fixture-transform-commit".into(),
+        transform: fixture_transform(),
     },
     Undo {} => PainterMessage::Undo {},
     Redo {
@@ -305,6 +347,7 @@ fn fixture_shape(item_id: &str, shape: ShapeKind, done: bool) -> ShapeItem {
         },
         start: (0.1, 0.2),
         end: (0.3, 0.4),
+        transform: done.then_some(fixture_transform()),
         done,
         ended_at: done.then_some(1_700_000_000_000.0),
     }
@@ -318,9 +361,20 @@ fn fixture_stamp(item_id: &str, done: bool) -> StampItem {
         center: (0.25, 0.35),
         width_n: 0.125,
         height_n: 0.225,
+        rotation: 0.375,
         opacity: 0.875,
         done,
         ended_at: Some(1_700_000_000_789.0),
+    }
+}
+
+#[cfg(test)]
+fn fixture_transform() -> ItemTransform {
+    ItemTransform {
+        center: (0.45, 0.55),
+        width_n: 0.2,
+        height_n: 0.15,
+        rotation: 0.375,
     }
 }
 
@@ -520,13 +574,49 @@ mod tests {
                 items,
                 ..
             } => {
-                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(protocol_version, MIN_COMPATIBLE_PROTOCOL_VERSION);
                 assert_eq!(rev, 3);
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].item_id(), "s1");
             }
             OverlayControlMessage::Pong { .. } => panic!("unexpected pong"),
         }
+    }
+
+    #[test]
+    fn v6_shape_stamp_and_shape_end_migrate_without_transform_fields() {
+        let snapshot: OverlayControlMessage = serde_json::from_str(
+            r##"{"type":"snapshot","protocolVersion":6,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"stroke-1","brush":{"tool":"marker","color":"#fff","opacity":0.5,"widthN":0.01,"pressureWidth":true,"pressureMin":0.65,"tiltWidth":true,"tiltMaxScale":1.75},"pts":[[0.1,0.2,0.5,0,0.25,-0.5]],"done":true,"endedAt":0},{"kind":"shape","itemId":"shape-1","shape":"rectangle","style":{"color":"#fff","opacity":1,"widthN":0.01},"start":[0.1,0.2],"end":[0.4,0.5],"done":true,"endedAt":1},{"kind":"stamp","itemId":"stamp-1","stampId":"asset","center":[0.5,0.5],"widthN":0.1,"heightN":0.2,"opacity":1,"done":true,"endedAt":2}]}"##,
+        )
+        .unwrap();
+        let OverlayControlMessage::Snapshot {
+            protocol_version,
+            items,
+            ..
+        } = snapshot
+        else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(protocol_version, MIN_COMPATIBLE_PROTOCOL_VERSION);
+        assert!(matches!(
+            &items[1],
+            CanvasItem::Shape { shape } if shape.transform.is_none()
+        ));
+        assert!(matches!(
+            &items[2],
+            CanvasItem::Stamp { stamp } if stamp.rotation == 0.0
+        ));
+
+        let end: PainterMessage =
+            serde_json::from_str(r##"{"type":"shape_end","itemId":"shape-1","endedAt":3}"##)
+                .unwrap();
+        assert!(matches!(
+            end,
+            PainterMessage::ShapeEnd {
+                transform: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -598,6 +688,7 @@ mod tests {
                 },
                 start: (0.1, 0.2),
                 end: (0.8, 0.7),
+                transform: None,
                 done: true,
                 ended_at: Some(42.0),
             },

@@ -69,6 +69,9 @@ export const OverlayApp: React.FC = () => {
             case "stamp_preview":
               layers.previewStamp(queued.stamp, queued.rebuildBaked);
               break;
+            case "item_preview":
+              layers.previewItem(queued.item, queued.rebuildBaked);
+              break;
             case "rebuild":
               layers.rebuild(state.items);
               break;
@@ -107,9 +110,15 @@ export const OverlayApp: React.FC = () => {
             schedule(effect);
             return true;
           case "stamp_preview":
+            layers.prepareItemPreview({ kind: "stamp", ...effect.stamp });
+            schedule(effect);
+            return true;
+          case "item_preview":
+            layers.prepareItemPreview(effect.item);
             schedule(effect);
             return true;
           case "rebuild":
+            layers.prepareRebuild();
             schedule(effect);
             return true;
           case "resync":

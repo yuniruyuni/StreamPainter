@@ -8,7 +8,7 @@
 - ペン・マーカー・消しゴム・直線・矢印・四角形・楕円
 - Windows Pointer APIによるペンの筆圧・傾き、能力欠落時の一定幅fallback
 - 設定画面で管理する固定サイズPNGスタンプ
-- 配置済みスタンプの選択、ドラッグ移動、Undo／Redo
+- 配置済み図形／スタンプの選択、移動・縦横比固定の拡大縮小・回転、約60fps同期、Undo／Redo
 - OBS全画面プロジェクター追従、Z-order維持、obs-websocket連携
 - Rust内蔵loopback HTTP/WebSocketサーバー
 - OBS Browser Source用assetsのexe埋め込み
@@ -24,7 +24,6 @@
 ## 次の候補
 
 - Surface Pen／Windows Ink対応タブレットでの実機・driver別の筆圧／傾き検証
-- 図形の選択・移動と、図形／スタンプの回転・拡大縮小
 - テキスト、アニメーションスタンプ
 
 ## 非目標

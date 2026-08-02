@@ -6,7 +6,8 @@
 //   フレームごとに active へ globalAlpha = opacity で合成する。
 // - eraser は baked へ直接 destination-out で増分適用する。
 // - undo / clear / snapshot / トリム時は strokes 一覧から baked を全再構築する。
-// - 移動中スタンプは baked から一度だけ除き、active で位置だけを再描画する。
+// - item transform中は対象より前の履歴をprefixへ一度だけcacheし、対象以降を
+//   active上へ元の順序で再合成する。後続eraserもprefixへ正しく作用する。
 
 import type { CanvasItem, ShapeItem, StampItem, Stroke } from "~/protocol";
 import { stableSegments, tailSegment } from "./geometry";
@@ -57,12 +58,18 @@ function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   return ctx;
 }
 
+function itemId(item: CanvasItem): string {
+  return item.kind === "stroke" ? item.strokeId : item.itemId;
+}
+
 export class OverlayLayers {
   private actives = new Map<string, ActiveEntry>();
   private latestItems: CanvasItem[] = [];
   private stampImages = new Map<string, StampImageEntry>();
   private strokeCompositingScratch: HTMLCanvasElement | null = null;
-  private movingStamp: StampItem | null = null;
+  private transformPrefix: HTMLCanvasElement | null = null;
+  private transformPrefixItemId: string | null = null;
+  private transformingItem: CanvasItem | null = null;
   private disposed = false;
 
   constructor(
@@ -85,8 +92,8 @@ export class OverlayLayers {
       canvas.height = height;
     }
     this.resizeStrokeCompositingScratch(width, height);
-    if (this.movingStamp) {
-      this.rebuildBaked(items, this.movingStamp.itemId);
+    if (this.transformingItem) {
+      this.rebuildTransformPrefix(items, itemId(this.transformingItem));
       this.renderActive();
     } else {
       this.rebuild(items);
@@ -100,7 +107,7 @@ export class OverlayLayers {
 
   // 確定 CanvasItem 一覧から baked を全再構築する。
   rebuild(items: CanvasItem[]): void {
-    this.movingStamp = null;
+    this.prepareRebuild();
     this.setItems(items);
     this.rebuildBaked(items);
     this.renderActive();
@@ -111,10 +118,35 @@ export class OverlayLayers {
     this.rebuild([]);
   }
 
-  // 最初のpreviewだけbakedを再構築し、以降はactive上のスタンプだけを更新する。
+  // WebSocket受信時点でtransform状態だけを記録する。描画はRAFまで行わないため、
+  // coalescingを保ちつつ、RAF前のresizeでも対象を通常bakedへ焼き込まない。
+  prepareItemPreview(item: CanvasItem): void {
+    this.transformingItem = item;
+  }
+
+  // commit / undo / snapshot の受信時点でtransform状態を終了する。
+  // 実際のrebuildがRAF待ちの間にresizeが発生してqueueが破棄されても、
+  // resize側が古いpreviewをtransform中として再構築しないようにする。
+  prepareRebuild(): void {
+    this.transformingItem = null;
+    this.releaseTransformPrefix();
+  }
+
+  // 最初のpreviewだけprefixを再構築し、以降はactive上のsuffixだけを更新する。
   previewStamp(stamp: StampItem, rebuildBaked: boolean): void {
-    this.movingStamp = stamp;
-    if (rebuildBaked) this.rebuildBaked(this.latestItems, stamp.itemId);
+    this.previewItem({ kind: "stamp", ...stamp }, rebuildBaked);
+  }
+
+  // transform previewでは対象以前をcacheし、対象と後続履歴を最大1frameごとに描く。
+  previewItem(item: CanvasItem, rebuildBaked: boolean): void {
+    this.transformingItem = item;
+    if (
+      rebuildBaked ||
+      this.transformPrefixItemId !== itemId(item) ||
+      !this.transformPrefix
+    ) {
+      this.rebuildTransformPrefix(this.latestItems, itemId(item));
+    }
   }
 
   /** component破棄後に画像callbackやretry timerがcanvasへ触れないよう停止する。 */
@@ -131,27 +163,64 @@ export class OverlayLayers {
       this.releaseCanvas(this.strokeCompositingScratch);
       this.strokeCompositingScratch = null;
     }
+    this.releaseTransformPrefix();
     this.stampImages.clear();
     this.actives.clear();
     this.latestItems = [];
-    this.movingStamp = null;
+    this.transformingItem = null;
   }
 
-  private rebuildBaked(items: CanvasItem[], excludedStampId?: string): void {
+  private rebuildBaked(items: CanvasItem[]): void {
     this.latestItems = items;
     const ctx = context2d(this.baked);
     ctx.globalCompositeOperation = "source-over";
     ctx.clearRect(0, 0, this.width, this.height);
 
     for (const item of items) {
-      if (
-        item.done &&
-        !(item.kind === "stamp" && item.itemId === excludedStampId)
-      ) {
+      if (item.done) {
         this.compositeItem(ctx, item);
       }
     }
 
+    this.resetActiveItems(items);
+  }
+
+  private rebuildTransformPrefix(
+    items: CanvasItem[],
+    transformedItemId: string,
+  ): void {
+    this.latestItems = items;
+    const transformedIndex = items.findIndex(
+      (item) => item.done && itemId(item) === transformedItemId,
+    );
+    if (transformedIndex < 0) {
+      this.transformingItem = null;
+      this.releaseTransformPrefix();
+      this.rebuildBaked(items);
+      return;
+    }
+    this.transformPrefixItemId = transformedItemId;
+
+    const prefix = this.getTransformPrefix();
+    const ctx = context2d(prefix);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, this.width, this.height);
+    for (const item of items.slice(0, transformedIndex)) {
+      if (item.done) this.compositeItem(ctx, item);
+    }
+
+    // visible bakedを空にし、prefixとsuffixを同じactive canvasへ載せる。
+    // これによりsuffix内のdestination-outがprefixにも作用する。
+    const bakedCtx = context2d(this.baked);
+    bakedCtx.globalAlpha = 1;
+    bakedCtx.globalCompositeOperation = "source-over";
+    bakedCtx.clearRect(0, 0, this.width, this.height);
+
+    this.resetActiveItems(items);
+  }
+
+  private resetActiveItems(items: CanvasItem[]): void {
     // 描画中ストロークをリセットして描き直す (undo 等で消えたものは捨てる)
     const alive = new Set(
       items
@@ -162,12 +231,12 @@ export class OverlayLayers {
         .map((stroke) => stroke.strokeId),
     );
     for (const id of this.actives.keys()) {
-      if (!alive.has(id)) this.actives.delete(id);
+      if (!alive.has(id)) this.deleteActive(id);
     }
     for (const item of items) {
       if (item.kind === "stroke" && !item.done) {
         const stroke = item;
-        this.actives.delete(stroke.strokeId);
+        this.deleteActive(stroke.strokeId);
         this.beginActive(stroke);
         this.appendActive(stroke);
       }
@@ -245,19 +314,44 @@ export class OverlayLayers {
       // pen / marker、または begin を経ていないストロークは全体を描き直す
       this.compositeStroke(ctx, stroke);
     }
-    this.actives.delete(stroke.strokeId);
+    this.deleteActive(stroke.strokeId);
     this.renderActive();
   }
 
   cancelActive(strokeId: string): void {
-    this.actives.delete(strokeId);
+    this.deleteActive(strokeId);
     this.renderActive();
   }
 
   // active レイヤーを合成し直す (クリア + 各 scratch を opacity 付きで転写)
   renderActive(): void {
     const ctx = context2d(this.active);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
     ctx.clearRect(0, 0, this.width, this.height);
+
+    if (this.transformingItem && this.transformPrefix) {
+      ctx.drawImage(this.transformPrefix, 0, 0);
+      const transformedId = itemId(this.transformingItem);
+      const transformedIndex = this.latestItems.findIndex(
+        (item) => item.done && itemId(item) === transformedId,
+      );
+      if (transformedIndex >= 0) {
+        for (const original of this.latestItems.slice(transformedIndex)) {
+          const item =
+            itemId(original) === transformedId
+              ? this.transformingItem
+              : original;
+          if (item.done) {
+            this.compositeItem(ctx, item);
+          } else {
+            this.renderLiveItem(ctx, item);
+          }
+        }
+      }
+      return;
+    }
+
     for (const entry of this.actives.values()) {
       if (!entry.scratch) continue;
       ctx.globalAlpha = entry.stroke.brush.opacity;
@@ -269,7 +363,26 @@ export class OverlayLayers {
         this.drawShape(ctx, item);
       }
     }
-    if (this.movingStamp) this.drawStamp(ctx, this.movingStamp);
+  }
+
+  private renderLiveItem(
+    ctx: CanvasRenderingContext2D,
+    item: CanvasItem,
+  ): void {
+    if (item.kind === "shape") {
+      this.drawShape(ctx, item);
+      return;
+    }
+    if (item.kind !== "stroke") return;
+    const entry = this.actives.get(item.strokeId);
+    if (entry?.scratch) {
+      ctx.globalAlpha = entry.stroke.brush.opacity;
+      ctx.globalCompositeOperation = "source-over";
+      ctx.drawImage(entry.scratch, 0, 0);
+      ctx.globalAlpha = 1;
+    } else if (item.brush.tool === "eraser") {
+      this.compositeStroke(ctx, item);
+    }
   }
 
   private compositeItem(ctx: CanvasRenderingContext2D, item: CanvasItem): void {
@@ -318,6 +431,26 @@ export class OverlayLayers {
     return this.strokeCompositingScratch;
   }
 
+  private getTransformPrefix(): HTMLCanvasElement {
+    if (!this.transformPrefix) {
+      this.transformPrefix = this.runtime.createCanvas();
+    }
+    if (this.transformPrefix.width !== this.width) {
+      this.transformPrefix.width = this.width;
+    }
+    if (this.transformPrefix.height !== this.height) {
+      this.transformPrefix.height = this.height;
+    }
+    return this.transformPrefix;
+  }
+
+  private releaseTransformPrefix(): void {
+    this.transformPrefixItemId = null;
+    if (!this.transformPrefix) return;
+    this.releaseCanvas(this.transformPrefix);
+    this.transformPrefix = null;
+  }
+
   private resizeStrokeCompositingScratch(width: number, height: number): void {
     const scratch = this.strokeCompositingScratch;
     if (!scratch) return;
@@ -330,18 +463,30 @@ export class OverlayLayers {
     canvas.height = 0;
   }
 
+  private deleteActive(strokeId: string): void {
+    const entry = this.actives.get(strokeId);
+    if (entry?.scratch) this.releaseCanvas(entry.scratch);
+    this.actives.delete(strokeId);
+  }
+
   private drawShape(ctx: CanvasRenderingContext2D, shape: ShapeItem): void {
-    const start = {
-      x: shape.start[0] * this.width,
-      y: shape.start[1] * this.height,
-    };
-    const end = {
-      x: shape.end[0] * this.width,
-      y: shape.end[1] * this.height,
-    };
+    const transform = shape.transform;
+    const start = transform
+      ? { x: (-transform.widthN * this.width) / 2, y: 0 }
+      : { x: shape.start[0] * this.width, y: shape.start[1] * this.height };
+    const end = transform
+      ? { x: (transform.widthN * this.width) / 2, y: 0 }
+      : { x: shape.end[0] * this.width, y: shape.end[1] * this.height };
     const lineWidth = shape.style.widthN * this.height;
 
     ctx.save();
+    if (transform) {
+      ctx.translate(
+        transform.center[0] * this.width,
+        transform.center[1] * this.height,
+      );
+      ctx.rotate(transform.rotation);
+    }
     ctx.globalCompositeOperation = "source-over";
     ctx.globalAlpha = shape.style.opacity;
     ctx.strokeStyle = shape.style.color;
@@ -382,19 +527,32 @@ export class OverlayLayers {
         break;
       }
       case "rectangle":
-        ctx.rect(
-          Math.min(start.x, end.x),
-          Math.min(start.y, end.y),
-          Math.abs(end.x - start.x),
-          Math.abs(end.y - start.y),
-        );
+        if (transform) {
+          ctx.rect(
+            (-transform.widthN * this.width) / 2,
+            (-transform.heightN * this.height) / 2,
+            transform.widthN * this.width,
+            transform.heightN * this.height,
+          );
+        } else {
+          ctx.rect(
+            Math.min(start.x, end.x),
+            Math.min(start.y, end.y),
+            Math.abs(end.x - start.x),
+            Math.abs(end.y - start.y),
+          );
+        }
         break;
       case "ellipse":
         ctx.ellipse(
-          (start.x + end.x) / 2,
-          (start.y + end.y) / 2,
-          Math.abs(end.x - start.x) / 2,
-          Math.abs(end.y - start.y) / 2,
+          transform ? 0 : (start.x + end.x) / 2,
+          transform ? 0 : (start.y + end.y) / 2,
+          transform
+            ? (transform.widthN * this.width) / 2
+            : Math.abs(end.x - start.x) / 2,
+          transform
+            ? (transform.heightN * this.height) / 2
+            : Math.abs(end.y - start.y) / 2,
           0,
           0,
           Math.PI * 2,
@@ -416,13 +574,9 @@ export class OverlayLayers {
       ctx.save();
       ctx.globalCompositeOperation = "source-over";
       ctx.globalAlpha = stamp.opacity;
-      ctx.drawImage(
-        entry.image,
-        centerX - width / 2,
-        centerY - height / 2,
-        width,
-        height,
-      );
+      ctx.translate(centerX, centerY);
+      ctx.rotate(stamp.rotation ?? 0);
+      ctx.drawImage(entry.image, -width / 2, -height / 2, width, height);
       ctx.restore();
       return;
     }
@@ -481,8 +635,11 @@ export class OverlayLayers {
   }
 
   private redrawAfterStampLoad(): void {
-    if (this.movingStamp) {
-      this.rebuildBaked(this.latestItems, this.movingStamp.itemId);
+    if (this.transformingItem) {
+      this.rebuildTransformPrefix(
+        this.latestItems,
+        itemId(this.transformingItem),
+      );
       this.renderActive();
     } else {
       this.rebuild(this.latestItems);
@@ -491,7 +648,8 @@ export class OverlayLayers {
 
   private stampIsNeeded(stampId: string): boolean {
     return (
-      this.movingStamp?.stampId === stampId ||
+      (this.transformingItem?.kind === "stamp" &&
+        this.transformingItem.stampId === stampId) ||
       this.latestItems.some(
         (item) => item.kind === "stamp" && item.stampId === stampId,
       )

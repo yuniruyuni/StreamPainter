@@ -50,6 +50,14 @@ function stampPreview(index: number, rebuildBaked: boolean) {
   return { kind: "stamp_preview" as const, stamp: item, rebuildBaked };
 }
 
+function itemPreview(index: number, rebuildBaked: boolean) {
+  return {
+    kind: "item_preview" as const,
+    item: stamp(index),
+    rebuildBaked,
+  };
+}
+
 describe("RenderQueue", () => {
   test("同じstrokeの連続更新は最新1件へ集約する", () => {
     const queue = new RenderQueue();
@@ -119,6 +127,17 @@ describe("RenderQueue", () => {
     queue.enqueue({ kind: "rebuild" });
 
     expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
+  });
+
+  test("同じitemのtransform previewは60fps frameごとに最新1件へ集約する", () => {
+    const queue = new RenderQueue();
+    const first = itemPreview(1, true);
+    const latest = itemPreview(1, false);
+    if (latest.item.kind === "stamp") latest.item.rotation = 0.75;
+    queue.enqueue(first);
+    queue.enqueue(latest);
+
+    expect(queue.drain()).toEqual([{ ...latest, rebuildBaked: true }]);
   });
 
   test("上限を超えた待機効果はrebuild 1件へ畳み込む", () => {

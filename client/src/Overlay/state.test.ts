@@ -4,9 +4,14 @@ import type {
   CanvasItem,
   PaintEvent,
   RevisionedPaintEvent,
+  ServerToOverlayMessage,
   Stroke,
 } from "~/protocol";
-import { MAX_STROKES, PROTOCOL_VERSION } from "~/protocol";
+import {
+  MAX_STROKES,
+  MIN_COMPATIBLE_PROTOCOL_VERSION,
+  PROTOCOL_VERSION,
+} from "~/protocol";
 import { OverlayState } from "./state";
 
 const brush: Brush = {
@@ -60,6 +65,54 @@ describe("OverlayState", () => {
     const state = synchronizedState([strokeItem("s1")], 3);
     expect(state.strokes).toHaveLength(1);
     expect(state.rev).toBe(3);
+  });
+
+  test("v6の筆圧snapshotとtransformなしeventを安全に移行する", () => {
+    const state = new OverlayState();
+    const activeShape: CanvasItem = {
+      kind: "shape",
+      itemId: "shape-v6",
+      shape: "rectangle",
+      style: { color: "#fff", opacity: 1, widthN: 0.01 },
+      start: [0.2, 0.3],
+      end: [0.6, 0.7],
+      done: false,
+      endedAt: null,
+    };
+    const stamp: CanvasItem = {
+      kind: "stamp",
+      itemId: "stamp-v6",
+      stampId: "asset",
+      center: [0.5, 0.5],
+      widthN: 0.1,
+      heightN: 0.2,
+      opacity: 1,
+      done: true,
+      endedAt: 2,
+    };
+
+    expect(
+      state.apply({
+        type: "snapshot",
+        protocolVersion: MIN_COMPATIBLE_PROTOCOL_VERSION,
+        rev: 6,
+        fadeAfterMs: null,
+        items: [strokeItem("stroke-v6"), activeShape, stamp],
+      }).kind,
+    ).toBe("rebuild");
+    expect(state.strokes[0]?.pts[0]).toEqual([0.1, 0.1, 0.5, 0, 0, 0]);
+    expect(state.items[2]).not.toHaveProperty("rotation");
+
+    expect(
+      state.apply({
+        type: "shape_end",
+        rev: 7,
+        itemId: "shape-v6",
+        endedAt: 3,
+      }).kind,
+    ).toBe("bake_item");
+    expect(state.items[1]).toMatchObject({ done: true, endedAt: 3 });
+    expect(state.items[1]).not.toHaveProperty("transform");
   });
 
   test("resetは履歴と同期状態を破棄し、次のsnapshotから復元する", () => {
@@ -182,6 +235,59 @@ describe("OverlayState", () => {
     expect(applyNext(state, { type: "undo" }).kind).toBe("rebuild");
     expect(state.items).toHaveLength(1);
     expect(state.items[0]?.kind).toBe("stroke");
+  });
+
+  test("shape/stamp transform previewを集約しcommitで永続状態へ戻す", () => {
+    const shape: CanvasItem = {
+      kind: "shape",
+      itemId: "shape-1",
+      shape: "rectangle",
+      style: { color: "#fff", opacity: 1, widthN: 0.01 },
+      start: [0.2, 0.2],
+      end: [0.4, 0.4],
+      done: true,
+      endedAt: 1,
+    };
+    const state = synchronizedState([shape]);
+    const firstTransform = {
+      center: [0.5, 0.5] as [number, number],
+      widthN: 0.3,
+      heightN: 0.2,
+      rotation: 0.25,
+    };
+    const first = applyNext(state, {
+      type: "item_transform_preview",
+      itemId: "shape-1",
+      transform: firstTransform,
+    });
+    expect(first).toEqual({
+      kind: "item_preview",
+      item: state.items[0],
+      rebuildBaked: true,
+    });
+
+    const committedTransform = {
+      ...firstTransform,
+      center: [0.7, 0.6] as [number, number],
+      rotation: 0.5,
+    };
+    const second = applyNext(state, {
+      type: "item_transform_preview",
+      itemId: "shape-1",
+      transform: committedTransform,
+    });
+    expect(second.kind).toBe("item_preview");
+    if (second.kind === "item_preview") {
+      expect(second.rebuildBaked).toBe(false);
+    }
+    expect(
+      applyNext(state, {
+        type: "item_transform_commit",
+        itemId: "shape-1",
+        transform: committedTransform,
+      }).kind,
+    ).toBe("rebuild");
+    expect(state.items[0]).toMatchObject({ transform: committedTransform });
   });
 
   test("連続する stamp_move_preview は初回だけbaked再構築し確定時に戻す", () => {
@@ -324,6 +430,59 @@ describe("OverlayState", () => {
         items: [],
       }).kind,
     ).toBe("resync");
+
+    expect(
+      state.apply({
+        type: "snapshot",
+        protocolVersion: MIN_COMPATIBLE_PROTOCOL_VERSION - 1,
+        rev: 1,
+        fadeAfterMs: null,
+        items: [],
+      }).kind,
+    ).toBe("resync");
+  });
+
+  test("snapshot protocolVersionはnumberのsafe integer v6/v7だけを受理する", () => {
+    const invalidVersions: unknown[] = [
+      undefined,
+      String(PROTOCOL_VERSION),
+      { value: PROTOCOL_VERSION },
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      PROTOCOL_VERSION + 0.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ];
+    for (const protocolVersion of invalidVersions) {
+      const state = new OverlayState();
+      const raw = {
+        type: "snapshot",
+        ...(protocolVersion === undefined ? {} : { protocolVersion }),
+        rev: 1,
+        fadeAfterMs: null,
+        items: [],
+      };
+      expect(state.apply(raw as unknown as ServerToOverlayMessage).kind).toBe(
+        "resync",
+      );
+      expect(state.items).toEqual([]);
+      expect(state.rev).toBe(0);
+    }
+
+    for (const protocolVersion of [
+      MIN_COMPATIBLE_PROTOCOL_VERSION,
+      PROTOCOL_VERSION,
+    ]) {
+      const state = new OverlayState();
+      expect(
+        state.apply({
+          type: "snapshot",
+          protocolVersion,
+          rev: 1,
+          fadeAfterMs: null,
+          items: [],
+        }).kind,
+      ).toBe("rebuild");
+    }
   });
 
   test("増分revisionの欠落は再同期を要求する", () => {

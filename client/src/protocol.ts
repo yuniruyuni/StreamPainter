@@ -1,6 +1,7 @@
 // Rust 側 `painter/src/protocol.rs` と JSON 表現を揃えるローカル WS 型。
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
+export const MIN_COMPATIBLE_PROTOCOL_VERSION = 6;
 export const MAX_ITEMS = 500;
 export const MAX_STROKES = MAX_ITEMS;
 export const MAX_TOTAL_POINTS = 200_000;
@@ -40,6 +41,14 @@ export interface Stroke {
 export type Position = [u: number, v: number];
 export type ShapeKind = "line" | "arrow" | "rectangle" | "ellipse";
 
+export interface ItemTransform {
+  center: Position;
+  widthN: number;
+  heightN: number;
+  /** Canvas上の時計回りradian。 */
+  rotation: number;
+}
+
 export interface LineStyle {
   color: string;
   opacity: number;
@@ -52,6 +61,8 @@ export interface ShapeItem {
   style: LineStyle;
   start: Position;
   end: Position;
+  /** v6 snapshotでは未定義。start/endをfallbackとして使う。 */
+  transform?: ItemTransform;
   done: boolean;
   endedAt: number | null;
 }
@@ -62,6 +73,8 @@ export interface StampItem {
   center: Position;
   widthN: number;
   heightN: number;
+  /** v6 snapshotでは未定義（0 radianとして扱う）。 */
+  rotation?: number;
   opacity: number;
   done: boolean;
   endedAt: number | null;
@@ -79,11 +92,26 @@ export type PaintEvent =
   | { type: "stroke_cancel"; strokeId: string }
   | { type: "shape_begin"; shape: ShapeItem }
   | { type: "shape_update"; itemId: string; end: Position }
-  | { type: "shape_end"; itemId: string; endedAt: number }
+  | {
+      type: "shape_end";
+      itemId: string;
+      endedAt: number;
+      transform?: ItemTransform;
+    }
   | { type: "shape_cancel"; itemId: string }
   | { type: "stamp_add"; stamp: StampItem }
   | { type: "stamp_move_preview"; itemId: string; center: Position }
   | { type: "stamp_move"; itemId: string; center: Position }
+  | {
+      type: "item_transform_preview";
+      itemId: string;
+      transform: ItemTransform;
+    }
+  | {
+      type: "item_transform_commit";
+      itemId: string;
+      transform: ItemTransform;
+    }
   | { type: "undo" }
   | { type: "redo"; item: CanvasItem }
   | { type: "clear" };

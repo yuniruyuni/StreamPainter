@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import {
   type CanvasItem,
+  MIN_COMPATIBLE_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
   type ServerToOverlayMessage,
 } from "~/protocol";
@@ -186,7 +187,9 @@ function stampItem(itemId: string): CanvasItem {
 
 function acceptSupportedMessage(message: ServerToOverlayMessage): boolean {
   return (
-    message.type !== "snapshot" || message.protocolVersion === PROTOCOL_VERSION
+    message.type !== "snapshot" ||
+    (message.protocolVersion >= MIN_COMPATIBLE_PROTOCOL_VERSION &&
+      message.protocolVersion <= PROTOCOL_VERSION)
   );
 }
 

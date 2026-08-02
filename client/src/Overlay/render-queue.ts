@@ -1,3 +1,4 @@
+import type { CanvasItem } from "~/protocol";
 import type { RenderEffect } from "./state";
 
 const MAX_PENDING_EFFECTS = 128;
@@ -21,7 +22,7 @@ export class RenderQueue {
     }
     if (this.effects[0]?.kind === "rebuild") {
       // stamp previewはitemsの状態だけでは「移動中の別レイヤー」を復元できない。
-      if (effect.kind === "stamp_preview") {
+      if (effect.kind === "stamp_preview" || effect.kind === "item_preview") {
         this.effects = [{ kind: "rebuild" }, { ...effect, rebuildBaked: true }];
       }
       return;
@@ -48,6 +49,17 @@ export class RenderQueue {
       };
       return;
     }
+    if (
+      effect.kind === "item_preview" &&
+      last?.kind === "item_preview" &&
+      itemId(last.item) === itemId(effect.item)
+    ) {
+      this.effects[this.effects.length - 1] = {
+        ...effect,
+        rebuildBaked: last.rebuildBaked || effect.rebuildBaked,
+      };
+      return;
+    }
 
     this.effects.push(effect);
     if (this.effects.length > MAX_PENDING_EFFECTS) {
@@ -62,4 +74,8 @@ export class RenderQueue {
   clear(): void {
     this.effects = [];
   }
+}
+
+function itemId(item: CanvasItem): string {
+  return item.kind === "stroke" ? item.strokeId : item.itemId;
 }
