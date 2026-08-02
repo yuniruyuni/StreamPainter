@@ -54,6 +54,7 @@ $obsPassword = $null
 $diagnosticMonitor = $null
 $streamPainterAppRoot = $null
 $streamPainterLocalRoot = $null
+$script:smokeOverlayWindowRecord = $null
 
 function Write-SmokeStatus {
     param([Parameter(Mandatory = $true)][string]$Message)
@@ -118,6 +119,7 @@ function Initialize-NativeMethods {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace StreamPainterSmoke
 {
@@ -134,30 +136,75 @@ namespace StreamPainterSmoke
             public int Bottom;
         }
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsWindowVisible(IntPtr hwnd);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool IsIconic(IntPtr hwnd);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern IntPtr FindWindow(string className, string windowName);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int GetClassName(IntPtr hwnd, StringBuilder value, int maxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int GetWindowText(IntPtr hwnd, StringBuilder value, int maxCount);
 
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
         public static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
+
+        public static uint GetWindowStyle(IntPtr hwnd, int index)
+        {
+            return unchecked((uint)GetWindowLongPtr(hwnd, index).ToInt64());
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr GetProcessWindowStation();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr GetThreadDesktop(uint threadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetUserObjectInformationW", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetUserObjectInformationLength(
+            IntPtr handle,
+            int index,
+            IntPtr value,
+            uint length,
+            out uint needed);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetUserObjectInformationW", ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetUserObjectInformationName(
+            IntPtr handle,
+            int index,
+            StringBuilder value,
+            uint length,
+            out uint needed);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint desiredAccess);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseDesktop(IntPtr desktop);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -171,6 +218,214 @@ namespace StreamPainterSmoke
     }
 }
 '@
+}
+
+function Get-UserObjectName {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) {
+        return '<unavailable>'
+    }
+    $needed = [uint32]0
+    [void][StreamPainterSmoke.NativeMethods]::GetUserObjectInformationLength(
+        $Handle,
+        2,
+        [IntPtr]::Zero,
+        0,
+        [ref]$needed
+    )
+    if ($needed -eq 0) {
+        return "<error:$([Runtime.InteropServices.Marshal]::GetLastWin32Error())>"
+    }
+    $buffer = [System.Text.StringBuilder]::new([int]$needed)
+    if (-not [StreamPainterSmoke.NativeMethods]::GetUserObjectInformationName(
+        $Handle,
+        2,
+        $buffer,
+        $needed,
+        [ref]$needed
+    )) {
+        return "<error:$([Runtime.InteropServices.Marshal]::GetLastWin32Error())>"
+    }
+    return $buffer.ToString()
+}
+
+function Get-TopLevelWindowRecords {
+    param(
+        [switch]$IncludeProcessDetails,
+        [uint32]$OwnerProcessId = 0
+    )
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    $processCache = @{}
+    $desktopCache = @{}
+    $resolveDetails = $IncludeProcessDetails.IsPresent
+    $filterProcessId = $OwnerProcessId
+    $callback = [StreamPainterSmoke.NativeMethods+EnumWindowsProc] {
+        param([IntPtr]$window, [IntPtr]$unused)
+
+        $windowProcessId = [uint32]0
+        $threadId = [StreamPainterSmoke.NativeMethods]::GetWindowThreadProcessId(
+            $window,
+            [ref]$windowProcessId
+        )
+        if ($filterProcessId -ne 0 -and $windowProcessId -ne $filterProcessId) {
+            return $true
+        }
+        $classBuffer = [System.Text.StringBuilder]::new(512)
+        [void][StreamPainterSmoke.NativeMethods]::GetClassName(
+            $window,
+            $classBuffer,
+            $classBuffer.Capacity
+        )
+        $titleBuffer = [System.Text.StringBuilder]::new(4096)
+        [void][StreamPainterSmoke.NativeMethods]::GetWindowText(
+            $window,
+            $titleBuffer,
+            $titleBuffer.Capacity
+        )
+        $rect = [StreamPainterSmoke.NativeMethods+Rect]::new()
+        $rectValid = [StreamPainterSmoke.NativeMethods]::GetWindowRect($window, [ref]$rect)
+
+        $processName = ''
+        $sessionId = -1
+        $desktopName = ''
+        if ($resolveDetails) {
+            $processKey = [string]$windowProcessId
+            if (-not $processCache.ContainsKey($processKey)) {
+                try {
+                    $owner = [System.Diagnostics.Process]::GetProcessById([int]$windowProcessId)
+                    try {
+                        $processCache[$processKey] = [pscustomobject]@{
+                            Name = $owner.ProcessName
+                            SessionId = $owner.SessionId
+                        }
+                    }
+                    finally {
+                        $owner.Dispose()
+                    }
+                }
+                catch {
+                    $processCache[$processKey] = [pscustomobject]@{
+                        Name = '<unavailable>'
+                        SessionId = -1
+                    }
+                }
+            }
+            $processName = $processCache[$processKey].Name
+            $sessionId = $processCache[$processKey].SessionId
+
+            $desktopKey = [string]$threadId
+            if (-not $desktopCache.ContainsKey($desktopKey)) {
+                $desktopCache[$desktopKey] = Get-UserObjectName (
+                    [StreamPainterSmoke.NativeMethods]::GetThreadDesktop($threadId)
+                )
+            }
+            $desktopName = $desktopCache[$desktopKey]
+        }
+
+        $records.Add([pscustomobject]@{
+            ZOrder = $records.Count
+            Hwnd = $window.ToInt64()
+            ProcessId = $windowProcessId
+            ProcessName = $processName
+            SessionId = $sessionId
+            ThreadId = $threadId
+            Desktop = $desktopName
+            ClassName = $classBuffer.ToString()
+            Title = $titleBuffer.ToString()
+            Style = [StreamPainterSmoke.NativeMethods]::GetWindowStyle($window, -16)
+            ExtendedStyle = [StreamPainterSmoke.NativeMethods]::GetWindowStyle($window, -20)
+            RectValid = $rectValid
+            Left = $rect.Left
+            Top = $rect.Top
+            Right = $rect.Right
+            Bottom = $rect.Bottom
+            Visible = [StreamPainterSmoke.NativeMethods]::IsWindowVisible($window)
+            Iconic = [StreamPainterSmoke.NativeMethods]::IsIconic($window)
+        })
+        return $true
+    }
+
+    if (-not [StreamPainterSmoke.NativeMethods]::EnumWindows($callback, [IntPtr]::Zero)) {
+        throw "EnumWindows failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    }
+    return $records.ToArray()
+}
+
+function Get-ProcessDiagnosticLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [System.Diagnostics.Process]$Process
+    )
+
+    if ($null -eq $Process) {
+        return "$Label=not_started"
+    }
+    $processId = $Process.Id
+    try {
+        $Process.Refresh()
+        return "$Label pid=$processId session=$($Process.SessionId) exited=$($Process.HasExited) main_hwnd=0x$('{0:X}' -f $Process.MainWindowHandle.ToInt64())"
+    }
+    catch {
+        return "$Label pid=$processId details=<unavailable:$($_.Exception.Message)>"
+    }
+}
+
+function Write-WindowDiagnostics {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $currentProcess = [System.Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $lines.Add("captured_utc=$([DateTimeOffset]::UtcNow.ToString('o'))")
+        $lines.Add("powershell_pid=$PID session=$($currentProcess.SessionId) version=$($PSVersionTable.PSVersion)")
+    }
+    finally {
+        $currentProcess.Dispose()
+    }
+    $lines.Add("user_interactive=$([Environment]::UserInteractive) terminal_server_session=$([System.Windows.Forms.SystemInformation]::TerminalServerSession)")
+    $lines.Add("environment_session_name=$env:SESSIONNAME runner_name=$env:RUNNER_NAME image_os=$env:ImageOS image_version=$env:ImageVersion")
+    $lines.Add("process_window_station=$(Get-UserObjectName ([StreamPainterSmoke.NativeMethods]::GetProcessWindowStation()))")
+    $lines.Add("current_thread_desktop=$(Get-UserObjectName ([StreamPainterSmoke.NativeMethods]::GetThreadDesktop([StreamPainterSmoke.NativeMethods]::GetCurrentThreadId())))")
+
+    $inputDesktop = [StreamPainterSmoke.NativeMethods]::OpenInputDesktop(0, $false, 1)
+    if ($inputDesktop -eq [IntPtr]::Zero) {
+        $lines.Add("input_desktop=<error:$([Runtime.InteropServices.Marshal]::GetLastWin32Error())>")
+    }
+    else {
+        try {
+            $lines.Add("input_desktop=$(Get-UserObjectName $inputDesktop)")
+        }
+        finally {
+            [void][StreamPainterSmoke.NativeMethods]::CloseDesktop($inputDesktop)
+        }
+    }
+
+    $lines.Add((Get-ProcessDiagnosticLine -Label 'stream_painter' -Process $streamPainterProcess))
+    $lines.Add((Get-ProcessDiagnosticLine -Label 'obs' -Process $obsProcess))
+    $foreground = [StreamPainterSmoke.NativeMethods]::GetForegroundWindow()
+    $lines.Add("foreground_hwnd=0x$('{0:X}' -f $foreground.ToInt64())")
+    $lines.Add('enumeration_scope=current window station and desktop')
+    $windows = @(Get-TopLevelWindowRecords -IncludeProcessDetails)
+    if ($null -ne $streamPainterProcess) {
+        $streamPainterId = $streamPainterProcess.Id
+        $ownedCount = @($windows | Where-Object { $_.ProcessId -eq $streamPainterId }).Count
+        $classCount = @(
+            $windows |
+                Where-Object { $_.ClassName -ceq 'stream-painter-overlay' }
+        ).Count
+        $ownedClassCount = @(
+            $windows |
+                Where-Object {
+                    $_.ProcessId -eq $streamPainterId -and
+                        $_.ClassName -ceq 'stream-painter-overlay'
+                }
+        ).Count
+        $lines.Add("stream_painter_owned_top_level_count=$ownedCount overlay_class_count=$classCount owned_overlay_class_count=$ownedClassCount")
+    }
+    $lines.Add((Format-TopLevelWindowDiagnostics -Windows $windows))
+    Write-Utf8NoBom -Path $Path -Content ($lines -join [Environment]::NewLine)
 }
 
 function Send-FunctionKeyF9 {
@@ -649,14 +904,31 @@ width_n = 0.035
 
     $overlayWindow = [IntPtr]::Zero
     Invoke-WaitFor -Description 'StreamPainter overlay window' -TimeoutSeconds 30 -Condition {
-        $scriptWindow = [StreamPainterSmoke.NativeMethods]::FindWindow('stream-painter-overlay', $null)
-        if ($scriptWindow -ne [IntPtr]::Zero) {
-            $script:smokeOverlayWindow = $scriptWindow
+        $streamPainterProcess.Refresh()
+        if ($streamPainterProcess.HasExited) {
+            throw "StreamPainter exited before its overlay appeared (exit code $($streamPainterProcess.ExitCode))"
+        }
+        $windowRecords = @(
+            Get-TopLevelWindowRecords -OwnerProcessId ([uint32]$streamPainterProcess.Id)
+        )
+        $ownedOverlay = Select-StreamPainterOverlayWindowRecord `
+            -Windows $windowRecords `
+            -ProcessId ([uint32]$streamPainterProcess.Id) `
+            -Monitor $diagnosticMonitor
+        if ($null -ne $ownedOverlay) {
+            $script:smokeOverlayWindowRecord = $ownedOverlay
             return $true
         }
         return $false
     }
-    $overlayWindow = $script:smokeOverlayWindow
+    $overlayRecord = $script:smokeOverlayWindowRecord
+    $overlayWindow = [IntPtr]::new([int64]$overlayRecord.Hwnd)
+    Write-SmokeStatus (
+        "Found PID-owned StreamPainter overlay hwnd=0x$('{0:X}' -f $overlayWindow.ToInt64()) " +
+        "class='$($overlayRecord.ClassName)' title='$($overlayRecord.Title)' " +
+        "rect=($($overlayRecord.Left),$($overlayRecord.Top))-($($overlayRecord.Right),$($overlayRecord.Bottom)) " +
+        "visible=$($overlayRecord.Visible)"
+    )
     if (-not (Test-OverlayTransparent -Window $overlayWindow)) {
         throw 'StreamPainter overlay did not start in click-through mode'
     }
@@ -863,11 +1135,23 @@ EnableAutoUpdates=false
     Write-SmokeStatus 'Real OBS smoke test passed'
 }
 catch {
-    Write-SmokeStatus "FAILURE: $($_.Exception.Message)"
+    $failure = $_
+    Write-SmokeStatus "FAILURE: $($failure.Exception.Message)"
     Set-Content `
         -LiteralPath (Join-Path $ArtifactDirectory 'failure.txt') `
-        -Value $_.Exception.ToString() `
+        -Value $failure.Exception.ToString() `
         -Encoding UTF8
+    try {
+        $windowDiagnosticPath = Join-Path $ArtifactDirectory 'window-diagnostics.txt'
+        Write-WindowDiagnostics -Path $windowDiagnosticPath
+        Write-SmokeStatus 'Captured process, desktop, and top-level window diagnostics'
+    }
+    catch {
+        Set-Content `
+            -LiteralPath (Join-Path $ArtifactDirectory 'window-diagnostics-error.txt') `
+            -Value $_.Exception.ToString() `
+            -Encoding UTF8
+    }
     if ($null -ne $diagnosticMonitor) {
         try {
             Save-DesktopScreenshot `
@@ -881,7 +1165,7 @@ catch {
                 -Encoding UTF8
         }
     }
-    throw
+    throw $failure
 }
 finally {
     if ($null -ne $obsConnection) {

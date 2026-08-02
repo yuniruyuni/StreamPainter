@@ -38,6 +38,60 @@ function Assert-Throws {
     throw "$Label`: expected an exception"
 }
 
+function Assert-Contains {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Actual,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    if (-not $Actual.Contains($Expected)) {
+        throw "$Label`: expected '$Expected' in '$Actual'"
+    }
+}
+
+function New-WindowRecord {
+    param(
+        [int64]$Hwnd = 0x222,
+        [uint32]$ProcessId = 4242,
+        [string]$ClassName = 'stream-painter-overlay',
+        [string]$Title = 'StreamPainter',
+        [bool]$Visible = $true,
+        [bool]$Iconic = $false,
+        [bool]$RectValid = $true,
+        [int]$Left = 0,
+        [int]$Top = 0,
+        [int]$Right = 1024,
+        [int]$Bottom = 768
+    )
+
+    return [pscustomobject]@{
+        ZOrder = 0
+        Hwnd = $Hwnd
+        ProcessId = $ProcessId
+        ProcessName = 'stream-painter'
+        SessionId = 1
+        ThreadId = 5252
+        Desktop = 'Default'
+        ClassName = $ClassName
+        Title = $Title
+        Style = [uint32]2214592512
+        ExtendedStyle = [uint32]136839336
+        RectValid = $RectValid
+        Left = $Left
+        Top = $Top
+        Right = $Right
+        Bottom = $Bottom
+        Visible = $Visible
+        Iconic = $Iconic
+    }
+}
+
 $version = '32.2.1'
 $officialUri = [uri]'https://github.com/obsproject/obs-studio/releases/download/32.2.1/OBS-Studio-32.2.1-Windows-x64.zip'
 $officialSha = 'db64a2934f8261f85b1410b84be011207a0afda5400d008289f1f1e211bcc7de'
@@ -70,6 +124,53 @@ Assert-Equal -Label 'pillarbox width' -Actual $pillarbox.Width -Expected 1920
 $letterbox = Get-AspectFitRect -ScreenWidth 1920 -ScreenHeight 1200
 Assert-Equal -Label 'letterbox y' -Actual $letterbox.Y -Expected 60
 Assert-Equal -Label 'letterbox height' -Actual $letterbox.Height -Expected 1080
+
+$monitor = [pscustomobject]@{
+    monitorPositionX = 0
+    monitorPositionY = 0
+    monitorWidth = 1024
+    monitorHeight = 768
+}
+$wrongOwner = New-WindowRecord -Hwnd 0x111 -ProcessId 9999
+$ownedOverlay = New-WindowRecord
+$selected = Select-StreamPainterOverlayWindowRecord `
+    -Windows @($wrongOwner, $ownedOverlay) `
+    -ProcessId 4242 `
+    -Monitor $monitor
+Assert-Equal -Label 'PID-owned overlay selected' -Actual $selected.Hwnd -Expected 0x222
+
+$invalidWindows = @(
+    (New-WindowRecord -Visible $false),
+    (New-WindowRecord -Iconic $true),
+    (New-WindowRecord -ClassName 'not-stream-painter'),
+    (New-WindowRecord -Title 'Not StreamPainter'),
+    (New-WindowRecord -RectValid $false),
+    (New-WindowRecord -Left 10 -Right 1034)
+)
+foreach ($invalidWindow in $invalidWindows) {
+    $invalidSelection = Select-StreamPainterOverlayWindowRecord `
+        -Windows @($invalidWindow) `
+        -ProcessId 4242 `
+        -Monitor $monitor
+    if ($null -ne $invalidSelection) {
+        throw "invalid overlay record was selected: $($invalidWindow | ConvertTo-Json -Compress)"
+    }
+}
+Assert-Throws -Label 'ambiguous PID-owned overlays' -Action {
+    Select-StreamPainterOverlayWindowRecord `
+        -Windows @($ownedOverlay, (New-WindowRecord -Hwnd 0x333)) `
+        -ProcessId 4242 `
+        -Monitor $monitor
+}
+
+$diagnosticRecord = New-WindowRecord -Title "Stream`tPainter`nOverlay"
+$windowDiagnostics = Format-TopLevelWindowDiagnostics -Windows @($diagnosticRecord)
+Assert-Contains -Label 'diagnostic count' -Actual $windowDiagnostics -Expected 'top_level_window_count=1'
+Assert-Contains -Label 'diagnostic PID/session' -Actual $windowDiagnostics -Expected 'pid=4242 session=1'
+Assert-Contains -Label 'diagnostic class' -Actual $windowDiagnostics -Expected 'class="stream-painter-overlay"'
+Assert-Contains -Label 'diagnostic escaped title' -Actual $windowDiagnostics -Expected 'title="Stream\tPainter\nOverlay"'
+Assert-Contains -Label 'diagnostic styles' -Actual $windowDiagnostics -Expected 'style=0x84000000 exstyle=0x082800A8'
+Assert-Contains -Label 'diagnostic rect/visibility' -Actual $windowDiagnostics -Expected 'rect=(0,0)-(1024,768) visible=True iconic=False'
 
 Assert-Equal -Label 'smoke color accepted' `
     -Actual (Test-StreamPainterSmokePixel -Red 255 -Green 77 -Blue 109 -Alpha 255) `

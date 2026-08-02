@@ -59,7 +59,8 @@ OBSの`--safe-mode`はWebSocketも無効にするため使用せず、同梱plug
 
 1. cleanなrunner profileへ通常のStreamPainter設定を書き、release executableを起動する。
 2. `http://127.0.0.1:16873/health` が `200 ok` を返すことを確認する。
-3. 実overlay windowをF9で描画モードにし、Win32入力注入で中央へピンク色の線を描く。
+3. 起動したStreamPainterのPIDが所有し、class / title / 対象monitor矩形 / 可視状態が一致する
+   実overlay windowだけを選び、F9で描画モードにしてWin32入力注入で中央へピンク色の線を描く。
 4. loopback WebSocketへ正しいOriginで接続し、完了済みstrokeを含むsnapshotを確認する。
 5. **この後で初めてOBSを起動する。** 公式zip内のobs-websocketへ認証し、Sceneと実際の
    `browser_source` inputを作成して `http://127.0.0.1:16873/overlay` を読み込ませる。
@@ -87,6 +88,9 @@ obs-websocket requestの意味は公式の
   画素統計を収集する
 - projector表示後または失敗時にdesktop screenshotを試み、desktop capture自体が使えない場合も
   そのエラーをartifactへ残す
+- 失敗時はrunnerのsession / window station / desktopと、現在のdesktop上にある全top-level windowの
+  PID、process名、session、class、title、style、矩形、可視・最小化状態を
+  `window-diagnostics.txt`へ保存する
 
 main scriptはdesktopや既存設定を誤操作しないよう、`GITHUB_ACTIONS=true`でない環境では実行を
 拒否します。ローカルでは副作用のない次のhelper testだけを実行してください。

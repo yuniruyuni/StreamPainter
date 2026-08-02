@@ -96,6 +96,111 @@ function Get-AspectFitRect {
     }
 }
 
+function Select-StreamPainterOverlayWindowRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Windows,
+
+        [Parameter(Mandatory = $true)]
+        [uint32]$ProcessId,
+
+        [Parameter(Mandatory = $true)]
+        $Monitor,
+
+        [ValidateRange(0, 16)]
+        [int]$Tolerance = 2
+    )
+
+    $expectedLeft = [int]$Monitor.monitorPositionX
+    $expectedTop = [int]$Monitor.monitorPositionY
+    $expectedRight = $expectedLeft + [int]$Monitor.monitorWidth
+    $expectedBottom = $expectedTop + [int]$Monitor.monitorHeight
+    $candidates = @(
+        foreach ($window in $Windows) {
+            if ($null -eq $window -or [uint32]$window.ProcessId -ne $ProcessId) {
+                continue
+            }
+            if ([string]$window.ClassName -cne 'stream-painter-overlay' -or
+                [string]$window.Title -cne 'StreamPainter' -or
+                $window.Visible -ne $true -or
+                $window.Iconic -eq $true -or
+                $window.RectValid -ne $true) {
+                continue
+            }
+            if ([Math]::Abs([int]$window.Left - $expectedLeft) -gt $Tolerance -or
+                [Math]::Abs([int]$window.Top - $expectedTop) -gt $Tolerance -or
+                [Math]::Abs([int]$window.Right - $expectedRight) -gt $Tolerance -or
+                [Math]::Abs([int]$window.Bottom - $expectedBottom) -gt $Tolerance) {
+                continue
+            }
+            $window
+        }
+    )
+
+    if ($candidates.Count -gt 1) {
+        $handles = ($candidates | ForEach-Object { '0x{0:X}' -f [int64]$_.Hwnd }) -join ', '
+        throw "Multiple visible StreamPainter overlay windows belong to PID $ProcessId`: $handles"
+    }
+    if ($candidates.Count -eq 1) {
+        return $candidates[0]
+    }
+    return $null
+}
+
+function ConvertTo-DiagnosticText {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+    $text = [string]$Value
+    $text = $text.Replace('\', '\\')
+    $text = $text.Replace("`r", '\r')
+    $text = $text.Replace("`n", '\n')
+    $text = $text.Replace("`t", '\t')
+    return $text.Replace('"', '\"')
+}
+
+function Format-TopLevelWindowDiagnostics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Windows
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("top_level_window_count=$($Windows.Count)")
+    $lines.Add('z_order is the EnumWindows order (zero is nearest the foreground)')
+    foreach ($window in $Windows) {
+        $session = if ([int]$window.SessionId -ge 0) { [string]$window.SessionId } else { '?' }
+        $lines.Add((
+            'z_order={0} hwnd=0x{1:X} pid={2} session={3} process="{4}" thread={5} desktop="{6}" class="{7}" title="{8}" style=0x{9:X8} exstyle=0x{10:X8} rect_valid={11} rect=({12},{13})-({14},{15}) visible={16} iconic={17}' -f
+                [int]$window.ZOrder,
+                [int64]$window.Hwnd,
+                [uint32]$window.ProcessId,
+                $session,
+                (ConvertTo-DiagnosticText $window.ProcessName),
+                [uint32]$window.ThreadId,
+                (ConvertTo-DiagnosticText $window.Desktop),
+                (ConvertTo-DiagnosticText $window.ClassName),
+                (ConvertTo-DiagnosticText $window.Title),
+                [uint32]$window.Style,
+                [uint32]$window.ExtendedStyle,
+                [bool]$window.RectValid,
+                [int]$window.Left,
+                [int]$window.Top,
+                [int]$window.Right,
+                [int]$window.Bottom,
+                [bool]$window.Visible,
+                [bool]$window.Iconic
+        ))
+    }
+    return $lines -join [Environment]::NewLine
+}
+
 function Test-StreamPainterSmokePixel {
     [CmdletBinding()]
     param(
@@ -212,6 +317,8 @@ Export-ModuleMember -Function @(
     'Assert-ObsArchiveIdentity',
     'Get-ObsWebSocketAuthentication',
     'Get-AspectFitRect',
+    'Select-StreamPainterOverlayWindowRecord',
+    'Format-TopLevelWindowDiagnostics',
     'Test-StreamPainterSmokePixel',
     'Get-StreamPainterSmokeImageStatistics',
     'Assert-StreamPainterSmokeImage'
