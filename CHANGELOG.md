@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-03
+
 ### Added
 
 - 選択ツールで最前面の図形／スタンプを選び、専用ハンドルとカーソルで移動・縦横比固定の
@@ -176,7 +178,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.0...v0.5.1
