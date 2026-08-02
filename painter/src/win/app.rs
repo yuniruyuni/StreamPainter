@@ -151,6 +151,19 @@ struct App {
 }
 
 pub fn run() -> Result<()> {
+    match crate::win::autostart::SystemAutostart::current()
+        .and_then(|autostart| autostart.inspect())
+    {
+        Ok(crate::win::autostart::RegistrationStatus::NeedsRepair(problem)) => {
+            warn!(
+                "Windows auto-start registration needs repair: {}; open settings to repair or disable it",
+                problem.description()
+            );
+        }
+        Err(error) => warn!("failed to inspect Windows auto-start registration: {error:#}"),
+        _ => {}
+    }
+
     let config = config::load()?;
     if let Err(error) = config::cleanup_unregistered_stamps(&config) {
         warn!("failed to clean unregistered stamps: {error:#}");

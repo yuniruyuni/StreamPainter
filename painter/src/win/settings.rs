@@ -1,5 +1,5 @@
 //! タスクトレイから開くネイティブ設定画面。
-//! 保存内容は config.toml に反映し、hotkeyだけは実行中の登録へtransactionalに反映する。
+//! 保存内容はconfig.tomlへ反映し、hotkeyとWindows自動起動は外部登録へtransactionalに反映する。
 
 #![allow(clippy::too_many_arguments)]
 
@@ -26,7 +26,8 @@ use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_TAB,
+    EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN,
+    VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDesktopWindow, GetDlgItem,
@@ -52,6 +53,7 @@ use crate::net::local_server::{
     LocalServerDiagnostics, LocalServerDiagnosticsSnapshot, LocalServerDiagnosticsSubscription,
     LocalServerReachability,
 };
+use crate::win::autostart::{PreparedAutostartChange, RegistrationStatus, SystemAutostart};
 use crate::win::hotkey::{self, ChangeCommand, ProbeRegistration};
 use crate::win::monitor::{self, Monitor};
 
@@ -84,10 +86,76 @@ const ID_BROWSER_STATUS: i32 = 121;
 const ID_HOTKEY_CAPTURE: i32 = 122;
 const ID_HOTKEY_CLEAR: i32 = 123;
 const ID_HOTKEY_DEFAULT: i32 = 124;
+const ID_AUTOSTART: i32 = 125;
+const ID_AUTOSTART_STATUS: i32 = 126;
 
 const WM_DIAGNOSTICS_CHANGED: u32 = WM_APP + 1;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
+
+enum AutostartUi {
+    Available {
+        controller: SystemAutostart,
+        status: RegistrationStatus,
+    },
+    Unavailable,
+}
+
+impl AutostartUi {
+    fn load() -> Self {
+        let result = SystemAutostart::current().and_then(|controller| {
+            controller
+                .inspect()
+                .map(|status| Self::Available { controller, status })
+        });
+        match result {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!("Windows auto-start state is unavailable: {error:#}");
+                Self::Unavailable
+            }
+        }
+    }
+
+    fn is_registered(&self) -> bool {
+        match self {
+            Self::Available { status, .. } => status.is_registered(),
+            Self::Unavailable => false,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+
+    fn status_text(&self) -> String {
+        match self {
+            Self::Available {
+                status: RegistrationStatus::Disabled,
+                ..
+            } => "Windows自動起動: OFF（登録なし）".to_owned(),
+            Self::Available {
+                status: RegistrationStatus::Enabled,
+                ..
+            } => "Windows自動起動: ON（現在のexeを通常モードで起動）".to_owned(),
+            Self::Available {
+                status: RegistrationStatus::NeedsRepair(problem),
+                ..
+            } => format!(
+                "Windows自動起動: 登録あり・修復が必要（{}）",
+                problem.description()
+            ),
+            Self::Unavailable => "Windows自動起動: 状態を取得できません（変更しません）".to_owned(),
+        }
+    }
+
+    fn controller(&self) -> Option<&SystemAutostart> {
+        match self {
+            Self::Available { controller, .. } => Some(controller),
+            Self::Unavailable => None,
+        }
+    }
+}
 
 struct SettingsState {
     /// Someなら起動中overlayへhotkey変更をtransactionalに反映する。
@@ -99,6 +167,8 @@ struct SettingsState {
     selected_stamp: Option<usize>,
     new_stamp_files: Vec<PathBuf>,
     hotkey: HotkeyConfig,
+    /// config.tomlではなく、Windows上の実登録から毎回初期化する。
+    autostart: AutostartUi,
     saved: bool,
     diagnostics: Option<LocalServerDiagnostics>,
     _diagnostics_subscription: Option<LocalServerDiagnosticsSubscription>,
@@ -289,7 +359,7 @@ fn open_internal(
 
         let dpi = GetDpiForWindow(owner).max(96);
         let window_width = scale(680, dpi);
-        let window_height = scale(860, dpi);
+        let window_height = scale(900, dpi);
         let mut owner_rect = RECT::default();
         let (x, y) = if GetWindowRect(owner, &mut owner_rect).is_ok() {
             (
@@ -326,6 +396,7 @@ fn open_internal(
             selected_stamp: None,
             new_stamp_files: Vec::new(),
             hotkey: config.hotkey.clone(),
+            autostart: AutostartUi::load(),
             saved: false,
             diagnostics,
             _diagnostics_subscription: None,
@@ -845,17 +916,32 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             s(620),
             row_height,
         )?;
-        create_label(
+        let autostart_checkbox = create_checkbox(
             hwnd,
             font,
-            concat!(
-                "保存した設定は StreamPainter の再起動後に反映されます。\n",
-                "ポートを変えた場合は、OBS Browser Source のURLも上記URLへ変更してください。"
+            ID_AUTOSTART,
+            "Windowsログイン時にStreamPainterを自動起動する（現在のユーザー）",
+            state.autostart.is_registered(),
+            label_x,
+            s(732),
+            s(620),
+            row_height,
+        )?;
+        if !state.autostart.is_available() {
+            let _ = EnableWindow(autostart_checkbox, false);
+        }
+        create_label_with_id(
+            hwnd,
+            font,
+            ID_AUTOSTART_STATUS,
+            &format!(
+                "{}\n登録が古い場合はONのまま保存で現在のexeへ修復、OFFで解除します。\nその他の設定は再起動後に反映します。ポート変更時はOBSのURLも更新してください。",
+                state.autostart.status_text()
             ),
             label_x,
-            s(730),
+            s(756),
             s(620),
-            s(48),
+            s(62),
         )?;
 
         create_button(
@@ -864,7 +950,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_SAVE,
             "保存",
             s(430),
-            s(790),
+            s(820),
             s(100),
             s(32),
             true,
@@ -875,7 +961,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_CANCEL,
             "キャンセル",
             s(540),
-            s(790),
+            s(820),
             s(100),
             s(32),
             false,
@@ -1578,10 +1664,15 @@ impl Drop for PreparedHotkeyChange {
     }
 }
 
-fn save_with_hotkey_transaction(
+fn rollback_autostart(change: &mut Option<PreparedAutostartChange>) -> Option<anyhow::Error> {
+    change.as_mut().and_then(|change| change.rollback().err())
+}
+
+fn save_with_transactions(
     hwnd: HWND,
     state: &mut SettingsState,
     config: &Config,
+    autostart_enabled: bool,
 ) -> Result<()> {
     let mut hotkey_change = PreparedHotkeyChange::prepare(
         state.live_owner,
@@ -1589,8 +1680,16 @@ fn save_with_hotkey_transaction(
         &state.original_config.hotkey,
         &config.hotkey,
     )?;
+    // Registry値を先に更新するが、config/hotkey確定までは元の生値を保持する。
+    // REG_SZ以外の壊れた値を修復した場合も、後続失敗時は型とdataをそのまま戻す。
+    let mut autostart_change = state
+        .autostart
+        .controller()
+        .map(|controller| controller.prepare(autostart_enabled))
+        .transpose()?;
     if let Err(save_error) = config::save(config) {
         let hotkey_rollback = hotkey_change.rollback().err();
+        let autostart_rollback = rollback_autostart(&mut autostart_change);
         // 保護資格情報の更新失敗など、設定ファイルcommit後に失敗する経路もあるため、
         // 読み込み時の内容へbest-effortで戻す。
         let config_rollback = config::save(&state.original_config).err();
@@ -1600,6 +1699,11 @@ fn save_with_hotkey_transaction(
                 "\nホットキー登録の復元にも失敗しました: {error:#}"
             ));
         }
+        if let Some(error) = autostart_rollback {
+            detail.push_str(&format!(
+                "\nWindows自動起動登録の復元にも失敗しました: {error:#}"
+            ));
+        }
         if let Some(error) = config_rollback {
             detail.push_str(&format!("\n設定ファイルの復元にも失敗しました: {error:#}"));
         }
@@ -1607,6 +1711,7 @@ fn save_with_hotkey_transaction(
     }
     if let Err(commit_error) = hotkey_change.commit() {
         let hotkey_rollback = hotkey_change.rollback().err();
+        let autostart_rollback = rollback_autostart(&mut autostart_change);
         let config_rollback = config::save(&state.original_config).err();
         let mut detail = format!("保存後のホットキー変更を確定できませんでした: {commit_error:#}");
         if let Some(error) = hotkey_rollback {
@@ -1614,10 +1719,18 @@ fn save_with_hotkey_transaction(
                 "\nホットキー登録の復元にも失敗しました: {error:#}"
             ));
         }
+        if let Some(error) = autostart_rollback {
+            detail.push_str(&format!(
+                "\nWindows自動起動登録の復元にも失敗しました: {error:#}"
+            ));
+        }
         if let Some(error) = config_rollback {
             detail.push_str(&format!("\n設定ファイルの復元にも失敗しました: {error:#}"));
         }
         anyhow::bail!(detail);
+    }
+    if let Some(change) = autostart_change.as_mut() {
+        change.commit();
     }
     Ok(())
 }
@@ -1727,18 +1840,22 @@ unsafe extern "system" fn window_proc(
                         .ok_or_else(|| anyhow!("設定画面の状態がありません"))
                         .and_then(|state| {
                             let config = read_config(hwnd, state)?;
-                            save_with_hotkey_transaction(hwnd, state, &config)?;
+                            let autostart_enabled = checked(hwnd, ID_AUTOSTART)?;
+                            save_with_transactions(hwnd, state, &config, autostart_enabled)?;
                             let live_hotkey = state.live_owner.is_some();
+                            let autostart_available = state.autostart.is_available();
                             state.saved = true;
-                            Ok(live_hotkey)
+                            Ok((live_hotkey, autostart_available))
                         })
                 };
                 match result {
-                    Ok(live_hotkey) => unsafe {
-                        let message = if live_hotkey {
-                            "設定を保存しました。\nホットキーはすぐに反映されます。その他の設定は再起動すると反映されます。"
+                    Ok((live_hotkey, autostart_available)) => unsafe {
+                        let message = if !autostart_available {
+                            "設定を保存しました。\nWindows自動起動は状態を取得できなかったため変更していません。その他の設定は再起動すると反映されます。"
+                        } else if live_hotkey {
+                            "設定を保存しました。\nホットキーとWindows自動起動はすぐに反映されます。その他の設定は再起動すると反映されます。"
                         } else {
-                            "設定を保存しました。\n--settingsで変更したホットキーを含め、StreamPainterの再起動後に反映されます。"
+                            "設定を保存しました。\nWindows自動起動はすぐに反映されます。--settingsで変更したホットキーを含むその他の設定は再起動後に反映されます。"
                         };
                         MessageBoxW(
                             Some(hwnd),
