@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-03
+
 ### Added
 
 - SignPath Foundation承認後にだけ有効化するfail-closedなWindowsコード署名scaffoldと、
@@ -15,6 +17,11 @@
 
 - Windows Release workflowをbuild、署名またはunsigned確定、publishへ分離。外部承認前は
   `SIGNPATH_ENABLED`を設定せず、従来どおりunsigned配布を維持
+
+### Fixed
+
+- PowerShell 7で期待したSignTool失敗の終了コードが署名helper test成功後にも残り、
+  Windows workflowを誤って失敗させる問題を修正
 
 ## [0.6.0] - 2026-08-03
 
@@ -156,7 +163,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.4.0...v0.5.0
