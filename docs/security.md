@@ -25,6 +25,8 @@
 - Browser Sourceから受け付けるアプリメッセージは`ping`だけ
 - 受信WebSocket frameは4 KiBに制限する
 - 遅い接続の送信queueを制限し、UIスレッドへのbackpressureを防ぐ
+- OBS WebSocketパスワードはconfigとそのbackupへserializeせず、Windows資格情報マネージャーの
+  現在ユーザー用Generic credentialに保存する
 
 loopback構成ではBearer tokenは秘密になりにくく、配布・更新も複雑にするため採用しません。
 ブラウザ経由の攻撃はOrigin検証、LAN経由の攻撃はbind先とHost検証で遮断します。
@@ -33,6 +35,10 @@ loopback構成ではBearer tokenは秘密になりにくく、配布・更新も
 
 Windows Firewallで外部受信規則を作る必要はありません。もし実行時に公開ネットワーク向けの
 Firewall許可を求められた場合は拒否して構いません。
+
+設定ファイルや配布exeのコピーにはOBS WebSocketパスワードが含まれません。別PC・別ユーザーへの
+移行時はパスワードを再入力します。同じWindowsユーザー権限で動くプロセスによる資格情報の取得は
+上記のthreat modelどおり防御対象外です。
 
 他端末からoverlayを見る用途が必要になった場合、listenerを公開するのではなく、認証・TLS・
 rate limitを備えた別製品のrelayとして設計してください。

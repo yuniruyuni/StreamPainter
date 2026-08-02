@@ -1,6 +1,7 @@
 //! 設定ファイル。%APPDATA%/StreamPainter/config/config.toml
 
 use std::{
+    fmt,
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -12,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use tracing::warn;
 
+use crate::credential::{CredentialStore, SystemCredentialStore, MAX_OBS_PASSWORD_BYTES};
+
 pub const MAX_STAMPS: usize = 32;
 pub const MAX_STAMP_FILE_BYTES: u64 = 5 * 1024 * 1024;
 pub const MAX_STAMP_DIMENSION: u32 = 2048;
@@ -19,7 +22,7 @@ pub const MAX_STAMP_PIXELS: u64 = 4_194_304;
 /// 全スタンプをRGBAへ展開した場合に約64 MiBとなる上限。
 pub const MAX_TOTAL_STAMP_PIXELS: u64 = 16_777_216;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// OBS Browser Source を配信する loopback HTTP サーバーのポート
     #[serde(default = "default_local_server_port")]
@@ -39,7 +42,8 @@ pub struct Config {
     pub obs_control: bool,
     #[serde(default = "default_obs_url")]
     pub obs_websocket_url: String,
-    #[serde(default)]
+    /// 実行時だけ保持する。旧版の平文を読み込めるが、設定ファイルへは絶対に書き戻さない。
+    #[serde(default, skip_serializing)]
     pub obs_websocket_password: String,
     /// "program" (視聴者に見えている映像) | "preview" (スタジオモードの編集側)
     #[serde(default = "default_projector_view")]
@@ -52,6 +56,26 @@ pub struct Config {
     /// 管理ディレクトリ内の PNG スタンプ。外部パスや URL は保持しない。
     #[serde(default)]
     pub stamps: Vec<StampConfig>,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("local_server_port", &self.local_server_port)
+            .field("screen", &self.screen)
+            .field("canvas_aspect", &self.canvas_aspect)
+            .field("local_echo", &self.local_echo)
+            .field("follow_projector", &self.follow_projector)
+            .field("obs_control", &self.obs_control)
+            .field("obs_websocket_url", &self.obs_websocket_url)
+            .field("obs_websocket_password", &"[REDACTED]")
+            .field("projector_view", &self.projector_view)
+            .field("close_projector", &self.close_projector)
+            .field("brush", &self.brush)
+            .field("stamps", &self.stamps)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,7 +178,8 @@ follow_projector = true
 # F9 でプロジェクターが未表示なら自動で開く
 obs_control = true
 obs_websocket_url = "ws://localhost:4455"
-obs_websocket_password = ""
+# パスワードはWindows資格情報マネージャーへユーザー単位で保存します。
+# タスクトレイの「設定...」から入力してください。
 # "program" = 視聴者に見えている映像 / "preview" = スタジオモードの編集側
 projector_view = "program"
 # 描画モード終了時に、F9 で自動で開いたプロジェクターを閉じる
@@ -206,8 +231,10 @@ fn backup_path(path: &Path) -> Result<PathBuf> {
 fn read_validated_config(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
+    // toml の構文エラーは入力行を含み得る。旧版の平文パスワードをログへ出さないため、
+    // parser の詳細は error chain へ載せない。
     let config: Config =
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        toml::from_str(&text).map_err(|_| anyhow!("failed to parse {}", path.display()))?;
     config
         .validate()
         .with_context(|| format!("invalid configuration in {}", path.display()))?;
@@ -584,6 +611,142 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     write_atomically_with_ops(path, contents, &SystemConfigFileOps)
 }
 
+const LEGACY_PASSWORD_FIELD: &[u8] = b"obs_websocket_password";
+
+fn line_defines_legacy_password(line: &[u8]) -> bool {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let line = &line[line
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(line.len())..];
+    for key in [
+        LEGACY_PASSWORD_FIELD,
+        b"\"obs_websocket_password\"",
+        b"'obs_websocket_password'",
+    ] {
+        if let Some(remainder) = line.strip_prefix(key) {
+            return remainder
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace())
+                == Some(b'=');
+        }
+    }
+    false
+}
+
+fn file_contains_legacy_password_field(path: &Path) -> Result<bool> {
+    match std::fs::read(path) {
+        Ok(contents) => Ok(contents
+            .split(|byte| *byte == b'\n')
+            .any(line_defines_legacy_password)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn config_files_contain_legacy_password(path: &Path) -> Result<bool> {
+    Ok(file_contains_legacy_password_field(path)?
+        || file_contains_legacy_password_field(&backup_path(path)?)?)
+}
+
+fn serialized_config(config: &Config) -> Result<Vec<u8>> {
+    let body = toml::to_string_pretty(config).context("failed to serialize configuration")?;
+    Ok(
+        format!("# StreamPainter 設定 — 通常はタスクトレイの「設定...」から編集します。\n{body}")
+            .into_bytes(),
+    )
+}
+
+/// primary を安全な内容へ置換した直後の backup は旧 primary なので、旧パスワード field が
+/// 残る場合だけ同じ内容をもう一度 commit して primary / backup の両方を洗浄する。
+fn write_config_without_secret_with_ops<O: ConfigFileOps>(
+    path: &Path,
+    config: &Config,
+    ops: &O,
+) -> Result<()> {
+    let contents = serialized_config(config)?;
+    write_atomically_with_ops(path, &contents, ops)?;
+    if config_files_contain_legacy_password(path)? {
+        write_atomically_with_ops(path, &contents, ops)?;
+    }
+    if config_files_contain_legacy_password(path)? {
+        anyhow::bail!("設定ファイルから旧形式の資格情報を除去できません");
+    }
+    Ok(())
+}
+
+fn load_config_with_store_and_ops<S: CredentialStore, O: ConfigFileOps>(
+    path: &Path,
+    store: &S,
+    ops: &O,
+) -> Result<Config> {
+    let mut config = load_config_file(path)?;
+    let legacy_password = std::mem::take(&mut config.obs_websocket_password);
+    let protected_password = store
+        .read_obs_password()
+        .context("OBS WebSocketの保護資格情報を読み込めません")?;
+
+    // 既に保護済みならそちらを正とする。初回移行時だけ保護ストレージへの成功を確認して
+    // から平文ファイルを洗浄するため、途中障害でも利用可能な資格情報を失わない。
+    let password = match protected_password {
+        Some(password) => password,
+        None if !legacy_password.is_empty() => {
+            store
+                .write_obs_password(&legacy_password)
+                .context("OBS WebSocket資格情報を保護ストレージへ移行できません")?;
+            legacy_password
+        }
+        None => String::new(),
+    };
+
+    if config_files_contain_legacy_password(path)? {
+        write_config_without_secret_with_ops(path, &config, ops)
+            .context("設定ファイルの平文資格情報を除去できません")?;
+    }
+    config.obs_websocket_password = password;
+    Ok(config)
+}
+
+fn save_config_with_store_and_ops<S: CredentialStore, O: ConfigFileOps>(
+    path: &Path,
+    config: &Config,
+    store: &S,
+    ops: &O,
+) -> Result<()> {
+    config.validate()?;
+    // read が失敗した場合は設定ファイルにも触れない。更新・削除は安全な設定ファイルを
+    // commit した後に行い、保護ストレージ側の失敗時はその契約により旧値が残る。
+    let previous_password = store
+        .read_obs_password()
+        .context("OBS WebSocketの保護資格情報を読み込めません")?;
+    write_config_without_secret_with_ops(path, config, ops)?;
+
+    if config.obs_websocket_password.is_empty() {
+        if previous_password.is_some() {
+            store
+                .delete_obs_password()
+                .context("OBS WebSocketの保護資格情報を削除できません")?;
+        }
+    } else if previous_password.as_deref() != Some(config.obs_websocket_password.as_str()) {
+        store
+            .write_obs_password(&config.obs_websocket_password)
+            .context("OBS WebSocketの保護資格情報を更新できません")?;
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn scrub_legacy_config_source_with_ops<O: ConfigFileOps>(path: &Path, ops: &O) -> Result<()> {
+    if !config_files_contain_legacy_password(path)? {
+        return Ok(());
+    }
+    let mut legacy = load_config_file(path)?;
+    legacy.obs_websocket_password.clear();
+    write_config_without_secret_with_ops(path, &legacy, ops)
+        .context("旧設定ファイルの平文資格情報を除去できません")
+}
+
 #[cfg(windows)]
 pub fn config_path() -> Result<PathBuf> {
     use known_folders::{get_known_folder_path, KnownFolder};
@@ -755,20 +918,25 @@ pub fn load() -> Result<Config> {
     }
     if !path.exists() {
         write_atomically(&path, TEMPLATE.as_bytes())?;
-        return Ok(Config::default());
     }
-    load_config_file(&path)
+    let config =
+        load_config_with_store_and_ops(&path, &SystemCredentialStore, &SystemConfigFileOps)?;
+    #[cfg(windows)]
+    {
+        // 名称移行元を残す場合も、保護ストレージへの移行成功後は旧 primary / backup から
+        // 平文だけを除去する。毎回確認するので途中障害後の次回起動でも再試行できる。
+        let legacy_path = legacy_config_path()?;
+        if legacy_path.exists() {
+            scrub_legacy_config_source_with_ops(&legacy_path, &SystemConfigFileOps)?;
+        }
+    }
+    Ok(config)
 }
 
 /// 検証済みの設定を保存する。設定画面からの書き込み経路はここに集約する。
 pub fn save(config: &Config) -> Result<()> {
-    config.validate()?;
     let path = config_path()?;
-    let body = toml::to_string_pretty(config).context("failed to serialize configuration")?;
-    let text =
-        format!("# StreamPainter 設定 — 通常はタスクトレイの「設定...」から編集します。\n{body}");
-    write_atomically(&path, text.as_bytes())?;
-    Ok(())
+    save_config_with_store_and_ops(&path, config, &SystemCredentialStore, &SystemConfigFileOps)
 }
 
 impl Config {
@@ -801,6 +969,9 @@ impl Config {
             && !self.obs_websocket_url.starts_with("wss://")
         {
             anyhow::bail!("OBS WebSocket URL は ws:// または wss:// で始めてください");
+        }
+        if self.obs_websocket_password.len() > MAX_OBS_PASSWORD_BYTES {
+            anyhow::bail!("OBS WebSocket パスワードが長すぎます");
         }
         if !matches!(self.projector_view.as_str(), "program" | "preview") {
             anyhow::bail!("プロジェクター表示は program または preview を指定してください");
@@ -916,7 +1087,70 @@ pub fn cleanup_unregistered_stamps(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CredentialFailure {
+        Read,
+        Write,
+        Delete,
+    }
+
+    struct FakeCredentialStore {
+        password: RefCell<Option<String>>,
+        failure: Option<CredentialFailure>,
+        writes: Cell<usize>,
+        deletes: Cell<usize>,
+    }
+
+    impl FakeCredentialStore {
+        fn new(password: Option<&str>) -> Self {
+            Self {
+                password: RefCell::new(password.map(str::to_owned)),
+                failure: None,
+                writes: Cell::new(0),
+                deletes: Cell::new(0),
+            }
+        }
+
+        fn failing(password: Option<&str>, failure: CredentialFailure) -> Self {
+            Self {
+                failure: Some(failure),
+                ..Self::new(password)
+            }
+        }
+
+        fn value(&self) -> Option<String> {
+            self.password.borrow().clone()
+        }
+    }
+
+    impl CredentialStore for FakeCredentialStore {
+        fn read_obs_password(&self) -> Result<Option<String>> {
+            if self.failure == Some(CredentialFailure::Read) {
+                anyhow::bail!("injected credential read failure");
+            }
+            Ok(self.value())
+        }
+
+        fn write_obs_password(&self, password: &str) -> Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            if self.failure == Some(CredentialFailure::Write) {
+                anyhow::bail!("injected credential write failure");
+            }
+            *self.password.borrow_mut() = Some(password.to_owned());
+            Ok(())
+        }
+
+        fn delete_obs_password(&self) -> Result<()> {
+            self.deletes.set(self.deletes.get() + 1);
+            if self.failure == Some(CredentialFailure::Delete) {
+                anyhow::bail!("injected credential delete failure");
+            }
+            *self.password.borrow_mut() = None;
+            Ok(())
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SaveFailure {
@@ -934,6 +1168,51 @@ mod tests {
     struct InjectedConfigFileOps {
         failure: SaveFailure,
         fired: Cell<bool>,
+    }
+
+    struct FailOnSecondBackupPromotion {
+        backup_promotions: Cell<usize>,
+    }
+
+    impl FailOnSecondBackupPromotion {
+        fn new() -> Self {
+            Self {
+                backup_promotions: Cell::new(0),
+            }
+        }
+    }
+
+    impl ConfigFileOps for FailOnSecondBackupPromotion {
+        fn write_synced(&self, path: &Path, contents: &[u8]) -> Result<()> {
+            SystemConfigFileOps.write_synced(path, contents)
+        }
+
+        fn copy_synced(&self, source: &Path, destination: &Path) -> Result<()> {
+            SystemConfigFileOps.copy_synced(source, destination)
+        }
+
+        fn replace_file(&self, replacement: &Path, destination: &Path) -> Result<()> {
+            let is_backup = destination
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".bak"));
+            if is_backup {
+                let promotion = self.backup_promotions.get() + 1;
+                self.backup_promotions.set(promotion);
+                if promotion == 2 {
+                    SystemConfigFileOps.replace_file(replacement, destination)?;
+                    anyhow::bail!("injected failure after second backup promotion");
+                }
+            }
+            SystemConfigFileOps.replace_file(replacement, destination)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<()> {
+            SystemConfigFileOps.remove_file(path)
+        }
+
+        fn sync_parent(&self, path: &Path) -> Result<()> {
+            SystemConfigFileOps.sync_parent(path)
+        }
     }
 
     impl InjectedConfigFileOps {
@@ -1176,6 +1455,326 @@ local_server_port = 18080
     }
 
     #[test]
+    fn password_deserializes_for_migration_but_never_serializes_or_debugs() {
+        let secret = "do-not-print-this-secret";
+        let config: Config = toml::from_str(&format!(
+            "obs_websocket_password = {secret:?}\nlocal_server_port = 16873\n"
+        ))
+        .unwrap();
+        assert_eq!(config.obs_websocket_password, secret);
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let debug = format!("{config:?}");
+        assert!(!serialized.contains("obs_websocket_password"));
+        assert!(!serialized.contains(secret));
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn legacy_password_detection_only_matches_a_top_level_assignment_line() {
+        assert!(line_defines_legacy_password(
+            b"  obs_websocket_password = \"secret\""
+        ));
+        assert!(line_defines_legacy_password(
+            b"\"obs_websocket_password\"=\"secret\""
+        ));
+        assert!(!line_defines_legacy_password(
+            b"name = \"obs_websocket_password\""
+        ));
+        assert!(!line_defines_legacy_password(
+            b"# obs_websocket_password = \"secret\""
+        ));
+    }
+
+    fn legacy_config_text(secret: &str) -> String {
+        format!(
+            "local_server_port = 16873\nobs_websocket_password = {secret:?}\nprojector_view = \"program\"\n"
+        )
+    }
+
+    fn clean_config_text() -> Vec<u8> {
+        serialized_config(&Config::default()).unwrap()
+    }
+
+    fn new_config_directory(prefix: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::now_v7()));
+        let path = directory.join("config.toml");
+        let backup = backup_path(&path).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        (directory, path, backup)
+    }
+
+    fn assert_no_secret_in_config_files(path: &Path, secrets: &[&str]) {
+        for file in [path.to_path_buf(), backup_path(path).unwrap()] {
+            if !file.exists() {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&file).unwrap();
+            assert!(!contents.contains("obs_websocket_password"), "{file:?}");
+            for secret in secrets {
+                assert!(!contents.contains(secret), "{file:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plaintext_migration_writes_credential_then_scrubs_primary_and_backup() {
+        let secret = "legacy-secret-for-migration";
+        let (directory, path, backup) = new_config_directory("stream-painter-credential-migrate");
+        std::fs::write(&path, legacy_config_text(secret)).unwrap();
+        std::fs::write(&backup, legacy_config_text("older-backup-secret")).unwrap();
+        let store = FakeCredentialStore::new(None);
+
+        let loaded = load_config_with_store_and_ops(&path, &store, &SystemConfigFileOps).unwrap();
+
+        assert_eq!(loaded.obs_websocket_password, secret);
+        assert_eq!(store.value().as_deref(), Some(secret));
+        assert_eq!(store.writes.get(), 1);
+        assert_no_secret_in_config_files(&path, &[secret, "older-backup-secret"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn credential_read_takes_precedence_over_stale_plaintext() {
+        let (directory, path, backup) = new_config_directory("stream-painter-credential-read");
+        std::fs::write(&path, legacy_config_text("stale-plaintext")).unwrap();
+        std::fs::write(&backup, legacy_config_text("older-plaintext")).unwrap();
+        let store = FakeCredentialStore::new(Some("protected-current"));
+
+        let loaded = load_config_with_store_and_ops(&path, &store, &SystemConfigFileOps).unwrap();
+
+        assert_eq!(loaded.obs_websocket_password, "protected-current");
+        assert_eq!(store.writes.get(), 0);
+        assert_no_secret_in_config_files(&path, &["stale-plaintext", "older-plaintext"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn renamed_legacy_source_is_scrubbed_in_both_generations() {
+        let (directory, path, backup) = new_config_directory("stream-painter-old-name-credential");
+        std::fs::write(&path, legacy_config_text("legacy-source-primary")).unwrap();
+        std::fs::write(&backup, legacy_config_text("legacy-source-backup")).unwrap();
+
+        scrub_legacy_config_source_with_ops(&path, &SystemConfigFileOps).unwrap();
+
+        assert_no_secret_in_config_files(&path, &["legacy-source-primary", "legacy-source-backup"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_write_failure_keeps_plaintext_and_does_not_leak_it_in_error() {
+        let secret = "migration-write-failure-secret";
+        let (directory, path, backup) =
+            new_config_directory("stream-painter-credential-migrate-write-fail");
+        let primary = legacy_config_text(secret);
+        let previous_backup = legacy_config_text("backup-secret");
+        std::fs::write(&path, &primary).unwrap();
+        std::fs::write(&backup, &previous_backup).unwrap();
+        let store = FakeCredentialStore::failing(None, CredentialFailure::Write);
+
+        let error =
+            load_config_with_store_and_ops(&path, &store, &SystemConfigFileOps).unwrap_err();
+
+        assert!(!format!("{error:#}").contains(secret));
+        assert_eq!(store.value(), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), primary);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), previous_backup);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn interrupted_migration_retains_credential_and_is_idempotent_on_retry() {
+        let secret = "migration-retry-secret";
+        let (directory, path, backup) =
+            new_config_directory("stream-painter-credential-migrate-retry");
+        let primary = legacy_config_text(secret);
+        let previous_backup = legacy_config_text("backup-retry-secret");
+        std::fs::write(&path, &primary).unwrap();
+        std::fs::write(&backup, &previous_backup).unwrap();
+        let store = FakeCredentialStore::new(None);
+        let failing_ops = InjectedConfigFileOps::new(SaveFailure::PromoteBackupAfter);
+
+        let error = load_config_with_store_and_ops(&path, &store, &failing_ops).unwrap_err();
+
+        assert!(!format!("{error:#}").contains(secret));
+        assert_eq!(store.value().as_deref(), Some(secret));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), primary);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), previous_backup);
+
+        let loaded = load_config_with_store_and_ops(&path, &store, &SystemConfigFileOps).unwrap();
+        assert_eq!(loaded.obs_websocket_password, secret);
+        assert_eq!(store.writes.get(), 1);
+        assert_no_secret_in_config_files(&path, &[secret, "backup-retry-secret"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failure_during_backup_scrub_keeps_credential_and_retries_safely() {
+        let secret = "second-pass-migration-secret";
+        let (directory, path, backup) =
+            new_config_directory("stream-painter-credential-second-pass");
+        std::fs::write(&path, legacy_config_text(secret)).unwrap();
+        std::fs::write(&backup, legacy_config_text("second-pass-backup-secret")).unwrap();
+        let store = FakeCredentialStore::new(None);
+        let failing_ops = FailOnSecondBackupPromotion::new();
+
+        let error = load_config_with_store_and_ops(&path, &store, &failing_ops).unwrap_err();
+
+        assert!(!format!("{error:#}").contains(secret));
+        assert_eq!(store.value().as_deref(), Some(secret));
+        assert!(!file_contains_legacy_password_field(&path).unwrap());
+        assert!(file_contains_legacy_password_field(&backup).unwrap());
+
+        let loaded = load_config_with_store_and_ops(&path, &store, &SystemConfigFileOps).unwrap();
+        assert_eq!(loaded.obs_websocket_password, secret);
+        assert_eq!(store.writes.get(), 1);
+        assert_no_secret_in_config_files(&path, &[secret, "second-pass-backup-secret"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn credential_update_occurs_after_secret_free_config_commit() {
+        let (directory, path, backup) = new_config_directory("stream-painter-credential-update");
+        std::fs::write(&path, legacy_config_text("legacy-primary")).unwrap();
+        std::fs::write(&backup, legacy_config_text("legacy-backup")).unwrap();
+        let store = FakeCredentialStore::new(Some("old-protected"));
+        let config = Config {
+            obs_websocket_password: "new-protected".into(),
+            ..Config::default()
+        };
+
+        save_config_with_store_and_ops(&path, &config, &store, &SystemConfigFileOps).unwrap();
+
+        assert_eq!(store.value().as_deref(), Some("new-protected"));
+        assert_eq!(store.writes.get(), 1);
+        assert_no_secret_in_config_files(
+            &path,
+            &[
+                "legacy-primary",
+                "legacy-backup",
+                "old-protected",
+                "new-protected",
+            ],
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn credential_update_failure_preserves_old_credential_without_secret_leak() {
+        let (directory, path, backup) =
+            new_config_directory("stream-painter-credential-update-fail");
+        std::fs::write(&path, clean_config_text()).unwrap();
+        std::fs::write(&backup, clean_config_text()).unwrap();
+        let store = FakeCredentialStore::failing(Some("old-protected"), CredentialFailure::Write);
+        let config = Config {
+            obs_websocket_password: "new-protected".into(),
+            ..Config::default()
+        };
+
+        let error = save_config_with_store_and_ops(&path, &config, &store, &SystemConfigFileOps)
+            .unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(!error.contains("old-protected"));
+        assert!(!error.contains("new-protected"));
+        assert_eq!(store.value().as_deref(), Some("old-protected"));
+        assert_no_secret_in_config_files(&path, &["old-protected", "new-protected"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn config_commit_failure_happens_before_credential_update() {
+        let (directory, path, backup) =
+            new_config_directory("stream-painter-config-before-credential");
+        let primary = clean_config_text();
+        let previous_backup = clean_config_text();
+        std::fs::write(&path, &primary).unwrap();
+        std::fs::write(&backup, &previous_backup).unwrap();
+        let store = FakeCredentialStore::new(Some("old-protected"));
+        let config = Config {
+            obs_websocket_password: "new-protected".into(),
+            ..Config::default()
+        };
+        let ops = InjectedConfigFileOps::new(SaveFailure::PromoteBackupAfter);
+
+        let error = save_config_with_store_and_ops(&path, &config, &store, &ops).unwrap_err();
+
+        let error = format!("{error:#}");
+        assert!(!error.contains("old-protected"));
+        assert!(!error.contains("new-protected"));
+        assert_eq!(store.value().as_deref(), Some("old-protected"));
+        assert_eq!(store.writes.get(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), primary);
+        assert_eq!(std::fs::read(&backup).unwrap(), previous_backup);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn credential_delete_and_delete_failure_have_safe_outcomes() {
+        for failure in [None, Some(CredentialFailure::Delete)] {
+            let (directory, path, backup) =
+                new_config_directory("stream-painter-credential-delete");
+            std::fs::write(&path, clean_config_text()).unwrap();
+            std::fs::write(&backup, clean_config_text()).unwrap();
+            let store = match failure {
+                Some(failure) => FakeCredentialStore::failing(Some("protected"), failure),
+                None => FakeCredentialStore::new(Some("protected")),
+            };
+
+            let result = save_config_with_store_and_ops(
+                &path,
+                &Config::default(),
+                &store,
+                &SystemConfigFileOps,
+            );
+
+            assert_eq!(store.deletes.get(), 1);
+            if failure.is_some() {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(!error.contains("protected"));
+                assert_eq!(store.value().as_deref(), Some("protected"));
+            } else {
+                result.unwrap();
+                assert_eq!(store.value(), None);
+            }
+            assert_no_secret_in_config_files(&path, &["protected"]);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn credential_read_failure_does_not_change_config_files() {
+        let (directory, path, backup) = new_config_directory("stream-painter-credential-read-fail");
+        std::fs::write(&path, b"primary-before").unwrap();
+        std::fs::write(&backup, b"backup-before").unwrap();
+        let store = FakeCredentialStore::failing(None, CredentialFailure::Read);
+
+        save_config_with_store_and_ops(&path, &Config::default(), &store, &SystemConfigFileOps)
+            .unwrap_err();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"primary-before");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"backup-before");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parse_errors_do_not_include_plaintext_password_lines() {
+        let secret = "parser-must-not-report-this-secret";
+        let (directory, path, _backup) = new_config_directory("stream-painter-secret-parse-error");
+        std::fs::write(
+            &path,
+            format!("obs_websocket_password = {secret:?}\ninvalid = [\n"),
+        )
+        .unwrap();
+
+        let error = read_validated_config(&path).unwrap_err();
+
+        assert!(!format!("{error:#}").contains(secret));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn validation_rejects_values_that_cannot_be_used() {
         let config = Config {
             local_server_port: 0,
@@ -1191,6 +1790,12 @@ local_server_port = 18080
 
         let config = Config {
             obs_websocket_url: "http://localhost:4455".into(),
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = Config {
+            obs_websocket_password: "x".repeat(MAX_OBS_PASSWORD_BYTES + 1),
             ..Config::default()
         };
         assert!(config.validate().is_err());

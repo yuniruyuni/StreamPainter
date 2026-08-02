@@ -7,7 +7,7 @@
 // Linux ホストではコンパイル検証のみ行うため未使用警告を抑制する
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -25,11 +25,22 @@ pub enum ProjectorView {
     Preview,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ObsSettings {
     pub url: String,
     pub password: String,
     pub view: ProjectorView,
+}
+
+impl fmt::Debug for ObsSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObsSettings")
+            .field("url", &self.url)
+            .field("password", &"[REDACTED]")
+            .field("view", &self.view)
+            .finish()
+    }
 }
 
 /// 対象モニタ (物理ピクセル) に全画面プロジェクターを開く。
@@ -189,6 +200,18 @@ fn compute_auth(password: &str, salt: &str, challenge: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_password() {
+        let settings = ObsSettings {
+            url: "ws://localhost:4455".into(),
+            password: "never-log-this-password".into(),
+            view: ProjectorView::Program,
+        };
+        let debug = format!("{settings:?}");
+        assert!(!debug.contains("never-log-this-password"));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn auth_string_matches_reference() {
