@@ -19,11 +19,11 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap1, ID2D1Brush, ID2D1DeviceContext, ID2D1Factory1,
-    ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle1, D2D1_ARC_SEGMENT,
-    D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_CAP_STYLE_ROUND,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
+    ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle1, D2D1_ANTIALIAS_MODE_ALIASED,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_CAP_STYLE_ROUND, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE_LINEAR,
     D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LINE_JOIN_ROUND, D2D1_PRIMITIVE_BLEND_COPY,
     D2D1_PRIMITIVE_BLEND_SOURCE_OVER, D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_ROUNDED_RECT,
     D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE,
@@ -62,6 +62,68 @@ use crate::win::radial_menu::{
     self, RadialCommand, RadialMenu, RadialSelection, COLOR_COUNT, STAMPS_PER_RING,
     STAMP_TOOL_INDEX, TOOL_COUNT,
 };
+
+/// `BeginDraw` と `EndDraw` を必ず対にする。
+///
+/// 描画コール側が失敗しても `EndDraw` は実行するため、次フレームへ描画状態を
+/// 持ち越さない。`EndDraw` 自体の device-loss エラーも呼び出し元へ返す。
+fn draw_transaction<T>(dc: &ID2D1DeviceContext, draw: impl FnOnce() -> Result<T>) -> Result<T> {
+    unsafe {
+        dc.BeginDraw();
+    }
+    let draw_result = draw();
+    let end_result = unsafe { dc.EndDraw(None, None) }.context("finish Direct2D draw");
+    match (draw_result, end_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(draw_error), Err(end_error)) => {
+            Err(draw_error.context(format!("Direct2D EndDraw also failed: {end_error:#}")))
+        }
+    }
+}
+
+/// Direct2D の push/pop スタックを、早期 return を含めて必ず釣り合わせる。
+#[must_use = "the guard must stay alive for the clipped drawing scope"]
+struct AxisAlignedClipGuard {
+    dc: ID2D1DeviceContext,
+}
+
+impl AxisAlignedClipGuard {
+    fn push(dc: &ID2D1DeviceContext, rect: D2D_RECT_F) -> Self {
+        unsafe {
+            // Browser の canvas 境界と同じ、ぼかしのない矩形クリップにする。
+            dc.PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
+        Self { dc: dc.clone() }
+    }
+}
+
+impl Drop for AxisAlignedClipGuard {
+    fn drop(&mut self) {
+        unsafe {
+            self.dc.PopAxisAlignedClip();
+        }
+    }
+}
+
+fn content_clip_rect(content: Rect) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left: content.x as f32,
+        top: content.y as f32,
+        right: (content.x + content.width) as f32,
+        bottom: (content.y + content.height) as f32,
+    }
+}
+
+fn with_content_clip<T>(
+    dc: &ID2D1DeviceContext,
+    content: Rect,
+    draw: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _clip = AxisAlignedClipGuard::push(dc, content_clip_rect(content));
+    draw()
+}
 
 pub struct Renderer {
     factory: ID2D1Factory1,
@@ -225,30 +287,33 @@ impl Renderer {
     ) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.baked);
-            self.dc.BeginDraw();
-            self.dc.Clear(Some(&transparent()));
-            for item in items
-                .iter()
-                .filter(|item| item.is_done() && excluded_item_id != Some(item.item_id()))
-            {
-                self.draw_item(item)?;
-            }
-            self.dc.EndDraw(None, None)?;
         }
-        Ok(())
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+            }
+            with_content_clip(&self.dc, self.content, || {
+                for item in items
+                    .iter()
+                    .filter(|item| item.is_done() && excluded_item_id != Some(item.item_id()))
+                {
+                    self.draw_item(item)?;
+                }
+                Ok(())
+            })
+        })
     }
 
     /// 新しく確定した1項目だけをbakedへ追記する。
     pub fn bake_item(&mut self, item: &CanvasItem) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.baked);
-            self.dc.BeginDraw();
         }
-        let draw_result = self.draw_item(item);
-        let end_result = unsafe { self.dc.EndDraw(None, None) };
-        draw_result?;
-        end_result?;
-        Ok(())
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || self.draw_item(item))
+        })
     }
 
     /// 空フレームを提示してオーバーレイ表示を消す (パススルー復帰時)。
@@ -256,9 +321,15 @@ impl Renderer {
     pub fn clear_frame(&mut self) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.target);
-            self.dc.BeginDraw();
-            self.dc.Clear(Some(&transparent()));
-            self.dc.EndDraw(None, None)?;
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+            }
+            Ok(())
+        })?;
+        unsafe {
             self.swapchain.Present(1, Default::default()).ok()?;
         }
         Ok(())
@@ -274,21 +345,35 @@ impl Renderer {
     ) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.target);
-            self.dc.BeginDraw();
-            self.dc.Clear(Some(&transparent()));
-            self.dc.DrawBitmap(
-                &self.baked,
-                None,
-                1.0,
-                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                None,
-                None,
-            );
-            for item in items.iter().filter(|item| !item.is_done()) {
-                self.draw_item(item)?;
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
             }
+            with_content_clip(&self.dc, self.content, || {
+                // Browser overlay の canvas と同じく、コンテンツだけを canvas 境界で切る。
+                unsafe {
+                    self.dc.DrawBitmap(
+                        &self.baked,
+                        None,
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+                for item in items.iter().filter(|item| !item.is_done()) {
+                    self.draw_item(item)?;
+                }
+                if let Some(stamp) = selected_stamp {
+                    self.draw_stamp(stamp)?;
+                }
+                Ok(())
+            })?;
+            // 選択枠・枠・ラジアルメニューは操作 UI なので、端でも欠けないよう
+            // content clip の後に描く。
             if let Some(stamp) = selected_stamp {
-                self.draw_stamp(stamp)?;
                 self.draw_stamp_selection(stamp)?;
             }
             if draw_mode {
@@ -297,7 +382,9 @@ impl Renderer {
             if let Some((menu, tool, color, stamps)) = radial {
                 self.draw_radial_menu(menu, tool, color, stamps)?;
             }
-            self.dc.EndDraw(None, None)?;
+            Ok(())
+        })?;
+        unsafe {
             self.swapchain.Present(1, Default::default()).ok()?;
         }
         Ok(())
@@ -1219,4 +1306,251 @@ fn parse_color(hex: &str) -> (f32, f32, f32) {
     }
     let parse = |s: &str| u8::from_str_radix(s, 16).unwrap_or(0) as f32 / 255.0;
     (parse(&hex[0..2]), parse(&hex[2..4]), parse(&hex[4..6]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct2D::{
+        ID2D1Image, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_MAP_OPTIONS_READ,
+    };
+    use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+
+    const TEST_SIZE: D2D_SIZE_U = D2D_SIZE_U {
+        width: 64,
+        height: 48,
+    };
+
+    struct Pixels {
+        bytes: Vec<u8>,
+        pitch: usize,
+    }
+
+    impl Pixels {
+        fn bgra(&self, x: u32, y: u32) -> [u8; 4] {
+            let offset = y as usize * self.pitch + x as usize * 4;
+            self.bytes[offset..offset + 4].try_into().unwrap()
+        }
+    }
+
+    fn test_context() -> Result<(ID2D1DeviceContext, ID2D1Bitmap1)> {
+        unsafe {
+            let mut d3d_device: Option<ID3D11Device> = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut d3d_device),
+                None,
+                None,
+            )?;
+            let d3d_device = d3d_device.context("no WARP D3D device")?;
+            let dxgi_device: IDXGIDevice = d3d_device.cast()?;
+            let factory: ID2D1Factory1 =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let d2d_device = factory.CreateDevice(&dxgi_device)?;
+            let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let target = dc.CreateBitmap(
+                TEST_SIZE,
+                None,
+                0,
+                &D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                    colorContext: core::mem::ManuallyDrop::new(None),
+                },
+            )?;
+            dc.SetTarget(&target);
+            Ok((dc, target))
+        }
+    }
+
+    fn fill(dc: &ID2D1DeviceContext, rect: D2D_RECT_F, color: D2D1_COLOR_F) -> Result<()> {
+        unsafe {
+            let brush = dc.CreateSolidColorBrush(&color, None)?;
+            dc.FillRectangle(&rect, &brush);
+        }
+        Ok(())
+    }
+
+    fn read_pixels(dc: &ID2D1DeviceContext, target: &ID2D1Bitmap1) -> Result<Pixels> {
+        unsafe {
+            dc.SetTarget(None::<&ID2D1Image>);
+            let readback = dc.CreateBitmap(
+                TEST_SIZE,
+                None,
+                0,
+                &D2D1_BITMAP_PROPERTIES1 {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                    colorContext: core::mem::ManuallyDrop::new(None),
+                },
+            )?;
+            readback.CopyFromBitmap(None, target, None)?;
+            let mapped = readback.Map(D2D1_MAP_OPTIONS_READ)?;
+            let length = mapped.pitch as usize * TEST_SIZE.height as usize;
+            let bytes = core::slice::from_raw_parts(mapped.bits, length).to_vec();
+            readback.Unmap()?;
+            Ok(Pixels {
+                bytes,
+                pitch: mapped.pitch as usize,
+            })
+        }
+    }
+
+    fn full_surface() -> D2D_RECT_F {
+        D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: TEST_SIZE.width as f32,
+            bottom: TEST_SIZE.height as f32,
+        }
+    }
+
+    fn red() -> D2D1_COLOR_F {
+        D2D1_COLOR_F {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }
+    }
+
+    fn blue() -> D2D1_COLOR_F {
+        D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            a: 1.0,
+        }
+    }
+
+    #[test]
+    fn content_is_clipped_but_ui_can_draw_in_letterbox_and_pillarbox_bars() -> Result<()> {
+        let cases = [
+            (
+                "letterbox",
+                Rect {
+                    x: 0.0,
+                    y: 8.0,
+                    width: 64.0,
+                    height: 32.0,
+                },
+                (32, 24),
+                (32, 2),
+                D2D_RECT_F {
+                    left: 28.0,
+                    top: 43.0,
+                    right: 36.0,
+                    bottom: 47.0,
+                },
+                (32, 45),
+            ),
+            (
+                "pillarbox",
+                Rect {
+                    x: 8.0,
+                    y: 0.0,
+                    width: 48.0,
+                    height: 48.0,
+                },
+                (32, 24),
+                (2, 24),
+                D2D_RECT_F {
+                    left: 59.0,
+                    top: 20.0,
+                    right: 63.0,
+                    bottom: 28.0,
+                },
+                (61, 24),
+            ),
+        ];
+
+        for (name, content, content_point, untouched_bar, ui_rect, ui_point) in cases {
+            let (dc, target) = test_context()?;
+            draw_transaction(&dc, || {
+                unsafe {
+                    dc.Clear(Some(&transparent()));
+                }
+                with_content_clip(&dc, content, || {
+                    // stroke/shape/stamp/baked は同じスコープを通るので、面全体を塗って
+                    // 各プリミティブが境界を跨いだ場合の可視範囲を pixel で検証する。
+                    fill(&dc, full_surface(), red())
+                })?;
+                // 枠・ラジアルメニューに相当する UI はクリップ外へ描画できる。
+                fill(&dc, ui_rect, blue())
+            })?;
+
+            let pixels = read_pixels(&dc, &target)?;
+            assert_eq!(
+                pixels.bgra(content_point.0, content_point.1),
+                [0, 0, 255, 255],
+                "{name}"
+            );
+            assert_eq!(
+                pixels.bgra(untouched_bar.0, untouched_bar.1),
+                [0, 0, 0, 0],
+                "{name}"
+            );
+            assert_eq!(
+                pixels.bgra(ui_point.0, ui_point.1),
+                [255, 0, 0, 255],
+                "{name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn clip_and_draw_transaction_are_balanced_after_early_error() -> Result<()> {
+        let (dc, target) = test_context()?;
+        let content = Rect {
+            x: 8.0,
+            y: 0.0,
+            width: 48.0,
+            height: 48.0,
+        };
+        let result = draw_transaction(&dc, || -> Result<()> {
+            unsafe {
+                dc.Clear(Some(&transparent()));
+            }
+            with_content_clip(&dc, content, || {
+                fill(&dc, full_surface(), red())?;
+                anyhow::bail!("synthetic item draw failure")
+            })
+        });
+        assert!(result.is_err());
+
+        // 早期 return 後も次セッションを開始でき、かつ古い clip は残っていない。
+        draw_transaction(&dc, || {
+            fill(
+                &dc,
+                D2D_RECT_F {
+                    left: 0.0,
+                    top: 20.0,
+                    right: 4.0,
+                    bottom: 28.0,
+                },
+                blue(),
+            )
+        })?;
+        let pixels = read_pixels(&dc, &target)?;
+        assert_eq!(pixels.bgra(2, 24), [255, 0, 0, 255]);
+        assert_eq!(pixels.bgra(6, 24), [0, 0, 0, 0]);
+        assert_eq!(pixels.bgra(32, 24), [0, 0, 255, 255]);
+        Ok(())
+    }
 }
