@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-08-03
+
+### Fixed
+
+- OBSプロジェクター起動要求へ世代IDと接続から表示確認まで共通の5秒deadlineを導入し、
+  timeout後の再試行へ旧要求の成功・失敗が誤適用される競合を解消
+
 ## [0.5.0] - 2026-08-03
 
 ### Added
@@ -117,7 +124,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.2...v0.3.3
