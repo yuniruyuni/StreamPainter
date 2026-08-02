@@ -136,6 +136,31 @@ namespace StreamPainterSmoke
             public int Bottom;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MouseInput
+        {
+            public int Dx;
+            public int Dy;
+            public uint MouseData;
+            public uint Flags;
+            public uint Time;
+            public UIntPtr ExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Explicit)]
+        public struct InputUnion
+        {
+            [FieldOffset(0)]
+            public MouseInput Mouse;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct Input
+        {
+            public uint Type;
+            public InputUnion Data;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
@@ -207,14 +232,13 @@ namespace StreamPainterSmoke
         public static extern uint GetCurrentThreadId();
 
         [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool SetCursorPos(int x, int y);
-
-        [DllImport("user32.dll")]
         public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
 
         [DllImport("user32.dll")]
-        public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+        public static extern int GetSystemMetrics(int index);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern uint SendInput(uint count, [In] Input[] inputs, int size);
     }
 }
 '@
@@ -441,6 +465,59 @@ function Test-OverlayTransparent {
     return ($extendedStyle -band 0x20) -ne 0
 }
 
+function Send-SmokeMouseInput {
+    param(
+        [Parameter(Mandatory = $true)][uint32]$Flags,
+        [int]$X = 0,
+        [int]$Y = 0,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $mouse = [StreamPainterSmoke.NativeMethods+MouseInput]::new()
+    $mouse.Dx = $X
+    $mouse.Dy = $Y
+    $mouse.Flags = $Flags
+    $mouse.ExtraInfo = [UIntPtr]::Zero
+    $union = [StreamPainterSmoke.NativeMethods+InputUnion]::new()
+    $union.Mouse = $mouse
+    $inputRecord = [StreamPainterSmoke.NativeMethods+Input]::new()
+    $inputRecord.Type = 0
+    $inputRecord.Data = $union
+    $inputs = [StreamPainterSmoke.NativeMethods+Input[]]@($inputRecord)
+    $inputSize = [Runtime.InteropServices.Marshal]::SizeOf($inputRecord)
+    $sent = [StreamPainterSmoke.NativeMethods]::SendInput(1, $inputs, $inputSize)
+    if ($sent -ne 1) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "SendInput failed for $Description (sent $sent of 1, Win32 error $errorCode)"
+    }
+}
+
+function Send-AbsoluteSmokeMouseMove {
+    param(
+        [Parameter(Mandatory = $true)][int]$X,
+        [Parameter(Mandatory = $true)][int]$Y,
+        [Parameter(Mandatory = $true)]$VirtualDesktop,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $normalizedX = ConvertTo-WindowsAbsoluteMouseCoordinate `
+        -Position $X `
+        -Origin $VirtualDesktop.X `
+        -Extent $VirtualDesktop.Width
+    $normalizedY = ConvertTo-WindowsAbsoluteMouseCoordinate `
+        -Position $Y `
+        -Origin $VirtualDesktop.Y `
+        -Extent $VirtualDesktop.Height
+    # MOVE | MOVE_NOCOALESCE | VIRTUALDESK | ABSOLUTE. Injecting an actual
+    # input packet is required for Windows to promote movement to
+    # WM_POINTERUPDATE; direct cursor repositioning did not do so on the runner.
+    Send-SmokeMouseInput `
+        -Flags 0xE001 `
+        -X $normalizedX `
+        -Y $normalizedY `
+        -Description $Description
+}
+
 function Send-SmokeStroke {
     param([Parameter(Mandatory = $true)]$MonitorBounds)
 
@@ -451,22 +528,36 @@ function Send-SmokeStroke {
     $endX = [int][Math]::Round($MonitorBounds.X + $content.X + ($content.Width * 0.75))
     $y = [int][Math]::Round($MonitorBounds.Y + $content.Y + ($content.Height * 0.5))
 
-    if (-not [StreamPainterSmoke.NativeMethods]::SetCursorPos($startX, $y)) {
-        throw 'SetCursorPos failed before drawing the smoke stroke'
+    $virtualDesktop = [pscustomobject]@{
+        X = [StreamPainterSmoke.NativeMethods]::GetSystemMetrics(76)
+        Y = [StreamPainterSmoke.NativeMethods]::GetSystemMetrics(77)
+        Width = [StreamPainterSmoke.NativeMethods]::GetSystemMetrics(78)
+        Height = [StreamPainterSmoke.NativeMethods]::GetSystemMetrics(79)
     }
+    if ($virtualDesktop.Width -le 1 -or $virtualDesktop.Height -le 1) {
+        throw "Invalid virtual desktop dimensions $($virtualDesktop.Width)x$($virtualDesktop.Height)"
+    }
+
+    Send-AbsoluteSmokeMouseMove `
+        -X $startX `
+        -Y $y `
+        -VirtualDesktop $virtualDesktop `
+        -Description 'smoke stroke start position'
     Start-Sleep -Milliseconds 150
-    [StreamPainterSmoke.NativeMethods]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    Send-SmokeMouseInput -Flags 0x0002 -Description 'smoke stroke left button down'
     try {
         for ($step = 1; $step -le 48; $step++) {
             $x = [int][Math]::Round($startX + (($endX - $startX) * $step / 48.0))
-            if (-not [StreamPainterSmoke.NativeMethods]::SetCursorPos($x, $y)) {
-                throw "SetCursorPos failed at smoke stroke step $step"
-            }
-            Start-Sleep -Milliseconds 12
+            Send-AbsoluteSmokeMouseMove `
+                -X $x `
+                -Y $y `
+                -VirtualDesktop $virtualDesktop `
+                -Description "smoke stroke move step $step"
+            Start-Sleep -Milliseconds 20
         }
     }
     finally {
-        [StreamPainterSmoke.NativeMethods]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        Send-SmokeMouseInput -Flags 0x0004 -Description 'smoke stroke left button up'
     }
 }
 
@@ -951,16 +1042,16 @@ width_n = 0.035
     Write-SmokeStatus 'Injected one real F9/mouse stroke before OBS startup'
 
     $snapshot = Get-StreamPainterSnapshot
-    $snapshotItems = @($snapshot.items)
-    if ($snapshot.type -ne 'snapshot' -or $snapshotItems.Count -ne 1) {
-        throw "Expected one-item StreamPainter snapshot, received type '$($snapshot.type)' with $($snapshotItems.Count) items"
-    }
-    $snapshotStroke = $snapshotItems[0]
-    if ($snapshotStroke.kind -ne 'stroke' -or $snapshotStroke.done -ne $true -or
-        $snapshotStroke.brush.color -ne '#ff4d6d' -or @($snapshotStroke.pts).Count -lt 10) {
-        throw 'StreamPainter snapshot does not contain the completed smoke stroke'
-    }
-    Write-SmokeStatus "Verified pre-OBS snapshot with $(@($snapshotStroke.pts).Count) stroke points"
+    $snapshotPath = Join-Path $ArtifactDirectory 'stream-painter-snapshot.json'
+    Write-Utf8NoBom `
+        -Path $snapshotPath `
+        -Content ($snapshot | ConvertTo-Json -Depth 30)
+    Write-SmokeStatus 'Saved pre-OBS StreamPainter snapshot artifact'
+    $snapshotDiagnostics = Assert-StreamPainterSmokeSnapshot -Snapshot $snapshot
+    Write-SmokeStatus (
+        'Verified pre-OBS snapshot: ' +
+        (Format-StreamPainterSmokeStrokeDiagnostics -Diagnostics $snapshotDiagnostics)
+    )
 
     Assert-WithinOverallDeadline
     $archivePath = Join-Path $runRoot "OBS-Studio-$ObsVersion-Windows-x64.zip"

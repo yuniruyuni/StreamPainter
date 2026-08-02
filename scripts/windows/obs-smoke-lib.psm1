@@ -109,6 +109,203 @@ function Get-AspectFitRect {
     }
 }
 
+function ConvertTo-WindowsAbsoluteMouseCoordinate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [double]$Position,
+
+        [Parameter(Mandatory = $true)]
+        [double]$Origin,
+
+        [Parameter(Mandatory = $true)]
+        [double]$Extent
+    )
+
+    foreach ($value in @($Position, $Origin, $Extent)) {
+        if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+            throw 'Absolute mouse coordinates must be finite values'
+        }
+    }
+    if ($Extent -le 1.0) {
+        throw 'Absolute mouse coordinate extent must be greater than one'
+    }
+
+    $offset = [Math]::Min([Math]::Max($Position - $Origin, 0.0), $Extent - 1.0)
+    return [uint32][Math]::Round($offset * 65535.0 / ($Extent - 1.0))
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function ConvertTo-FiniteDoubleOrNull {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    try {
+        $number = [double]$Value
+    }
+    catch {
+        return $null
+    }
+    if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) {
+        return $null
+    }
+    return $number
+}
+
+function Get-StreamPainterSmokeStrokeDiagnostics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Snapshot
+    )
+
+    $type = Get-ObjectPropertyValue -Object $Snapshot -Name 'type'
+    $items = @(Get-ObjectPropertyValue -Object $Snapshot -Name 'items')
+    $stroke = if ($items.Count -eq 1) { $items[0] } else { $null }
+    $kind = Get-ObjectPropertyValue -Object $stroke -Name 'kind'
+    $done = Get-ObjectPropertyValue -Object $stroke -Name 'done'
+    $brush = Get-ObjectPropertyValue -Object $stroke -Name 'brush'
+    $color = Get-ObjectPropertyValue -Object $brush -Name 'color'
+    $rawPoints = @(Get-ObjectPropertyValue -Object $stroke -Name 'pts')
+
+    $pointCount = 0
+    $firstPoint = @()
+    $lastPoint = @()
+    if ($rawPoints.Count -gt 0) {
+        # Windows PowerShell 5.1 unwraps a one-element outer JSON array. In
+        # that case pts is the six scalar components of a single point.
+        $firstScalar = ConvertTo-FiniteDoubleOrNull -Value $rawPoints[0]
+        if ($null -ne $firstScalar) {
+            $pointCount = 1
+            $firstPoint = $rawPoints
+            $lastPoint = $rawPoints
+        }
+        else {
+            $pointCount = $rawPoints.Count
+            $firstPoint = @($rawPoints[0])
+            $lastPoint = @($rawPoints[-1])
+        }
+    }
+
+    $firstU = if ($firstPoint.Count -ge 1) {
+        ConvertTo-FiniteDoubleOrNull -Value $firstPoint[0]
+    }
+    else { $null }
+    $firstV = if ($firstPoint.Count -ge 2) {
+        ConvertTo-FiniteDoubleOrNull -Value $firstPoint[1]
+    }
+    else { $null }
+    $lastU = if ($lastPoint.Count -ge 1) {
+        ConvertTo-FiniteDoubleOrNull -Value $lastPoint[0]
+    }
+    else { $null }
+    $lastV = if ($lastPoint.Count -ge 2) {
+        ConvertTo-FiniteDoubleOrNull -Value $lastPoint[1]
+    }
+    else { $null }
+
+    return [pscustomobject]@{
+        Type = $type
+        ItemCount = $items.Count
+        Kind = $kind
+        Done = $done
+        Color = $color
+        PointCount = $pointCount
+        FirstU = $firstU
+        FirstV = $firstV
+        LastU = $lastU
+        LastV = $lastV
+    }
+}
+
+function Format-SmokeCoordinate {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return '<missing>'
+    }
+    return ([double]$Value).ToString('0.######', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-StreamPainterSmokeStrokeDiagnostics {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Diagnostics
+    )
+
+    return (
+        'type="{0}" items={1} kind="{2}" done={3} color="{4}" points={5} first=({6},{7}) last=({8},{9})' -f
+            [string]$Diagnostics.Type,
+            [int]$Diagnostics.ItemCount,
+            [string]$Diagnostics.Kind,
+            [string]$Diagnostics.Done,
+            [string]$Diagnostics.Color,
+            [int]$Diagnostics.PointCount,
+            (Format-SmokeCoordinate -Value $Diagnostics.FirstU),
+            (Format-SmokeCoordinate -Value $Diagnostics.FirstV),
+            (Format-SmokeCoordinate -Value $Diagnostics.LastU),
+            (Format-SmokeCoordinate -Value $Diagnostics.LastV)
+    )
+}
+
+function Assert-StreamPainterSmokeSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$Snapshot
+    )
+
+    $diagnostics = Get-StreamPainterSmokeStrokeDiagnostics -Snapshot $Snapshot
+    $summary = Format-StreamPainterSmokeStrokeDiagnostics -Diagnostics $diagnostics
+    $coordinatesPresent = $null -ne $diagnostics.FirstU -and
+        $null -ne $diagnostics.FirstV -and
+        $null -ne $diagnostics.LastU -and
+        $null -ne $diagnostics.LastV
+    $coordinatesValid = $coordinatesPresent -and
+        [Math]::Abs($diagnostics.FirstU - 0.25) -le 0.03 -and
+        [Math]::Abs($diagnostics.FirstV - 0.50) -le 0.03 -and
+        [Math]::Abs($diagnostics.LastU - 0.75) -le 0.03 -and
+        [Math]::Abs($diagnostics.LastV - 0.50) -le 0.03 -and
+        ($diagnostics.LastU - $diagnostics.FirstU) -ge 0.45 -and
+        [Math]::Abs($diagnostics.LastV - $diagnostics.FirstV) -le 0.03
+
+    if ([string]$diagnostics.Type -cne 'snapshot' -or
+        $diagnostics.ItemCount -ne 1 -or
+        [string]$diagnostics.Kind -cne 'stroke' -or
+        $diagnostics.Done -ne $true -or
+        [string]$diagnostics.Color -cne '#ff4d6d' -or
+        $diagnostics.PointCount -lt 2 -or
+        -not $coordinatesValid) {
+        throw (
+            "StreamPainter smoke stroke assertion failed: $summary; " +
+            'expected a completed #ff4d6d stroke from approximately (0.25,0.50) to (0.75,0.50) ' +
+            'with at least two points, horizontal span >= 0.45, and vertical drift <= 0.03'
+        )
+    }
+
+    return $diagnostics
+}
+
 function Select-StreamPainterOverlayWindowRecord {
     [CmdletBinding()]
     param(
@@ -331,6 +528,10 @@ Export-ModuleMember -Function @(
     'Get-ObsWebSocketAuthentication',
     'Wait-ObsSmokeTask',
     'Get-AspectFitRect',
+    'ConvertTo-WindowsAbsoluteMouseCoordinate',
+    'Get-StreamPainterSmokeStrokeDiagnostics',
+    'Format-StreamPainterSmokeStrokeDiagnostics',
+    'Assert-StreamPainterSmokeSnapshot',
     'Select-StreamPainterOverlayWindowRecord',
     'Format-TopLevelWindowDiagnostics',
     'Test-StreamPainterSmokePixel',
