@@ -29,19 +29,23 @@ use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetDesktopWindow, GetDlgItem,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    IsDialogMessageW, IsWindow, LoadCursorW, MessageBoxW, RegisterClassW, SendMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
-    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CBS_DROPDOWNLIST,
-    CBS_HASSTRINGS, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EN_CHANGE, ES_AUTOHSCROLL, ES_NUMBER,
-    ES_PASSWORD, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW, LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_NCDESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    IsDialogMessageW, IsWindow, LoadCursorW, MessageBoxW, PostMessageW, RegisterClassW,
+    SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON,
+    CBS_DROPDOWNLIST, CBS_HASSTRINGS, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, EN_CHANGE,
+    ES_AUTOHSCROLL, ES_NUMBER, ES_PASSWORD, ES_READONLY, GWLP_USERDATA, HMENU, IDC_ARROW,
+    LBN_SELCHANGE, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT,
+    LB_SETCURSEL, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, SW_SHOW, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_NCDESTROY, WM_SETFONT, WNDCLASSW, WS_CAPTION,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::config::{self, Config, StampConfig, MAX_STAMPS};
+use crate::net::local_server::{
+    LocalServerDiagnostics, LocalServerDiagnosticsSnapshot, LocalServerDiagnosticsSubscription,
+    LocalServerReachability,
+};
 use crate::win::monitor::{self, Monitor};
 
 const CLASS_NAME: PCWSTR = w!("stream-painter-settings");
@@ -67,6 +71,11 @@ const ID_STAMP_REMOVE: i32 = 115;
 const ID_STAMP_NAME: i32 = 116;
 const ID_STAMP_SIZE: i32 = 117;
 const ID_STAMP_OPACITY: i32 = 118;
+const ID_COPY_OVERLAY_URL: i32 = 119;
+const ID_SERVER_STATUS: i32 = 120;
+const ID_BROWSER_STATUS: i32 = 121;
+
+const WM_DIAGNOSTICS_CHANGED: u32 = WM_APP + 1;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -77,6 +86,8 @@ struct SettingsState {
     selected_stamp: Option<usize>,
     new_stamp_files: Vec<PathBuf>,
     saved: bool,
+    diagnostics: Option<LocalServerDiagnostics>,
+    _diagnostics_subscription: Option<LocalServerDiagnosticsSubscription>,
     /// 設定画面を overlay より前に保つ。WM_NCDESTROY で state と一緒に解放する。
     _foreground_ui: crate::win::projector::ForegroundUiGuard,
 }
@@ -133,7 +144,7 @@ pub fn run_standalone() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    open(unsafe { GetDesktopWindow() })?;
+    open(unsafe { GetDesktopWindow() }, None)?;
 
     unsafe {
         let mut message = MSG::default();
@@ -156,7 +167,7 @@ pub fn run_standalone() -> Result<()> {
 }
 
 /// 設定画面を開く。すでに開いている場合は既存画面を前面へ出す。
-pub fn open(owner: HWND) -> Result<()> {
+pub fn open(owner: HWND, diagnostics: Option<LocalServerDiagnostics>) -> Result<()> {
     if is_open() {
         let hwnd = hwnd_from_raw(SETTINGS_HWND.load(Ordering::SeqCst));
         unsafe {
@@ -177,7 +188,7 @@ pub fn open(owner: HWND) -> Result<()> {
 
         let dpi = GetDpiForWindow(owner).max(96);
         let window_width = scale(680, dpi);
-        let window_height = scale(820, dpi);
+        let window_height = scale(860, dpi);
         let mut owner_rect = RECT::default();
         let (x, y) = if GetWindowRect(owner, &mut owner_rect).is_ok() {
             (
@@ -212,6 +223,8 @@ pub fn open(owner: HWND) -> Result<()> {
             selected_stamp: None,
             new_stamp_files: Vec::new(),
             saved: false,
+            diagnostics,
+            _diagnostics_subscription: None,
             _foreground_ui: crate::win::projector::ForegroundUiGuard::new(),
         });
         let state_ptr = Box::into_raw(state);
@@ -220,6 +233,22 @@ pub fn open(owner: HWND) -> Result<()> {
         if let Err(error) = initialize_controls(hwnd, &config, dpi) {
             let _ = DestroyWindow(hwnd);
             return Err(error);
+        }
+
+        if let Some(diagnostics) = (&*state_ptr).diagnostics.clone() {
+            let raw = hwnd.0 as isize;
+            let subscription = diagnostics.subscribe(move || {
+                if SETTINGS_HWND.load(Ordering::SeqCst) == raw {
+                    let _ = PostMessageW(
+                        Some(hwnd_from_raw(raw)),
+                        WM_DIAGNOSTICS_CHANGED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            });
+            (&mut *state_ptr)._diagnostics_subscription = Some(subscription);
+            let _ = PostMessageW(Some(hwnd), WM_DIAGNOSTICS_CHANGED, WPARAM(0), LPARAM(0));
         }
 
         SETTINGS_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
@@ -309,9 +338,20 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             &config.overlay_url(),
             field_x,
             s(16),
-            field_width,
+            s(315),
             row_height,
             ES_AUTOHSCROLL | ES_READONLY,
+        )?;
+        create_button(
+            hwnd,
+            font,
+            ID_COPY_OVERLAY_URL,
+            "URLをコピー",
+            s(535),
+            s(14),
+            s(105),
+            s(28),
+            false,
         )?;
 
         create_label(
@@ -638,6 +678,26 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         )?;
         refresh_stamp_list(hwnd, state, (!state.stamps.is_empty()).then_some(0))?;
 
+        create_label_with_id(
+            hwnd,
+            font,
+            ID_SERVER_STATUS,
+            "ローカルサーバー: 状態を確認中...",
+            label_x,
+            s(680),
+            s(620),
+            row_height,
+        )?;
+        create_label_with_id(
+            hwnd,
+            font,
+            ID_BROWSER_STATUS,
+            "OBS Browser Source: 状態を確認中...",
+            label_x,
+            s(704),
+            s(620),
+            row_height,
+        )?;
         create_label(
             hwnd,
             font,
@@ -646,7 +706,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
                 "ポートを変えた場合は、OBS Browser Source のURLも上記URLへ変更してください。"
             ),
             label_x,
-            s(688),
+            s(730),
             s(620),
             s(48),
         )?;
@@ -657,7 +717,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_SAVE,
             "保存",
             s(430),
-            s(748),
+            s(790),
             s(100),
             s(32),
             true,
@@ -668,12 +728,14 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_CANCEL,
             "キャンセル",
             s(540),
-            s(748),
+            s(790),
             s(100),
             s(32),
             false,
         )?;
     }
+
+    update_connection_status(hwnd, state)?;
 
     Ok(())
 }
@@ -737,6 +799,33 @@ unsafe fn create_label(
             w!("STATIC"),
             text,
             None,
+            WINDOW_EX_STYLE::default(),
+            WS_CHILD | WS_VISIBLE,
+            x,
+            y,
+            width,
+            height,
+        )
+    }
+}
+
+unsafe fn create_label_with_id(
+    parent: HWND,
+    font: HFONT,
+    id: i32,
+    text: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Result<HWND> {
+    unsafe {
+        create_control(
+            parent,
+            font,
+            w!("STATIC"),
+            text,
+            Some(id),
             WINDOW_EX_STYLE::default(),
             WS_CHILD | WS_VISIBLE,
             x,
@@ -1199,13 +1288,82 @@ fn update_overlay_url(hwnd: HWND) {
     unsafe {
         let _ = SetWindowTextW(url_control, &HSTRING::from(url));
     }
+    let _ = set_control_text(hwnd, ID_COPY_OVERLAY_URL, "URLをコピー");
+}
+
+fn connection_status_labels(
+    port_text: &str,
+    diagnostics: Option<LocalServerDiagnosticsSnapshot>,
+) -> (String, String) {
+    let Some(diagnostics) = diagnostics else {
+        return (
+            "ローカルサーバー: この設定専用プロセスでは停止中".to_owned(),
+            "OBS Browser Source: 未接続（通常起動後にトレイから確認してください）".to_owned(),
+        );
+    };
+
+    let entered_port = port_text.trim().parse::<u16>().ok();
+    let port_matches = entered_port == Some(diagnostics.port);
+    let server = match diagnostics.reachability {
+        LocalServerReachability::Starting => {
+            format!("ローカルサーバー: 起動中（ポート {}）", diagnostics.port)
+        }
+        LocalServerReachability::Reachable if port_matches => format!(
+            "ローカルサーバー: 到達可能（127.0.0.1:{}）",
+            diagnostics.port
+        ),
+        LocalServerReachability::Reachable => format!(
+            "ローカルサーバー: 到達可能（稼働ポート {}。入力中のURLとは不一致）",
+            diagnostics.port
+        ),
+        LocalServerReachability::Stopped => {
+            "ローカルサーバー: 停止（StreamPainterを再起動してください）".to_owned()
+        }
+    };
+    let browser = match (diagnostics.reachability, diagnostics.browser_subscribers) {
+        (LocalServerReachability::Starting, _) => {
+            "OBS Browser Source: 未接続（ローカルサーバー起動中）".to_owned()
+        }
+        (LocalServerReachability::Stopped, _) => {
+            "OBS Browser Source: 未接続（ローカルサーバーが停止中）".to_owned()
+        }
+        (LocalServerReachability::Reachable, 0) => {
+            "OBS Browser Source: 未接続（OBSのURLを確認してソースを更新してください）".to_owned()
+        }
+        (LocalServerReachability::Reachable, count) => {
+            format!("OBS Browser Source: 接続済み（{count}接続）")
+        }
+    };
+    (server, browser)
+}
+
+fn update_connection_status(hwnd: HWND, state: &SettingsState) -> Result<()> {
+    let port = control_text(hwnd, ID_PORT)?;
+    let snapshot = state
+        .diagnostics
+        .as_ref()
+        .map(LocalServerDiagnostics::snapshot);
+    let (server, browser) = connection_status_labels(&port, snapshot);
+    set_control_text(hwnd, ID_SERVER_STATUS, &server)?;
+    set_control_text(hwnd, ID_BROWSER_STATUS, &browser)
+}
+
+fn copy_overlay_url(hwnd: HWND) -> Result<()> {
+    let url = control_text(hwnd, ID_OVERLAY_URL)?;
+    crate::win::clipboard::copy_text(hwnd, &url)
+        .context("OBS Browser Source URLをコピーできません")?;
+    set_control_text(hwnd, ID_COPY_OVERLAY_URL, "コピー済み")
 }
 
 fn show_error(hwnd: HWND, error: &anyhow::Error) {
+    show_operation_error(hwnd, "設定を更新できません", error);
+}
+
+fn show_operation_error(hwnd: HWND, summary: &str, error: &anyhow::Error) {
     unsafe {
         MessageBoxW(
             Some(hwnd),
-            &HSTRING::from(format!("設定を更新できません:\n{error:#}")),
+            &HSTRING::from(format!("{summary}:\n{error:#}")),
             w!("StreamPainter 設定"),
             MB_OK | MB_ICONERROR,
         );
@@ -1225,6 +1383,17 @@ unsafe extern "system" fn window_proc(
 
             if id == ID_PORT && notification == EN_CHANGE {
                 update_overlay_url(hwnd);
+                let state_ptr =
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+                if let Some(state) = unsafe { state_ptr.as_ref() } {
+                    let _ = update_connection_status(hwnd, state);
+                }
+                return LRESULT(0);
+            }
+            if id == ID_COPY_OVERLAY_URL {
+                if let Err(error) = copy_overlay_url(hwnd) {
+                    show_operation_error(hwnd, "URLをコピーできません", &error);
+                }
                 return LRESULT(0);
             }
             if id == ID_STAMP_LIST && notification == LBN_SELCHANGE {
@@ -1297,6 +1466,15 @@ unsafe extern "system" fn window_proc(
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        WM_DIAGNOSTICS_CHANGED => {
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+            if let Some(state) = unsafe { state_ptr.as_ref() } {
+                if let Err(error) = update_connection_status(hwnd, state) {
+                    show_error(hwnd, &error);
+                }
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -1315,5 +1493,62 @@ unsafe extern "system" fn window_proc(
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diagnostics(
+        reachability: LocalServerReachability,
+        browser_subscribers: usize,
+    ) -> LocalServerDiagnosticsSnapshot {
+        LocalServerDiagnosticsSnapshot {
+            port: 16_873,
+            reachability,
+            browser_subscribers,
+        }
+    }
+
+    #[test]
+    fn status_labels_distinguish_reachable_server_from_browser_connection() {
+        let (server, browser) = connection_status_labels(
+            "16873",
+            Some(diagnostics(LocalServerReachability::Reachable, 0)),
+        );
+        assert!(server.contains("到達可能"));
+        assert!(browser.contains("未接続"));
+
+        let (server, browser) = connection_status_labels(
+            "16873",
+            Some(diagnostics(LocalServerReachability::Reachable, 1)),
+        );
+        assert!(server.contains("到達可能"));
+        assert!(browser.contains("接続済み"));
+    }
+
+    #[test]
+    fn status_labels_explain_port_mismatch_and_server_stop() {
+        let (server, _) = connection_status_labels(
+            "16874",
+            Some(diagnostics(LocalServerReachability::Reachable, 0)),
+        );
+        assert!(server.contains("入力中のURLとは不一致"));
+        assert!(server.contains("16873"));
+
+        let (server, browser) = connection_status_labels(
+            "16873",
+            Some(diagnostics(LocalServerReachability::Stopped, 0)),
+        );
+        assert!(server.contains("停止"));
+        assert!(browser.contains("未接続"));
+    }
+
+    #[test]
+    fn standalone_settings_does_not_claim_a_browser_connection() {
+        let (server, browser) = connection_status_labels("16873", None);
+        assert!(server.contains("停止中"));
+        assert!(browser.contains("未接続"));
     }
 }

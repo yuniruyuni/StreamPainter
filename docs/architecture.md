@@ -36,6 +36,11 @@ snapshot再同期します。完全履歴の複製はこの異常復旧時だけ
 - backpressure: 各接続は256メッセージの上限を持つ
 - 遅延時: 接続をハブから除外し、Browser Source側の再接続に任せる
 
+ローカルサーバーの起動・停止とBrowser Source WebSocket session数は、認証情報を含まない
+プロセス内diagnosticsとして保持します。状態が変わった時だけWin32メッセージを設定画面へ送り、
+定期的なHTTP pollingは行いません。トレイメニューは開いた時点の同じsnapshotを表示します。
+診断用の公開HTTP endpointやHost / Origin検証の例外は追加しません。
+
 CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000点に制限します。古い確定
 アイテムを削除する必要が生じた場合は増分ではなくsnapshotを送り、全クライアントを再同期
 します。増分イベントにはrevisionを付け、欠落を検出したoverlayは再接続snapshotで復旧します。

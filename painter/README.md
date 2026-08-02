@@ -22,7 +22,8 @@ release buildには `client/static/` のHTML/CSS/JavaScriptと、lockfileから�
 ## 設定
 
 タスクトレイアイコンの「設定...」から編集します。保存した設定はアプリの再起動後に反映
-されます。OBS Browser SourceのURLも設定画面に表示されます。
+されます。OBS Browser SourceのURLは設定画面またはタスクトレイから1操作でコピーでき、
+ローカルサーバーの到達状態とBrowser Source WebSocketの接続状態も別々に表示されます。
 
 ```text
 http://127.0.0.1:16873/overlay

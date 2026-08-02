@@ -1551,6 +1551,7 @@ unsafe extern "system" fn window_proc(
                 hwnd,
                 (lparam.0 & 0xffff) as u32,
                 unsafe { &*app_ptr }.hotkey_registered,
+                unsafe { &*app_ptr }.web.diagnostics().snapshot(),
             );
             let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
             if current != app_ptr {
@@ -1561,9 +1562,20 @@ unsafe extern "system" fn window_proc(
                     unsafe { &mut *app_ptr }.toggle_mode(hwnd);
                     unsafe { &mut *app_ptr }.poll_projector(hwnd);
                 }
+                Some(TrayCommand::CopyOverlayUrl) => {
+                    let overlay_url = unsafe { &*app_ptr }.web.overlay_url().to_owned();
+                    if let Err(error) = crate::win::clipboard::copy_text(hwnd, &overlay_url) {
+                        warn!("copy overlay URL: {error:#}");
+                        crate::win::message_box(&format!(
+                            "OBS Browser Source URLをコピーできません:\n{error:#}"
+                        ));
+                    }
+                    unsafe { &mut *app_ptr }.poll_projector(hwnd);
+                }
                 Some(TrayCommand::Settings) => {
                     unsafe { &mut *app_ptr }.set_draw_mode(hwnd, false);
-                    if let Err(error) = settings::open(hwnd) {
+                    let diagnostics = unsafe { &*app_ptr }.web.diagnostics();
+                    if let Err(error) = settings::open(hwnd, Some(diagnostics)) {
                         warn!("settings: {error:#}");
                         crate::win::message_box(&format!("設定画面を開けません:\n{error:#}"));
                     }

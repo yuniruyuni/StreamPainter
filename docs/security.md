@@ -27,6 +27,7 @@
 - 遅い接続の送信queueを制限し、UIスレッドへのbackpressureを防ぐ
 - OBS WebSocketパスワードはconfigとそのbackupへserializeせず、Windows資格情報マネージャーの
   現在ユーザー用Generic credentialに保存する
+- 接続診断はプロセス内部の状態通知だけで実装し、外部向けdiagnostics endpointを追加しない
 
 loopback構成ではBearer tokenは秘密になりにくく、配布・更新も複雑にするため採用しません。
 ブラウザ経由の攻撃はOrigin検証、LAN経由の攻撃はbind先とHost検証で遮断します。

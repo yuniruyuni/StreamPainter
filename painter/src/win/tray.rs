@@ -1,18 +1,20 @@
 //! タスクトレイ常駐 (docs/painter.md)。
-//! 右クリックメニュー: 描画モード切替 (F9) / 設定 / ライセンス / 終了。
+//! 右クリックメニュー: 描画モード切替 / URLコピー・接続診断 / 設定 / 終了。
 //! オーバーレイは WS_EX_NOACTIVATE で操作 UI を持たないため、終了導線はここが正となる。
 
 use anyhow::{Context, Result};
-use windows::core::w;
+use windows::core::{w, HSTRING};
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
-    TrackPopupMenu, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
+    TrackPopupMenu, IDI_APPLICATION, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CONTEXTMENU, WM_LBUTTONUP, WM_RBUTTONUP,
 };
+
+use crate::net::local_server::{LocalServerDiagnosticsSnapshot, LocalServerReachability};
 
 /// トレイからのコールバックメッセージ (window_proc で処理する)
 pub const WM_TRAY: u32 = WM_APP + 1;
@@ -23,6 +25,7 @@ const TRAY_ID: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrayCommand {
     ToggleMode,
+    CopyOverlayUrl,
     Settings,
     Logs,
     Licenses,
@@ -30,10 +33,13 @@ pub enum TrayCommand {
 }
 
 const MENU_TOGGLE: usize = 1;
-const MENU_SETTINGS: usize = 2;
-const MENU_LOGS: usize = 3;
-const MENU_LICENSES: usize = 4;
-const MENU_EXIT: usize = 5;
+const MENU_COPY_OVERLAY_URL: usize = 2;
+const MENU_SETTINGS: usize = 3;
+const MENU_LOGS: usize = 4;
+const MENU_LICENSES: usize = 5;
+const MENU_EXIT: usize = 6;
+const MENU_SERVER_STATUS: usize = 100;
+const MENU_BROWSER_STATUS: usize = 101;
 
 pub fn add(hwnd: HWND, hotkey_registered: bool) -> Result<()> {
     let mut data = NOTIFYICONDATAW {
@@ -72,7 +78,35 @@ pub fn remove(hwnd: HWND) {
 }
 
 /// WM_TRAY 受信時の処理。メニューを出し、選択されたコマンドを返す
-pub fn on_message(hwnd: HWND, lparam_low: u32, hotkey_registered: bool) -> Option<TrayCommand> {
+fn diagnostics_labels(diagnostics: LocalServerDiagnosticsSnapshot) -> (String, String) {
+    let server = match diagnostics.reachability {
+        LocalServerReachability::Starting => {
+            format!("ローカルサーバー: 起動中 ({})", diagnostics.port)
+        }
+        LocalServerReachability::Reachable => {
+            format!("ローカルサーバー: 到達可能 ({})", diagnostics.port)
+        }
+        LocalServerReachability::Stopped => "ローカルサーバー: 停止".to_owned(),
+    };
+    let browser = if diagnostics.reachability == LocalServerReachability::Reachable
+        && diagnostics.browser_subscribers > 0
+    {
+        format!(
+            "OBS Browser Source: 接続済み ({}接続)",
+            diagnostics.browser_subscribers
+        )
+    } else {
+        "OBS Browser Source: 未接続".to_owned()
+    };
+    (server, browser)
+}
+
+pub fn on_message(
+    hwnd: HWND,
+    lparam_low: u32,
+    hotkey_registered: bool,
+    diagnostics: LocalServerDiagnosticsSnapshot,
+) -> Option<TrayCommand> {
     if lparam_low != WM_RBUTTONUP && lparam_low != WM_LBUTTONUP && lparam_low != WM_CONTEXTMENU {
         return None;
     }
@@ -86,6 +120,26 @@ pub fn on_message(hwnd: HWND, lparam_low: u32, hotkey_registered: bool) -> Optio
             w!("描画モード切替")
         };
         let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle_label);
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_COPY_OVERLAY_URL,
+            w!("OBS Browser Source URLをコピー"),
+        );
+        let (server_status, browser_status) = diagnostics_labels(diagnostics);
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            MENU_SERVER_STATUS,
+            &HSTRING::from(server_status),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            MENU_BROWSER_STATUS,
+            &HSTRING::from(browser_status),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定..."));
         let _ = AppendMenuW(menu, MF_STRING, MENU_LOGS, w!("ログフォルダー..."));
         let _ = AppendMenuW(menu, MF_STRING, MENU_LICENSES, w!("第三者ライセンス..."));
@@ -109,11 +163,44 @@ pub fn on_message(hwnd: HWND, lparam_low: u32, hotkey_registered: bool) -> Optio
 
         match selected.0 as usize {
             MENU_TOGGLE => Some(TrayCommand::ToggleMode),
+            MENU_COPY_OVERLAY_URL => Some(TrayCommand::CopyOverlayUrl),
             MENU_SETTINGS => Some(TrayCommand::Settings),
             MENU_LOGS => Some(TrayCommand::Logs),
             MENU_LICENSES => Some(TrayCommand::Licenses),
             MENU_EXIT => Some(TrayCommand::Exit),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_labels_keep_server_and_browser_state_separate() {
+        let (server, browser) = diagnostics_labels(LocalServerDiagnosticsSnapshot {
+            port: 16_873,
+            reachability: LocalServerReachability::Reachable,
+            browser_subscribers: 0,
+        });
+        assert!(server.contains("到達可能"));
+        assert!(browser.contains("未接続"));
+
+        let (_, browser) = diagnostics_labels(LocalServerDiagnosticsSnapshot {
+            port: 16_873,
+            reachability: LocalServerReachability::Reachable,
+            browser_subscribers: 2,
+        });
+        assert!(browser.contains("接続済み"));
+        assert!(browser.contains("2接続"));
+
+        let (server, browser) = diagnostics_labels(LocalServerDiagnosticsSnapshot {
+            port: 16_873,
+            reachability: LocalServerReachability::Stopped,
+            browser_subscribers: 0,
+        });
+        assert!(server.contains("停止"));
+        assert!(browser.contains("未接続"));
     }
 }

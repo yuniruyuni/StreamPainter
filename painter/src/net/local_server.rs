@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 
 use anyhow::{bail, Context, Result};
@@ -39,6 +39,145 @@ const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
 const HUB_INPUT_QUEUE_CAPACITY: usize = 1024;
 const THIRD_PARTY_LICENSES_HTML: &str = include_str!("../../assets/third-party-licenses.html");
 
+/// UI に公開するローカルサーバーの実行状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalServerReachability {
+    Starting,
+    Reachable,
+    Stopped,
+}
+
+/// 設定画面とトレイへ渡す、認証情報を含まない接続診断のスナップショット。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalServerDiagnosticsSnapshot {
+    pub port: u16,
+    pub reachability: LocalServerReachability,
+    pub browser_subscribers: usize,
+}
+
+type DiagnosticsListener = Arc<dyn Fn() + Send + Sync + 'static>;
+
+struct LocalServerDiagnosticsInner {
+    snapshot: LocalServerDiagnosticsSnapshot,
+    listeners: HashMap<u64, DiagnosticsListener>,
+    next_listener_id: u64,
+}
+
+/// 状態変化時だけ listener を呼び出す、軽量な診断ハンドル。
+#[derive(Clone)]
+pub struct LocalServerDiagnostics {
+    inner: Arc<Mutex<LocalServerDiagnosticsInner>>,
+}
+
+impl LocalServerDiagnostics {
+    fn new(port: u16) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LocalServerDiagnosticsInner {
+                snapshot: LocalServerDiagnosticsSnapshot {
+                    port,
+                    reachability: LocalServerReachability::Starting,
+                    browser_subscribers: 0,
+                },
+                listeners: HashMap::new(),
+                next_listener_id: 1,
+            })),
+        }
+    }
+
+    pub fn snapshot(&self) -> LocalServerDiagnosticsSnapshot {
+        self.inner.lock().unwrap().snapshot
+    }
+
+    /// listener は登録後の状態変化時だけ呼ばれる。初期表示には `snapshot` を使う。
+    pub fn subscribe(
+        &self,
+        listener: impl Fn() + Send + Sync + 'static,
+    ) -> LocalServerDiagnosticsSubscription {
+        let listener = Arc::new(listener) as DiagnosticsListener;
+        let id = {
+            let mut inner = self.inner.lock().unwrap();
+            let id = inner.next_listener_id;
+            inner.next_listener_id = inner.next_listener_id.saturating_add(1);
+            inner.listeners.insert(id, listener);
+            id
+        };
+        LocalServerDiagnosticsSubscription {
+            inner: Arc::downgrade(&self.inner),
+            id,
+        }
+    }
+
+    fn update(&self, update: impl FnOnce(&mut LocalServerDiagnosticsSnapshot)) {
+        let listeners = {
+            let mut inner = self.inner.lock().unwrap();
+            let previous = inner.snapshot;
+            update(&mut inner.snapshot);
+            if inner.snapshot == previous {
+                return;
+            }
+            inner.listeners.values().cloned().collect::<Vec<_>>()
+        };
+        for listener in listeners {
+            listener();
+        }
+    }
+
+    fn set_reachability(&self, reachability: LocalServerReachability) {
+        self.update(|snapshot| {
+            snapshot.reachability = reachability;
+            if reachability == LocalServerReachability::Stopped {
+                snapshot.browser_subscribers = 0;
+            }
+        });
+    }
+
+    fn browser_subscriber_connected(&self) -> BrowserSubscriberGuard {
+        self.update(|snapshot| {
+            snapshot.browser_subscribers = snapshot.browser_subscribers.saturating_add(1);
+        });
+        BrowserSubscriberGuard {
+            diagnostics: self.clone(),
+        }
+    }
+}
+
+/// 設定画面を閉じた後に callback を残さないための登録解除 guard。
+pub struct LocalServerDiagnosticsSubscription {
+    inner: Weak<Mutex<LocalServerDiagnosticsInner>>,
+    id: u64,
+}
+
+impl Drop for LocalServerDiagnosticsSubscription {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.lock().unwrap().listeners.remove(&self.id);
+        }
+    }
+}
+
+struct BrowserSubscriberGuard {
+    diagnostics: LocalServerDiagnostics,
+}
+
+impl Drop for BrowserSubscriberGuard {
+    fn drop(&mut self) {
+        self.diagnostics.update(|snapshot| {
+            snapshot.browser_subscribers = snapshot.browser_subscribers.saturating_sub(1);
+        });
+    }
+}
+
+struct ServerThreadGuard {
+    diagnostics: LocalServerDiagnostics,
+}
+
+impl Drop for ServerThreadGuard {
+    fn drop(&mut self) {
+        self.diagnostics
+            .set_reachability(LocalServerReachability::Stopped);
+    }
+}
+
 #[derive(RustEmbed)]
 #[folder = "../client/static/"]
 #[exclude = ".gitkeep"]
@@ -51,6 +190,7 @@ pub struct LocalServerHandle {
     recovery: Arc<HubRecovery>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    diagnostics: LocalServerDiagnostics,
     overlay_url: String,
     licenses_url: String,
 }
@@ -96,6 +236,10 @@ impl LocalServerHandle {
 
     pub fn licenses_url(&self) -> &str {
         &self.licenses_url
+    }
+
+    pub fn diagnostics(&self) -> LocalServerDiagnostics {
+        self.diagnostics.clone()
     }
 }
 
@@ -161,17 +305,23 @@ pub fn spawn(
     let (hub_tx, hub_rx) = mpsc::channel(HUB_INPUT_QUEUE_CAPACITY);
     let hub = HubHandle { tx: hub_tx };
     let recovery = Arc::new(HubRecovery::default());
+    let diagnostics = LocalServerDiagnostics::new(port);
     let web_state = WebState {
         hub: hub.clone(),
         port,
         stamp_paths: Arc::new(stamp_paths),
+        diagnostics: diagnostics.clone(),
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let recovery_for_thread = Arc::clone(&recovery);
+    let diagnostics_for_thread = diagnostics.clone();
 
     let thread = std::thread::Builder::new()
         .name("local-web".into())
         .spawn(move || {
+            let _server_thread = ServerThreadGuard {
+                diagnostics: diagnostics_for_thread.clone(),
+            };
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -190,6 +340,7 @@ pub fn spawn(
                         return;
                     }
                 };
+                diagnostics_for_thread.set_reachability(LocalServerReachability::Reachable);
                 let hub_task = tokio::spawn(run_hub(hub_rx, Arc::clone(&recovery_for_thread)));
                 let app = router(web_state);
                 tokio::select! {
@@ -214,6 +365,7 @@ pub fn spawn(
         recovery,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
+        diagnostics,
         overlay_url,
         licenses_url,
     })
@@ -224,6 +376,7 @@ struct WebState {
     hub: HubHandle,
     port: u16,
     stamp_paths: Arc<HashMap<String, PathBuf>>,
+    diagnostics: LocalServerDiagnostics,
 }
 
 fn router(state: WebState) -> Router {
@@ -318,7 +471,7 @@ async fn websocket(
     }
     ws.max_message_size(4 * 1024)
         .max_frame_size(4 * 1024)
-        .on_upgrade(move |socket| websocket_session(socket, state.hub))
+        .on_upgrade(move |socket| websocket_session(socket, state.hub, state.diagnostics))
 }
 
 fn trusted_host(headers: &HeaderMap, port: u16) -> bool {
@@ -393,8 +546,8 @@ impl HubHandle {
         reply_rx.await.ok()
     }
 
-    fn unsubscribe(&self, id: u64) {
-        let _ = self.tx.try_send(HubCommand::Unsubscribe { id });
+    async fn unsubscribe(&self, id: u64) {
+        let _ = self.tx.send(HubCommand::Unsubscribe { id }).await;
     }
 }
 
@@ -737,10 +890,11 @@ async fn run_hub(mut commands: mpsc::Receiver<HubCommand>, recovery: Arc<HubReco
     }
 }
 
-async fn websocket_session(socket: WebSocket, hub: HubHandle) {
+async fn websocket_session(socket: WebSocket, hub: HubHandle, diagnostics: LocalServerDiagnostics) {
     let Some((subscriber_id, mut outbound)) = hub.subscribe().await else {
         return;
     };
+    let subscriber = diagnostics.browser_subscriber_connected();
     let (mut socket_tx, mut socket_rx) = socket.split();
 
     loop {
@@ -776,7 +930,9 @@ async fn websocket_session(socket: WebSocket, hub: HubHandle) {
             }
         }
     }
-    hub.unsubscribe(subscriber_id);
+    // hub queue が混雑していても、UI上の切断状態はsocket終了時点で即時反映する。
+    drop(subscriber);
+    hub.unsubscribe(subscriber_id).await;
 }
 
 #[cfg(test)]
@@ -1247,6 +1403,8 @@ mod tests {
     use crate::engine::canvas_engine::CanvasEngine;
     use crate::protocol::{Brush, LineStyle, ShapeItem, ShapeKind, StampItem, Tool};
     use std::io::{Read, Write};
+    use std::sync::mpsc as std_mpsc;
+    use std::time::{Duration, Instant};
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::ORIGIN as WS_ORIGIN;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -1286,6 +1444,7 @@ mod tests {
             recovery: Arc::clone(&recovery),
             shutdown: None,
             thread: None,
+            diagnostics: LocalServerDiagnostics::new(0),
             overlay_url: String::new(),
             licenses_url: String::new(),
         };
@@ -1317,6 +1476,69 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    fn wait_for_diagnostics(
+        diagnostics: &LocalServerDiagnostics,
+        changes: &std_mpsc::Receiver<()>,
+        predicate: impl Fn(LocalServerDiagnosticsSnapshot) -> bool,
+    ) -> LocalServerDiagnosticsSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let snapshot = diagnostics.snapshot();
+            if predicate(snapshot) {
+                return snapshot;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "diagnostics did not reach expected state"
+            );
+            changes
+                .recv_timeout(remaining)
+                .expect("diagnostics did not report a state change");
+        }
+    }
+
+    #[test]
+    fn diagnostics_publish_only_real_state_transitions() {
+        let diagnostics = LocalServerDiagnostics::new(16_873);
+        let notifications = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&notifications);
+        let subscription = diagnostics.subscribe(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert_eq!(
+            diagnostics.snapshot(),
+            LocalServerDiagnosticsSnapshot {
+                port: 16_873,
+                reachability: LocalServerReachability::Starting,
+                browser_subscribers: 0,
+            }
+        );
+        diagnostics.set_reachability(LocalServerReachability::Reachable);
+        diagnostics.set_reachability(LocalServerReachability::Reachable);
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+
+        let first = diagnostics.browser_subscriber_connected();
+        let second = diagnostics.browser_subscriber_connected();
+        assert_eq!(diagnostics.snapshot().browser_subscribers, 2);
+        assert_eq!(notifications.load(Ordering::SeqCst), 3);
+
+        drop(first);
+        assert_eq!(diagnostics.snapshot().browser_subscribers, 1);
+        assert_eq!(notifications.load(Ordering::SeqCst), 4);
+
+        diagnostics.set_reachability(LocalServerReachability::Stopped);
+        assert_eq!(diagnostics.snapshot().browser_subscribers, 0);
+        assert_eq!(notifications.load(Ordering::SeqCst), 5);
+        drop(second);
+        assert_eq!(notifications.load(Ordering::SeqCst), 5);
+
+        drop(subscription);
+        diagnostics.set_reachability(LocalServerReachability::Starting);
+        assert_eq!(notifications.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
@@ -1582,6 +1804,7 @@ mod tests {
             recovery: Arc::clone(&recovery),
             shutdown: None,
             thread: None,
+            diagnostics: LocalServerDiagnostics::new(0),
             overlay_url: String::new(),
             licenses_url: String::new(),
         };
@@ -1786,6 +2009,7 @@ mod tests {
             hub: test_hub(),
             port: 16_873,
             stamp_paths: Arc::new(paths),
+            diagnostics: LocalServerDiagnostics::new(16_873),
         };
         let mut headers = HeaderMap::new();
         headers.insert(HOST, "127.0.0.1:16873".parse().unwrap());
@@ -1827,6 +2051,14 @@ mod tests {
         let port = available_port();
         let source_items = Arc::new(Mutex::new(Vec::new()));
         let server = spawn(port, &[], Arc::clone(&source_items)).unwrap();
+        let diagnostics = server.diagnostics();
+        let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
+        let _diagnostics_subscription = diagnostics.subscribe(move || {
+            let _ = diagnostics_tx.send(());
+        });
+        wait_for_diagnostics(&diagnostics, &diagnostics_rx, |snapshot| {
+            snapshot.reachability == LocalServerReachability::Reachable
+        });
         let url = format!("ws://127.0.0.1:{port}/ws");
 
         let mut http = std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
@@ -1878,6 +2110,9 @@ mod tests {
             .into_text()
             .unwrap()
             .contains("\"type\":\"snapshot\""));
+        wait_for_diagnostics(&diagnostics, &diagnostics_rx, |snapshot| {
+            snapshot.browser_subscribers == 1
+        });
 
         let begin = PainterMessage::StrokeBegin {
             stroke_id: "integration".into(),
@@ -1909,6 +2144,18 @@ mod tests {
         assert_eq!(pong.into_text().unwrap(), r#"{"type":"pong","t":42.0}"#);
 
         socket.close(None).await.unwrap();
+        wait_for_diagnostics(&diagnostics, &diagnostics_rx, |snapshot| {
+            snapshot.reachability == LocalServerReachability::Reachable
+                && snapshot.browser_subscribers == 0
+        });
         drop(server);
+        assert_eq!(
+            diagnostics.snapshot(),
+            LocalServerDiagnosticsSnapshot {
+                port,
+                reachability: LocalServerReachability::Stopped,
+                browser_subscribers: 0,
+            }
+        );
     }
 }
