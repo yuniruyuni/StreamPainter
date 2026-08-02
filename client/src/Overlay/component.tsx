@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { connectOverlay } from "./connection";
+import { OverlayDisconnectGuard } from "./disconnect-guard";
 import { RenderQueue } from "./render-queue";
 import { OverlayLayers } from "./renderer/layers";
 import { OverlayState } from "./state";
@@ -77,43 +78,53 @@ export const OverlayApp: React.FC = () => {
       });
     }
 
-    const conn = connectOverlay(`ws://${location.host}/ws`, (msg) => {
-      const effect = state.apply(msg);
-      layers.setItems(state.items);
-      switch (effect.kind) {
-        case "none":
-          return true;
-        case "active":
-          schedule(effect);
-          return true;
-        case "bake":
-          schedule(effect);
-          return true;
-        case "bake_item":
-          schedule(effect);
-          return true;
-        case "cancel":
-          schedule(effect);
-          return true;
-        case "preview":
-          schedule(effect);
-          return true;
-        case "stamp_preview":
-          schedule(effect);
-          return true;
-        case "rebuild":
-          schedule(effect);
-          return true;
-        case "resync":
-          cancelScheduledRender();
-          return false;
-      }
+    const disconnectGuard = new OverlayDisconnectGuard(() => {
+      cancelScheduledRender();
+      state.reset();
+      layers.clear();
     });
+    const conn = connectOverlay(
+      `ws://${location.host}/ws`,
+      (msg) => {
+        const effect = state.apply(msg);
+        layers.setItems(state.items);
+        switch (effect.kind) {
+          case "none":
+            return true;
+          case "active":
+            schedule(effect);
+            return true;
+          case "bake":
+            schedule(effect);
+            return true;
+          case "bake_item":
+            schedule(effect);
+            return true;
+          case "cancel":
+            schedule(effect);
+            return true;
+          case "preview":
+            schedule(effect);
+            return true;
+          case "stamp_preview":
+            schedule(effect);
+            return true;
+          case "rebuild":
+            schedule(effect);
+            return true;
+          case "resync":
+            cancelScheduledRender();
+            return false;
+        }
+      },
+      (status) => disconnectGuard.update(status),
+    );
 
     window.addEventListener("resize", size);
     return () => {
       window.removeEventListener("resize", size);
       cancelScheduledRender();
+      disconnectGuard.dispose();
       conn.close();
       layers.dispose();
     };

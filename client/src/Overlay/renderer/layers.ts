@@ -106,6 +106,11 @@ export class OverlayLayers {
     this.renderActive();
   }
 
+  /** 長期切断時に両表示canvasと描画中状態を透明へ戻す。 */
+  clear(): void {
+    this.rebuild([]);
+  }
+
   // 最初のpreviewだけbakedを再構築し、以降はactive上のスタンプだけを更新する。
   previewStamp(stamp: StampItem, rebuildBaked: boolean): void {
     this.movingStamp = stamp;

@@ -59,6 +59,30 @@ describe("OverlayState", () => {
     expect(state.rev).toBe(3);
   });
 
+  test("resetは履歴と同期状態を破棄し、次のsnapshotから復元する", () => {
+    const state = synchronizedState([strokeItem("old")], 3);
+    state.reset();
+    expect(state.items).toEqual([]);
+    expect(state.fadeAfterMs).toBeNull();
+    expect(state.rev).toBe(0);
+    expect(
+      state.apply({ type: "clear", rev: 4 } as RevisionedPaintEvent).kind,
+    ).toBe("resync");
+
+    expect(
+      state.apply({
+        type: "snapshot",
+        protocolVersion: PROTOCOL_VERSION,
+        rev: 8,
+        fadeAfterMs: 5_000,
+        items: [strokeItem("new")],
+      }).kind,
+    ).toBe("rebuild");
+    expect(state.items).toEqual([strokeItem("new")]);
+    expect(state.fadeAfterMs).toBe(5_000);
+    expect(state.rev).toBe(8);
+  });
+
   test("begin → points → end のライフサイクル", () => {
     const state = synchronizedState();
     const begin = applyNext(state, {

@@ -48,6 +48,15 @@ export class OverlayState {
       .map(({ kind: _kind, ...stroke }) => stroke);
   }
 
+  /** 長期切断時に古い履歴を捨て、次のsnapshot受理まで増分を拒否する。 */
+  reset(): void {
+    this.items = [];
+    this.fadeAfterMs = null;
+    this.rev = 0;
+    this.synchronized = false;
+    this.movingStampId = null;
+  }
+
   apply(msg: ServerToOverlayMessage): RenderEffect {
     if (msg.type === "pong") return { kind: "none" };
 

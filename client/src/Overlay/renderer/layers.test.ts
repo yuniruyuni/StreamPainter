@@ -281,6 +281,24 @@ function withoutWarnings(callback: () => void): void {
 }
 
 describe("OverlayLayers marker compositing scratch", () => {
+  test("clearはbaked・activeの両canvasを同期的に透明化する", () => {
+    const { layers, baked, active } = harness();
+    layers.rebuild([marker(1)]);
+    baked.context.resetLogs();
+    active.context.resetLogs();
+
+    layers.clear();
+
+    expect(baked.context.operations.map((operation) => operation.kind)).toEqual(
+      ["clear"],
+    );
+    expect(
+      active.context.operations.map((operation) => operation.kind),
+    ).toEqual(["clear"]);
+    expect(baked.context.drawImageCalls).toEqual([]);
+    expect(active.context.drawImageCalls).toEqual([]);
+  });
+
   test("自己交差する半透明strokeを不透明scratchから1回だけ合成する", () => {
     const { layers, baked, runtime } = harness();
     const crossingPoints: Extract<CanvasItem, { kind: "stroke" }>["pts"] = [
