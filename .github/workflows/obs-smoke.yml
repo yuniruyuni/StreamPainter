@@ -1,0 +1,100 @@
+name: Real OBS smoke test
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly at 04:17 Monday JST. Keep this non-required while hosted-GUI
+    # behavior remains outside GitHub's documented runner guarantees.
+    - cron: "17 19 * * 0"
+
+env:
+  OBS_VERSION: 32.2.1
+  OBS_ARCHIVE_URL: https://github.com/obsproject/obs-studio/releases/download/32.2.1/OBS-Studio-32.2.1-Windows-x64.zip
+  OBS_ARCHIVE_SHA256: db64a2934f8261f85b1410b84be011207a0afda5400d008289f1f1e211bcc7de
+
+jobs:
+  smoke:
+    # A standard fresh VM is reproducible and needs no repository secret.
+    # It does not promise a physical display or GPU, so this scheduled/manual
+    # workflow is deliberately not a pull-request or push status check.
+    runs-on: windows-2025
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Initialize diagnostics directory
+        shell: pwsh
+        run: |
+          $directory = "$env:RUNNER_TEMP/stream-painter-obs-smoke-diagnostics"
+          New-Item -ItemType Directory -Force $directory | Out-Null
+          @(
+            "run_id=${{ github.run_id }}"
+            "run_attempt=${{ github.run_attempt }}"
+            "runner_os=$env:RUNNER_OS"
+            "image_os=$env:ImageOS"
+            "image_version=$env:ImageVersion"
+          ) | Set-Content "$directory/workflow-context.txt" -Encoding utf8
+
+      - name: Test smoke helper logic
+        shell: pwsh
+        run: ./scripts/windows/test-obs-smoke-lib.ps1
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: painter
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: Generate embedded application assets
+        run: bun run prepare:painter
+
+      - name: Build StreamPainter
+        working-directory: painter
+        run: cargo build --release --locked
+
+      - name: Run real OBS Browser Source smoke test
+        shell: pwsh
+        run: |
+          ./scripts/windows/run-obs-smoke.ps1 `
+            -StreamPainterExecutable ./painter/target/release/stream-painter.exe `
+            -ObsVersion $env:OBS_VERSION `
+            -ObsArchiveUri $env:OBS_ARCHIVE_URL `
+            -ObsArchiveSha256 $env:OBS_ARCHIVE_SHA256 `
+            -WorkDirectory "$env:RUNNER_TEMP/stream-painter-obs-smoke" `
+            -ArtifactDirectory "$env:RUNNER_TEMP/stream-painter-obs-smoke-diagnostics" `
+            -OverallTimeoutSeconds 600
+
+      - name: Upload OBS smoke diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: real-obs-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stream-painter-obs-smoke-diagnostics
+          if-no-files-found: error
+          retention-days: 14

@@ -6,6 +6,7 @@
 - [webapp.md](webapp.md): OBS Browser Sourceの描画実装
 - [protocol.md](protocol.md): ローカルWebSocketプロトコル
 - [security.md](security.md): loopbackサービスの脅威モデルと防御
+- [obs-smoke-test.md](obs-smoke-test.md): 実OBSを使うWindows定期smoke test
 - [roadmap.md](roadmap.md): 現在の到達点と今後の候補
 
 現在の正式構成はローカル完結型です。旧Cloud Runサーバー、Twitch認証、PostgreSQL、
