@@ -6,6 +6,18 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-03
+
+### Changed
+
+- Release tagがmainへ反映済みのcommitだけを指すことを、build前に検証
+
+### Fixed
+
+- ペンとタッチなど複数ポインターの入力が混線し、別ポインターで描画が確定する問題を修正
+- pointer cancelやcapture喪失時に、描画中のストローク／図形を安全に破棄
+- Browser SourceのWebSocket接続直後に失敗した場合も指数backoffを維持
+
 ## [0.3.1] - 2026-08-02
 
 ### Changed
@@ -62,7 +74,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.1.1...v0.2.0
