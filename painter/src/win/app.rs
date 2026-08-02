@@ -34,6 +34,9 @@ use crate::engine::canvas_engine::CanvasEngine;
 use crate::engine::content_rect::{content_rect, parse_aspect, Rect};
 use crate::net::local_server::{self, LocalServerHandle};
 use crate::net::obs::{self, ObsSettings, ProjectorView};
+use crate::net::obs_request::{
+    PollDisposition, ProjectorRequestTracker, RequestGeneration, WorkerDisposition,
+};
 use crate::protocol::{Brush, LineStyle, ShapeKind, StampItem, Tool};
 use crate::win::hotkey::{self, ChangeCommand, HotkeyManager};
 use crate::win::menu::{self, DrawTool, MenuAction};
@@ -55,10 +58,15 @@ const PROJECTOR_INTERVAL_MS: u32 = 2000;
 /// obs-websocket でプロジェクターを開いた後、表示を確認するまでの高速ポーリング
 const PENDING_TIMER_ID: usize = 3;
 const PENDING_INTERVAL_MS: u32 = 250;
-const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RENDERER_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-/// obs-websocket 要求スレッドからの結果通知 (wparam: 成功=1)
+/// obs-websocket workerがchannelへ結果を追加したことだけを通知する。payloadは持たない。
+/// WM_APP+3 はhotkey transactionが使用するため、既存の+2を維持する。
 const WM_OBS_RESULT: u32 = WM_APP + 2;
+
+struct ObsWorkerResult {
+    generation: RequestGeneration,
+    outcome: std::result::Result<(), String>,
+}
 
 struct StampDrag {
     pointer_id: u32,
@@ -122,8 +130,12 @@ struct App {
     obs: Option<ObsSettings>,
     /// 描画モード終了時にプロジェクターを閉じるか
     close_projector: bool,
-    /// hotkey → プロジェクターを開いて描画モードに入る、の完了待ち (開始時刻)
-    pending_draw: Option<std::time::Instant>,
+    /// 世代IDとworker/UI共通deadlineを持つprojector要求状態。
+    obs_requests: ProjectorRequestTracker,
+    /// receiverをsenderより先にdropし、終了中のworker送信をdisconnectさせる。
+    obs_result_rx: std::sync::mpsc::Receiver<ObsWorkerResult>,
+    obs_result_tx: std::sync::mpsc::Sender<ObsWorkerResult>,
+    obs_worker_wake_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 登録競合時もトレイ操作だけで継続し、設定変更はtransactionalに反映する。
     hotkey: HotkeyManager,
     /// 現在のプロジェクターを自分が obs-websocket で開いたか
@@ -219,6 +231,8 @@ pub fn run() -> Result<()> {
 
     let mut hotkey = HotkeyManager::new(hwnd);
     let startup_hotkey_error = hotkey.register_initial(&config.hotkey).err();
+    let (obs_result_tx, obs_result_rx) = std::sync::mpsc::channel();
+    let obs_worker_wake_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
 
     let mut app = Box::new(App {
         engine,
@@ -241,7 +255,10 @@ pub fn run() -> Result<()> {
         projector_visible: false,
         obs,
         close_projector: config.close_projector,
-        pending_draw: None,
+        obs_requests: ProjectorRequestTracker::default(),
+        obs_result_rx,
+        obs_result_tx,
+        obs_worker_wake_enabled,
         hotkey,
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
@@ -776,6 +793,7 @@ impl App {
         let Some((actual_index, next_monitor)) = select_monitor(&monitors, self.configured_screen)
         else {
             warn!("display configuration changed; no monitor is available");
+            self.cancel_obs_request(hwnd, "display configuration became unavailable");
             self.set_draw_mode(hwnd, false);
             self.projector_visible = false;
             let _ = self.projector_z_order.enforce(None, hwnd);
@@ -789,6 +807,7 @@ impl App {
             self.poll_projector(hwnd);
             return;
         }
+        self.cancel_obs_request(hwnd, "target display changed");
         self.radial_menu = None;
         self.cancel_stamp_drag(hwnd);
 
@@ -886,71 +905,138 @@ impl App {
 
     /// obs-websocket でプロジェクターを開き、表示確認後に描画モードへ入る
     fn request_projector(&mut self, hwnd: HWND) {
-        if self.pending_draw.is_some() {
+        let Some(obs) = self.obs.clone() else { return };
+        let Some(request) = self.obs_requests.begin(std::time::Instant::now()) else {
+            return;
+        };
+        info!(
+            "opening OBS projector via obs-websocket (generation={})...",
+            request.generation
+        );
+        if unsafe { SetTimer(Some(hwnd), PENDING_TIMER_ID, PENDING_INTERVAL_MS, None) } == 0 {
+            let _ = self.obs_requests.cancel();
+            warn!(
+                "could not start OBS projector deadline timer (generation={})",
+                request.generation
+            );
             return;
         }
-        let Some(obs) = self.obs.clone() else { return };
-        self.pending_draw = Some(std::time::Instant::now());
-        info!("opening OBS projector via obs-websocket...");
 
         let mon = self.monitor;
+        let result_tx = self.obs_result_tx.clone();
+        let wake_enabled = std::sync::Arc::clone(&self.obs_worker_wake_enabled);
+        // HWNDそのものはthread間で渡さず、wake message送信用のcopyable handle値だけを持つ。
+        // 結果payloadはchannel側に置くため、messageにpointerは含めない。
         let hwnd_raw = hwnd.0 as isize;
         std::thread::spawn(move || {
-            let result = obs::open_projector(&obs, mon.x, mon.y, mon.width, mon.height);
-            if let Err(e) = &result {
-                warn!("open projector failed: {e:#}");
-            }
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(hwnd_raw as *mut core::ffi::c_void)),
-                    WM_OBS_RESULT,
-                    WPARAM(result.is_ok() as usize),
-                    LPARAM(0),
-                );
+            let outcome =
+                obs::open_projector(&obs, mon.x, mon.y, mon.width, mon.height, request.deadline)
+                    .map_err(|error| format!("{error:#}"));
+            let delivered = result_tx
+                .send(ObsWorkerResult {
+                    generation: request.generation,
+                    outcome,
+                })
+                .is_ok();
+            if delivered && wake_enabled.load(std::sync::atomic::Ordering::Acquire) {
+                // App終了後はreceiverがdropされるためsendが失敗し、stale HWNDへpostしない。
+                // send成功とDestroyのraceでpostされてもpayloadなしのprivate messageなので安全。
+                let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_OBS_RESULT, WPARAM(0), LPARAM(0));
+                }
             }
         });
-        unsafe {
-            SetTimer(Some(hwnd), PENDING_TIMER_ID, PENDING_INTERVAL_MS, None);
+    }
+
+    fn on_obs_results(&mut self, hwnd: HWND) {
+        loop {
+            let result = match self.obs_result_rx.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            };
+            self.on_obs_worker_result(hwnd, result);
         }
     }
 
-    fn on_obs_result(&mut self, hwnd: HWND, ok: bool) {
-        if !ok {
-            self.cancel_pending(hwnd, "obs-websocket request failed");
-            return;
+    fn on_obs_worker_result(&mut self, hwnd: HWND, result: ObsWorkerResult) {
+        let succeeded = result.outcome.is_ok();
+        match self.obs_requests.worker_finished(
+            std::time::Instant::now(),
+            result.generation,
+            succeeded,
+        ) {
+            WorkerDisposition::Ignored => {
+                info!(
+                    "ignored stale OBS projector result (generation={}, success={succeeded})",
+                    result.generation
+                );
+            }
+            WorkerDisposition::AwaitingProjector => {
+                info!(
+                    "OBS projector request succeeded (generation={}); waiting for window",
+                    result.generation
+                );
+                self.poll_projector(hwnd);
+                self.apply_pending_poll(hwnd);
+            }
+            WorkerDisposition::Failed(generation) => {
+                self.stop_pending_timer(hwnd);
+                warn!(
+                    "OBS projector request failed (generation={generation}): {}",
+                    result
+                        .outcome
+                        .expect_err("failed disposition requires a worker error")
+                );
+            }
+            WorkerDisposition::TimedOut(generation) => {
+                self.stop_pending_timer(hwnd);
+                warn!(
+                    "OBS projector request timed out (generation={generation}); late worker result ignored"
+                );
+            }
         }
-        self.poll_projector(hwnd);
-        self.try_finish_pending(hwnd);
     }
 
     fn on_pending_timer(&mut self, hwnd: HWND) {
+        // wake messageが配送されなかった場合も、deadline timerをchannelのfallback drainにする。
+        self.on_obs_results(hwnd);
         self.poll_projector(hwnd);
-        self.try_finish_pending(hwnd);
-        if let Some(started) = self.pending_draw {
-            if started.elapsed() > PENDING_TIMEOUT {
-                self.cancel_pending(hwnd, "projector did not appear in time");
+        self.apply_pending_poll(hwnd);
+    }
+
+    fn apply_pending_poll(&mut self, hwnd: HWND) {
+        match self
+            .obs_requests
+            .poll(std::time::Instant::now(), self.projector_visible)
+        {
+            PollDisposition::Idle | PollDisposition::Waiting => {}
+            PollDisposition::Ready(generation) => {
+                info!("OBS projector became visible (generation={generation})");
+                self.projector_opened_by_us = true;
+                self.stop_pending_timer(hwnd);
+                self.set_draw_mode(hwnd, true);
+            }
+            PollDisposition::TimedOut(generation) => {
+                self.stop_pending_timer(hwnd);
+                warn!(
+                    "OBS projector request timed out before the window appeared (generation={generation})"
+                );
             }
         }
     }
 
-    /// プロジェクターの表示が確認できたら描画モードへ入る
-    fn try_finish_pending(&mut self, hwnd: HWND) {
-        if self.pending_draw.is_some() && self.projector_visible {
-            self.pending_draw = None;
-            self.projector_opened_by_us = true;
-            unsafe {
-                let _ = KillTimer(Some(hwnd), PENDING_TIMER_ID);
-            }
-            self.set_draw_mode(hwnd, true);
+    fn stop_pending_timer(&self, hwnd: HWND) {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), PENDING_TIMER_ID);
         }
     }
 
-    fn cancel_pending(&mut self, hwnd: HWND, reason: &str) {
-        if self.pending_draw.take().is_some() {
-            warn!("pending draw canceled: {reason}");
-            unsafe {
-                let _ = KillTimer(Some(hwnd), PENDING_TIMER_ID);
-            }
+    fn cancel_obs_request(&mut self, hwnd: HWND, reason: &str) {
+        if let Some(generation) = self.obs_requests.cancel() {
+            info!("canceled OBS projector request (generation={generation}, reason={reason})");
+            self.stop_pending_timer(hwnd);
         }
     }
 
@@ -1649,7 +1735,9 @@ unsafe extern "system" fn window_proc(
                     unsafe { &mut *app_ptr }.poll_projector(hwnd);
                 }
                 Some(TrayCommand::Settings) => {
-                    unsafe { &mut *app_ptr }.set_draw_mode(hwnd, false);
+                    let app = unsafe { &mut *app_ptr };
+                    app.cancel_obs_request(hwnd, "settings opened");
+                    app.set_draw_mode(hwnd, false);
                     let diagnostics = unsafe { &*app_ptr }.web.diagnostics();
                     if let Err(error) = settings::open(hwnd, Some(diagnostics)) {
                         warn!("settings: {error:#}");
@@ -1706,7 +1794,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_OBS_RESULT => {
-            unsafe { &mut *app_ptr }.on_obs_result(hwnd, wparam.0 != 0);
+            unsafe { &mut *app_ptr }.on_obs_results(hwnd);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -1720,6 +1808,13 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             tray::remove(hwnd);
+            let app = unsafe { &mut *app_ptr };
+            app.obs_worker_wake_enabled
+                .store(false, std::sync::atomic::Ordering::Release);
+            if let Some(generation) = app.obs_requests.cancel() {
+                info!("canceled OBS projector request on exit (generation={generation})");
+            }
+            app.stop_pending_timer(hwnd);
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(app_ptr));

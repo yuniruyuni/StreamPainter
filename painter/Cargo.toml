@@ -25,6 +25,9 @@ futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 rust-embed = { version = "8", features = ["include-exclude"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 known-folders = "1.4.2"
 windows-numerics = "0.3"

@@ -7,7 +7,7 @@
 // Linux ホストではコンパイル検証のみ行うため未使用警告を抑制する
 #![cfg_attr(not(windows), allow(dead_code))]
 
-use std::{fmt, time::Duration};
+use std::{fmt, future::Future, time::Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -16,8 +16,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::Message;
-
-const TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProjectorView {
@@ -51,11 +49,15 @@ pub fn open_projector(
     y: i32,
     width: i32,
     height: i32,
+    deadline: Instant,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(open_async(settings, x, y, width, height))
+    rt.block_on(complete_before(
+        tokio::time::Instant::from_std(deadline),
+        open_async(settings, x, y, width, height),
+    ))
 }
 
 type WsStream =
@@ -64,9 +66,8 @@ type WsSink = SplitSink<WsStream, Message>;
 type WsSource = futures_util::stream::SplitStream<WsStream>;
 
 async fn open_async(settings: &ObsSettings, x: i32, y: i32, width: i32, height: i32) -> Result<()> {
-    let (ws, _) = tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(&settings.url))
+    let (ws, _) = tokio_tungstenite::connect_async(&settings.url)
         .await
-        .context("OBS WebSocket への接続がタイムアウトしました")?
         .context(
             "OBS WebSocket へ接続できません (OBS の ツール → WebSocket サーバー設定 を確認)",
         )?;
@@ -129,6 +130,17 @@ async fn open_async(settings: &ObsSettings, x: i32, y: i32, width: i32, height: 
     Ok(())
 }
 
+/// 接続・認証・monitor取得・projector要求の全段階を、同じ絶対deadlineで包む。
+/// 個別stageごとにtimeoutを作り直さない。
+async fn complete_before<T>(
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .context("OBSプロジェクター要求全体の期限を超えました")?
+}
+
 async fn send(sink: &mut WsSink, op: u32, d: Value) -> Result<()> {
     let msg = json!({ "op": op, "d": d });
     sink.send(Message::Text(msg.to_string().into())).await?;
@@ -137,25 +149,19 @@ async fn send(sink: &mut WsSink, op: u32, d: Value) -> Result<()> {
 
 /// 指定 op のメッセージを受信する (イベント等は読み捨てる)
 async fn recv_op(stream: &mut WsSource, op: u64) -> Result<Value> {
-    tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match stream.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text)?;
-                    if v["op"].as_u64() == Some(op) {
-                        return Ok(v["d"].clone());
-                    }
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let v: Value = serde_json::from_str(&text)?;
+                if v["op"].as_u64() == Some(op) {
+                    return Ok(v["d"].clone());
                 }
-                Some(Ok(Message::Close(_))) | None => {
-                    bail!("OBS WebSocket が切断されました")
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(e.into()),
             }
+            Some(Ok(Message::Close(_))) | None => bail!("OBS WebSocket が切断されました"),
+            Some(Ok(_)) => {}
+            Some(Err(e)) => return Err(e.into()),
         }
-    })
-    .await
-    .context("OBS WebSocket の応答がタイムアウトしました")?
+    }
 }
 
 /// Request (op 6) を送り RequestResponse (op 7) を待つ
@@ -199,6 +205,8 @@ fn compute_auth(password: &str, salt: &str, challenge: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -229,5 +237,23 @@ mod tests {
         let expected = b64.encode(Sha256::digest(format!("{secret}ztTBnnuqrqaKDzRM3xcVdbYm")));
         assert_eq!(auth, expected);
         assert_eq!(auth.len(), 44); // sha256 の base64 長
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_deadline_bounds_all_stages_instead_of_resetting_per_stage() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        let result = complete_before(deadline, async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(5)
+        );
     }
 }
