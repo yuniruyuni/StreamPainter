@@ -44,13 +44,16 @@ cargo build --release --locked
 ## リリース（メンテナー向け）
 
 1. `painter/Cargo.toml`のバージョンと`CHANGELOG.md`を更新してmainへ反映する。
-2. 同じバージョンの`vX.Y.Z`タグを作成し、originへpushする。
+2. ローカルのmainをorigin/mainへfast-forwardし、mainへ反映済みの同じcommitに
+   `vX.Y.Z`タグを作成してoriginへpushする。未マージbranchのcommitにはrelease tagを付けない。
 3. Release workflowが全検証、Windows release build、SHA-256生成、GitHub Release公開を
    完了したことを確認する。
 
-タグとCargoのバージョンが一致しない場合、または検証・asset uploadのいずれかが失敗した
-場合はReleaseを公開しません。公開後の同じタグ・assetの上書きは行わず、新しい修正版として
-バージョンを上げてください。Windowsコード署名は現在のフローには含まれません。
+Release workflowは完全なGit履歴を取得し、tagが指すcommitがorigin/mainに含まれることをbuild前に
+検証します。含まれない場合、タグとCargoのバージョンが一致しない場合、または検証・asset
+uploadのいずれかが失敗した場合はReleaseを公開しません。公開後の同じタグ・assetの上書きは
+行わず、新しい修正版としてバージョンを上げてください。Windowsコード署名は現在のフローには
+含まれません。
 
 ## ライセンス
 
