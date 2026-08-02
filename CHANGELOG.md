@@ -6,6 +6,21 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-03
+
+### Added
+
+- OBS Browser Source URLをタスクトレイと設定画面からコピーし、ローカルサーバーの到達状態と
+  Browser Source WebSocket接続数を別々に確認できる診断表示
+- 描画モード切替のグローバルホットキーを設定画面でcapture・解除・既定値へ復元する機能。
+  登録競合時は以前のキーまたはトレイ操作を維持し、保存と再登録を一体でrollback
+
+### Changed
+
+- Windowsネイティブ描画をGPU上のactive scratchと確定segment cursorで増分化し、連続入力を
+  低優先度の`WM_PAINT` 1フレームへ集約。10,000点strokeでも1更新が全点数に比例しない構成へ変更
+- 半透明マーカーをBrowser Sourceと同じくstroke単位のopacityで合成し、ローカル表示の見た目を統一
+
 ## [0.4.0] - 2026-08-03
 
 ### Added
@@ -102,7 +117,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.1...v0.3.2
