@@ -6,15 +6,27 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-03
+
 ### Added
 
+- 設定画面から現在のWindowsユーザーだけを対象に自動起動をopt-inできる機能。実際の
+  Registry状態を表示し、portable exeの移動・削除・不正な起動引数を検出して修復または解除可能
 - Windows Pointer APIでペンの筆圧をペン／マーカーへ、傾きの大きさをマーカーへ反映し、
-  能力を報告しないdeviceでは従来の一定幅を維持
+  能力を報告しないdeviceでは従来の一定幅を維持（物理ペン／固有driverの互換性確認は継続中）
 
 ### Changed
 
 - ローカルWebSocketプロトコルを筆圧・傾きとtool別brush tuningを含むversion 6へ更新し、
-  Direct2DとBrowser Sourceで同じ線幅計算を使用
+  Direct2DとBrowser Sourceで同じ線幅計算を使用。v0.5.xから更新した後は、OBS Browser Sourceの
+  「現在のページを再読み込み」を1回実行する必要あり
+
+### Fixed
+
+- 実OBS smoke workflowでoverlayを起動PID・class・title・monitor矩形・可視状態から特定し、
+  検出失敗時にはsession／desktopと全top-level windowの詳細をartifactへ保存
+- Windowsの実入力streamへ非結合mouse eventを注入して連続したpointer updateを検証し、
+  描画snapshotの種類・完了状態・色・始終点をartifactへ保存
 
 ## [0.5.1] - 2026-08-03
 
@@ -134,7 +146,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.3...v0.4.0
