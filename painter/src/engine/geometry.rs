@@ -44,7 +44,7 @@ fn mid(a: Vec2, b: Vec2) -> Vec2 {
 }
 
 /// n 点のうち形が確定しているセグメント数 (j = 1..=n-2)
-#[allow(dead_code)] // M3 の増分描画最適化で使用予定 (docs/roadmap.md)
+#[allow(dead_code)] // protocol/client conformance とcursor計測テストでも共有する
 pub fn stable_segment_count(point_count: usize) -> usize {
     point_count.saturating_sub(2)
 }
@@ -185,5 +185,72 @@ mod tests {
     #[test]
     fn full_is_stable_plus_tail() {
         assert_eq!(full_segments(&pts(), 1000.0, 1000.0, &brush()).len(), 3);
+    }
+
+    fn long_stroke(point_count: usize) -> Vec<Point> {
+        (0..point_count)
+            .map(|index| {
+                let u = index as f64 / (point_count - 1) as f64;
+                let v = ((index * 37) % 997) as f64 / 996.0;
+                let pressure = (index % 101) as f64 / 100.0;
+                (u, v, pressure, index as f64 * 0.25)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ten_thousand_point_incremental_geometry_matches_full_geometry() {
+        let source = long_stroke(10_000);
+        let mut received = Vec::with_capacity(source.len());
+        let mut incremental = Vec::with_capacity(stable_segment_count(source.len()));
+        let mut next_segment = 1;
+
+        for point in &source {
+            received.push(*point);
+            let new_segments = stable_segments(&received, 3840.0, 2160.0, &brush(), next_segment);
+            // 1点ずつ届く通常更新では、既存9,999点の有無にかかわらず新規仕事は
+            // 最大1segment。Rendererもこのcursorをそのまま保持する。
+            assert!(new_segments.len() <= 1);
+            next_segment += new_segments.len();
+            incremental.extend(new_segments);
+        }
+
+        assert_eq!(
+            incremental,
+            stable_segments(&source, 3840.0, 2160.0, &brush(), 1)
+        );
+        assert_eq!(next_segment, stable_segment_count(source.len()) + 1);
+    }
+
+    #[test]
+    fn ten_thousand_point_last_update_meets_the_native_frame_budget() {
+        const SAMPLES: usize = 2_000;
+        const TARGET_FRAME_MS: f64 = 1_000.0 / 60.0;
+        let source = long_stroke(10_000);
+        let next_segment = stable_segment_count(source.len() - 1) + 1;
+
+        let started = std::time::Instant::now();
+        let mut produced = 0;
+        for _ in 0..SAMPLES {
+            produced += std::hint::black_box(stable_segments(
+                std::hint::black_box(&source),
+                3840.0,
+                2160.0,
+                std::hint::black_box(&brush()),
+                std::hint::black_box(next_segment),
+            ))
+            .len();
+        }
+        let elapsed = started.elapsed();
+        let average_ms = elapsed.as_secs_f64() * 1_000.0 / SAMPLES as f64;
+        eprintln!(
+            "10,000-point incremental geometry: {average_ms:.6} ms/update ({SAMPLES} samples)"
+        );
+
+        assert_eq!(produced, SAMPLES);
+        assert!(
+            average_ms < TARGET_FRAME_MS,
+            "incremental geometry {average_ms:.3} ms exceeded the 60fps frame budget"
+        );
     }
 }

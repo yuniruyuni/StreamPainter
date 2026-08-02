@@ -10,6 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use tracing::{info, warn};
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -23,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     POINTER_MESSAGE_FLAG_CANCELED, POINTER_MESSAGE_FLAG_FIRSTBUTTON,
     POINTER_MESSAGE_FLAG_SECONDBUTTON, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_HOTKEY, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
+    WM_DISPLAYCHANGE, WM_HOTKEY, WM_PAINT, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP,
     WM_POINTERUPDATE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -70,6 +71,31 @@ struct StampSelection {
     drag: Option<StampDrag>,
 }
 
+/// 高ポーリングレート入力から同じフレームへの描画要求を1件へ集約する純状態。
+#[derive(Default)]
+struct FrameGate {
+    pending: bool,
+}
+
+impl FrameGate {
+    /// 新しく低優先度の paint を予約すべき場合だけ true。
+    fn request(&mut self) -> bool {
+        if self.pending {
+            return false;
+        }
+        self.pending = true;
+        true
+    }
+
+    fn take(&mut self) -> bool {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn cancel(&mut self) {
+        self.pending = false;
+    }
+}
+
 struct App {
     engine: CanvasEngine,
     web: LocalServerHandle,
@@ -109,6 +135,7 @@ struct App {
     radial_menu: Option<RadialMenu>,
     /// 選択中スタンプは baked から分離し、ドラッグ用のフレーム層へ描く。
     stamp_selection: Option<StampSelection>,
+    frame_gate: FrameGate,
 }
 
 pub fn run() -> Result<()> {
@@ -220,6 +247,7 @@ pub fn run() -> Result<()> {
         projector_z_order: projector::ZOrderGuard::default(),
         radial_menu: None,
         stamp_selection: None,
+        frame_gate: FrameGate::default(),
     });
 
     // 起動時に透明フレームを 1 回描き、D2D シェーダコンパイル・swapchain 初回
@@ -578,7 +606,30 @@ impl App {
 
     // ローカルエコーは描画モード中のみ表示する。パススルー中は overlay
     // (プロジェクター内のブラウザソース) 側の表示だけが見える
+    fn request_render(&mut self) {
+        if !self.draw_mode || !self.frame_gate.request() {
+            return;
+        }
+        // WM_PAINT は queued input/posted messages を処理した後にのみ生成され、同じ
+        // invalid region への複数要求も1件へ統合される。WM_APP をPostするとinputより
+        // 先に取り出され得て 1 update = 1 Present になるため、frame予約には使わない。
+        if !unsafe { InvalidateRect(Some(self.overlay_hwnd), None, false) }.as_bool() {
+            warn!("failed to invalidate native frame");
+            // invalidation失敗時もローカルエコーを止めない。
+            self.frame_gate.cancel();
+            self.render();
+        }
+    }
+
+    fn on_frame_request(&mut self) {
+        if self.frame_gate.take() {
+            self.render();
+        }
+    }
+
     fn render(&mut self) {
+        // pointer up / menu 操作などの即時描画は予約済みframeを包含する。
+        self.frame_gate.cancel();
         if !self.draw_mode {
             return;
         }
@@ -910,6 +961,7 @@ impl App {
         let t = std::time::Instant::now();
         self.draw_mode = on;
         if !self.draw_mode {
+            self.frame_gate.cancel();
             self.radial_menu = None;
             let deselected = self.stamp_selection.take().is_some();
             // 描画中に切り替えた場合はストロークを破棄する
@@ -1016,7 +1068,7 @@ impl App {
         };
         if let Some((item_id, center)) = moved {
             let _ = self.engine.preview_stamp_move(&item_id, center);
-            self.render();
+            self.request_render();
         }
         true
     }
@@ -1159,7 +1211,7 @@ impl App {
             return false;
         }
         if menu.update(pointer_screen(lparam)) {
-            self.render();
+            self.request_render();
         }
         true
     }
@@ -1316,6 +1368,7 @@ impl App {
         unsafe {
             SetTimer(Some(hwnd), FLUSH_TIMER_ID, FLUSH_INTERVAL_MS, None);
         }
+        // active scratch と cursor を入力開始時に確立する。以降の update はframe集約。
         self.render();
     }
 
@@ -1348,7 +1401,7 @@ impl App {
         } else if trimmed {
             self.rebuild();
         }
-        self.render();
+        self.request_render();
     }
 
     fn on_pointer_up(&mut self, hwnd: HWND, pointer_id: u32, lparam: LPARAM) {
@@ -1656,6 +1709,15 @@ unsafe extern "system" fn window_proc(
             unsafe { &mut *app_ptr }.on_obs_result(hwnd, wparam.0 != 0);
             LRESULT(0)
         }
+        WM_PAINT => {
+            // BeginPaint/EndPaintでupdate regionを必ずvalidateする。即時renderが予約を
+            // 包含済みならFrameGate::takeはfalseとなり、このpaintはno-opになる。
+            let mut paint = PAINTSTRUCT::default();
+            let _ = unsafe { BeginPaint(hwnd, &mut paint) };
+            unsafe { &mut *app_ptr }.on_frame_request();
+            let _ = unsafe { EndPaint(hwnd, &paint) };
+            LRESULT(0)
+        }
         WM_DESTROY => {
             tray::remove(hwnd);
             unsafe {
@@ -1671,7 +1733,41 @@ unsafe extern "system" fn window_proc(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+
+    const WM_FRAME_TEST_UPDATE: u32 = WM_APP + 0x500;
+    static FRAME_TEST_UPDATES: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_TEST_PAINTS: AtomicUsize = AtomicUsize::new(0);
+    static FRAME_TEST_UPDATES_AT_FIRST_PAINT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn frame_test_window_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_FRAME_TEST_UPDATE => {
+                FRAME_TEST_UPDATES.fetch_add(1, Ordering::SeqCst);
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+                LRESULT(0)
+            }
+            WM_PAINT => {
+                if FRAME_TEST_PAINTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    FRAME_TEST_UPDATES_AT_FIRST_PAINT
+                        .store(FRAME_TEST_UPDATES.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                let mut paint = PAINTSTRUCT::default();
+                let _ = unsafe { BeginPaint(hwnd, &mut paint) };
+                let _ = unsafe { EndPaint(hwnd, &paint) };
+                LRESULT(0)
+            }
+            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
 
     fn pointer_wparam(pointer_id: u32, flags: u32) -> WPARAM {
         WPARAM((pointer_id as usize) | ((flags as usize) << 16))
@@ -1693,6 +1789,81 @@ mod tests {
         assert_eq!(select_monitor(&monitors, 1), Some((1, monitors[1])));
         assert_eq!(select_monitor(&monitors, 9), Some((0, monitors[0])));
         assert_eq!(select_monitor(&[], 0), None);
+    }
+
+    #[test]
+    fn frame_gate_coalesces_pointer_updates_until_the_frame_is_taken() {
+        let mut gate = FrameGate::default();
+        assert!(gate.request());
+        for _ in 0..1_000 {
+            assert!(!gate.request());
+        }
+        assert!(gate.take());
+        assert!(!gate.take());
+        assert!(gate.request());
+        gate.cancel();
+        assert!(!gate.take());
+    }
+
+    #[test]
+    fn low_priority_paint_runs_after_queued_updates_and_coalesces_invalidations() -> Result<()> {
+        unsafe {
+            let instance = GetModuleHandleW(None)?;
+            let class_name = w!("stream-painter-frame-coalescing-test");
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(frame_test_window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                class_name,
+                w!("StreamPainter frame coalescing test"),
+                WS_POPUP,
+                -10_000,
+                -10_000,
+                64,
+                64,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )?;
+
+            // 非表示windowにはWM_PAINTが生成されないため、画面外で表示し初期paintを
+            // drainしてから今回のframe予約を計測する。
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, Some(hwnd), 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+
+            // 表示直後の初期paintは今回のframe予約とは無関係なので除外する。
+            FRAME_TEST_UPDATES.store(0, Ordering::SeqCst);
+            FRAME_TEST_PAINTS.store(0, Ordering::SeqCst);
+            FRAME_TEST_UPDATES_AT_FIRST_PAINT.store(0, Ordering::SeqCst);
+
+            for _ in 0..1_000 {
+                PostMessageW(Some(hwnd), WM_FRAME_TEST_UPDATE, WPARAM(0), LPARAM(0))?;
+            }
+
+            while PeekMessageW(&mut message, Some(hwnd), 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            let _ = DestroyWindow(hwnd);
+        }
+
+        assert_eq!(FRAME_TEST_UPDATES.load(Ordering::SeqCst), 1_000);
+        assert_eq!(
+            FRAME_TEST_UPDATES_AT_FIRST_PAINT.load(Ordering::SeqCst),
+            1_000
+        );
+        assert_eq!(FRAME_TEST_PAINTS.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[test]

@@ -62,6 +62,29 @@ describe("stableSegments", () => {
     const rest = stableSegments(pts, 1000, 1000, brush, first.length + 1);
     expect([...first, ...rest]).toEqual(all);
   });
+
+  test("10,000点でも1点更新は新規1segmentだけで全体幾何と一致する", () => {
+    const source: StrokePoint[] = Array.from({ length: 10_000 }, (_, index) => [
+      index / 9_999,
+      ((index * 37) % 997) / 996,
+      (index % 101) / 100,
+      index * 0.25,
+    ]);
+    const received: StrokePoint[] = [];
+    const incremental: ReturnType<typeof stableSegments> = [];
+    let nextSegment = 1;
+
+    for (const point of source) {
+      received.push(point);
+      const added = stableSegments(received, 3_840, 2_160, brush, nextSegment);
+      expect(added.length).toBeLessThanOrEqual(1);
+      nextSegment += added.length;
+      incremental.push(...added);
+    }
+
+    expect(incremental).toEqual(stableSegments(source, 3_840, 2_160, brush));
+    expect(nextSegment).toBe(stableSegmentCount(source.length) + 1);
+  });
 });
 
 describe("tailSegment / dot / fullSegments", () => {

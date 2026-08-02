@@ -29,7 +29,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE,
     D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
 };
@@ -53,7 +53,7 @@ use windows_numerics::Vector2;
 
 use crate::config::{self, StampConfig};
 use crate::engine::content_rect::Rect;
-use crate::engine::geometry::{dot, full_segments, Segment};
+use crate::engine::geometry::{dot, full_segments, stable_segments, tail_segment, Segment};
 use crate::protocol::{
     Brush, CanvasItem, LineStyle, ShapeItem, ShapeKind, StampItem, Stroke, Tool,
 };
@@ -107,6 +107,29 @@ impl Drop for AxisAlignedClipGuard {
     }
 }
 
+/// eraser の COPY blend を早期 return 後も SOURCE_OVER へ戻す。
+#[must_use = "the guard must stay alive for the COPY drawing scope"]
+struct CopyBlendGuard {
+    dc: ID2D1DeviceContext,
+}
+
+impl CopyBlendGuard {
+    fn set(dc: &ID2D1DeviceContext) -> Self {
+        unsafe {
+            dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+        }
+        Self { dc: dc.clone() }
+    }
+}
+
+impl Drop for CopyBlendGuard {
+    fn drop(&mut self) {
+        unsafe {
+            self.dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        }
+    }
+}
+
 fn content_clip_rect(content: Rect) -> D2D_RECT_F {
     D2D_RECT_F {
         left: content.x as f32,
@@ -125,12 +148,27 @@ fn with_content_clip<T>(
     draw()
 }
 
+/// 描画中ストロークの GPU scratch にどこまで確定セグメントを書いたかを保持する。
+///
+/// `next_segment` は Browser Source の `ActiveEntry.nextSegment` と同じ 1-origin の
+/// cursor で、点列全体を再走査せず未描画部分だけを `active` bitmap へ追記する。
+#[derive(Debug)]
+struct ActiveStrokeState {
+    stroke_id: String,
+    brush: Brush,
+    next_segment: usize,
+}
+
 pub struct Renderer {
     factory: ID2D1Factory1,
     dc: ID2D1DeviceContext,
     swapchain: IDXGISwapChain1,
     target: ID2D1Bitmap1,
     baked: ID2D1Bitmap1,
+    /// 描画中ストローク専用の再利用 bitmap。pen/marker は透明 scratch、eraser は
+    /// stroke 開始時点の baked 複製として使う。
+    active: ID2D1Bitmap1,
+    active_stroke: Option<ActiveStrokeState>,
     stamp_bitmaps: HashMap<String, ID2D1Bitmap1>,
     stroke_style: ID2D1StrokeStyle1,
     radial_text: IDWriteTextFormat,
@@ -150,12 +188,30 @@ impl Renderer {
         content: Rect,
         stamps: &[StampConfig],
     ) -> Result<Self> {
+        Self::new_with_driver(
+            hwnd,
+            width,
+            height,
+            content,
+            stamps,
+            D3D_DRIVER_TYPE_HARDWARE,
+        )
+    }
+
+    fn new_with_driver(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        content: Rect,
+        stamps: &[StampConfig],
+        driver_type: D3D_DRIVER_TYPE,
+    ) -> Result<Self> {
         unsafe {
             // D3D11 デバイス (BGRA サポートは D2D 連携に必須)
             let mut d3d_device: Option<ID3D11Device> = None;
             D3D11CreateDevice(
                 None,
-                D3D_DRIVER_TYPE_HARDWARE,
+                driver_type,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 None,
@@ -208,7 +264,7 @@ impl Renderer {
             let surface: IDXGISurface = swapchain.GetBuffer(0)?;
             let target = dc.CreateBitmapFromDxgiSurface(&surface, Some(&bitmap_props))?;
 
-            // 確定ストロークの焼き込み先
+            // 確定履歴と描画中ストロークの再利用 scratch。
             let baked_props = D2D1_BITMAP_PROPERTIES1 {
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -220,6 +276,7 @@ impl Renderer {
                 colorContext: core::mem::ManuallyDrop::new(None),
             };
             let baked = dc.CreateBitmap(D2D_SIZE_U { width, height }, None, 0, &baked_props)?;
+            let active = dc.CreateBitmap(D2D_SIZE_U { width, height }, None, 0, &baked_props)?;
             let stamp_bitmaps = load_stamp_bitmaps(&dc, stamps);
 
             // round cap / round join (docs/protocol.md)
@@ -263,6 +320,8 @@ impl Renderer {
                 swapchain,
                 target,
                 baked,
+                active,
+                active_stroke: None,
                 stamp_bitmaps,
                 stroke_style,
                 radial_text,
@@ -285,6 +344,30 @@ impl Renderer {
         items: &[CanvasItem],
         excluded_item_id: Option<&str>,
     ) -> Result<()> {
+        // rebuild/device recovery 後は現在の点列から scratch を再同期する。
+        self.active_stroke = None;
+        self.clear_baked_bitmap()?;
+
+        let visible = items
+            .iter()
+            .filter(|item| item.is_done() && excluded_item_id != Some(item.item_id()))
+            .collect::<Vec<_>>();
+        let mut direct_start = 0;
+        for (index, item) in visible.iter().enumerate() {
+            let CanvasItem::Stroke { stroke } = item else {
+                continue;
+            };
+            if !stroke_uses_opacity_scratch(stroke) {
+                continue;
+            }
+            self.append_baked_items(&visible[direct_start..index])?;
+            self.composite_translucent_stroke(stroke)?;
+            direct_start = index + 1;
+        }
+        self.append_baked_items(&visible[direct_start..])
+    }
+
+    fn clear_baked_bitmap(&self) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.baked);
         }
@@ -293,11 +376,21 @@ impl Renderer {
             unsafe {
                 self.dc.Clear(Some(&transparent()));
             }
+            Ok(())
+        })
+    }
+
+    fn append_baked_items(&self, items: &[&CanvasItem]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            self.dc.SetTarget(&self.baked);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
             with_content_clip(&self.dc, self.content, || {
-                for item in items
-                    .iter()
-                    .filter(|item| item.is_done() && excluded_item_id != Some(item.item_id()))
-                {
+                for item in items {
                     self.draw_item(item)?;
                 }
                 Ok(())
@@ -307,6 +400,19 @@ impl Renderer {
 
     /// 新しく確定した1項目だけをbakedへ追記する。
     pub fn bake_item(&mut self, item: &CanvasItem) -> Result<()> {
+        if let CanvasItem::Stroke { stroke } = item {
+            if self
+                .active_stroke
+                .as_ref()
+                .is_some_and(|active| active.stroke_id == stroke.stroke_id)
+            {
+                return self.bake_active_stroke(stroke);
+            }
+            if stroke_uses_opacity_scratch(stroke) {
+                self.active_stroke = None;
+                return self.composite_translucent_stroke(stroke);
+            }
+        }
         unsafe {
             self.dc.SetTarget(&self.baked);
         }
@@ -316,9 +422,48 @@ impl Renderer {
         })
     }
 
+    /// Browser Sourceと同じく、半透明strokeは不透明scratchへ全体を描いてから
+    /// opacityを1回だけ掛ける。rebuild後もactive確定時と同じ見た目を保つ。
+    fn composite_translucent_stroke(&self, stroke: &Stroke) -> Result<()> {
+        unsafe {
+            self.dc.SetTarget(&self.active);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+            }
+            with_content_clip(&self.dc, self.content, || {
+                let brush = self.opaque_brush(&stroke.brush)?;
+                self.draw_stroke_shape(stroke, &brush)
+            })
+        })?;
+
+        unsafe {
+            self.dc.SetTarget(&self.baked);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || {
+                unsafe {
+                    self.dc.DrawBitmap(
+                        &self.active,
+                        None,
+                        stroke.brush.opacity as f32,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+                Ok(())
+            })
+        })
+    }
+
     /// 空フレームを提示してオーバーレイ表示を消す (パススルー復帰時)。
     /// baked ビットマップは保持したままなので、次の描画モードで再表示される
     pub fn clear_frame(&mut self) -> Result<()> {
+        self.active_stroke = None;
         unsafe {
             self.dc.SetTarget(&self.target);
         }
@@ -343,6 +488,7 @@ impl Renderer {
         selected_stamp: Option<&StampItem>,
         radial: Option<(&RadialMenu, &DrawTool, &str, &[StampConfig])>,
     ) -> Result<()> {
+        self.sync_active_stroke(items)?;
         unsafe {
             self.dc.SetTarget(&self.target);
         }
@@ -353,18 +499,13 @@ impl Renderer {
             }
             with_content_clip(&self.dc, self.content, || {
                 // Browser overlay の canvas と同じく、コンテンツだけを canvas 境界で切る。
-                unsafe {
-                    self.dc.DrawBitmap(
-                        &self.baked,
-                        None,
-                        1.0,
-                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                        None,
-                        None,
-                    );
-                }
+                self.draw_cached_canvas_layers();
                 for item in items.iter().filter(|item| !item.is_done()) {
-                    self.draw_item(item)?;
+                    // Stroke は active bitmap へ増分描画済み。Shape の終点だけは
+                    // 最新値からフレーム単位で描き直す。
+                    if !matches!(item, CanvasItem::Stroke { .. }) {
+                        self.draw_item(item)?;
+                    }
                 }
                 if let Some(stamp) = selected_stamp {
                     self.draw_stamp(stamp)?;
@@ -390,6 +531,225 @@ impl Renderer {
         Ok(())
     }
 
+    /// 最新の active stroke と GPU scratch を同期する。1-origin の cursor より前の
+    /// 点には触れないため、通常の pointer update は新規点数にだけ比例する。
+    fn sync_active_stroke(&mut self, items: &[CanvasItem]) -> Result<()> {
+        let active = items.iter().find_map(|item| match item {
+            CanvasItem::Stroke { stroke } if !stroke.done => Some(stroke),
+            _ => None,
+        });
+        let Some(stroke) = active else {
+            self.active_stroke = None;
+            return Ok(());
+        };
+
+        let needs_reset = self.active_stroke.as_ref().is_none_or(|cached| {
+            cached.stroke_id != stroke.stroke_id || cached.brush != stroke.brush
+        });
+        if needs_reset {
+            self.begin_active_stroke(stroke)?;
+        }
+        self.append_active_stroke(stroke)
+    }
+
+    fn begin_active_stroke(&mut self, stroke: &Stroke) -> Result<()> {
+        self.active_stroke = None;
+        unsafe {
+            self.dc.SetTarget(&self.active);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+                // Eraser preview は確定 baked を壊さない。開始時の複製へ増分消去し、
+                // cancel 時は state を捨てるだけで元表示へ戻せる。
+                if stroke.brush.tool == Tool::Eraser {
+                    self.dc.DrawBitmap(
+                        &self.baked,
+                        None,
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        self.active_stroke = Some(ActiveStrokeState {
+            stroke_id: stroke.stroke_id.clone(),
+            brush: stroke.brush.clone(),
+            next_segment: 1,
+        });
+        Ok(())
+    }
+
+    fn append_active_stroke(&mut self, stroke: &Stroke) -> Result<()> {
+        let from_segment = self
+            .active_stroke
+            .as_ref()
+            .filter(|active| active.stroke_id == stroke.stroke_id)
+            .map_or(1, |active| active.next_segment);
+        let segments = stable_segments(
+            &stroke.pts,
+            self.content.width,
+            self.content.height,
+            &stroke.brush,
+            from_segment,
+        );
+        if segments.is_empty() {
+            return Ok(());
+        }
+
+        unsafe {
+            self.dc.SetTarget(&self.active);
+        }
+        let dc = self.dc.clone();
+        let result = draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || {
+                self.draw_active_segments(&stroke.brush, &segments)
+            })
+        });
+        if let Err(error) = result {
+            // 部分描画済みbitmapを同じcursorで再利用しない。次回はclearして再同期する。
+            self.active_stroke = None;
+            return Err(error);
+        }
+        if let Some(active) = self.active_stroke.as_mut() {
+            active.next_segment += segments.len();
+        }
+        Ok(())
+    }
+
+    fn draw_active_segments(&self, brush: &Brush, segments: &[Segment]) -> Result<()> {
+        let eraser = brush.tool == Tool::Eraser;
+        let _copy = eraser.then(|| CopyBlendGuard::set(&self.dc));
+        let color = if eraser {
+            unsafe { self.dc.CreateSolidColorBrush(&transparent(), None)? }
+        } else {
+            self.opaque_brush(brush)?
+        };
+        for segment in segments {
+            self.draw_segment(segment, &color)?;
+        }
+        Ok(())
+    }
+
+    /// 確定時は未描画の stable segment と tail/dot だけを scratch へ足し、全点から
+    /// geometry を作り直さず baked へ1回合成する。
+    fn bake_active_stroke(&mut self, stroke: &Stroke) -> Result<()> {
+        let result = self.bake_active_stroke_inner(stroke);
+        // 成否にかかわらず、このscratchへtailを重ねることはできない。失敗時は
+        // App側のdevice recoveryが完全履歴からbakedを再構築する。
+        self.active_stroke = None;
+        result
+    }
+
+    fn bake_active_stroke_inner(&mut self, stroke: &Stroke) -> Result<()> {
+        self.append_active_stroke(stroke)?;
+        unsafe {
+            self.dc.SetTarget(&self.active);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || {
+                let eraser = stroke.brush.tool == Tool::Eraser;
+                let _copy = eraser.then(|| CopyBlendGuard::set(&self.dc));
+                let color = if eraser {
+                    unsafe { self.dc.CreateSolidColorBrush(&transparent(), None)? }
+                } else {
+                    self.opaque_brush(&stroke.brush)?
+                };
+                if let Some((center, radius)) = dot(
+                    &stroke.pts,
+                    self.content.width,
+                    self.content.height,
+                    &stroke.brush,
+                ) {
+                    unsafe {
+                        self.dc.FillEllipse(
+                            &D2D1_ELLIPSE {
+                                point: self.to_local(center.x, center.y),
+                                radiusX: radius as f32,
+                                radiusY: radius as f32,
+                            },
+                            &color,
+                        );
+                    }
+                } else if let Some(tail) = tail_segment(
+                    &stroke.pts,
+                    self.content.width,
+                    self.content.height,
+                    &stroke.brush,
+                ) {
+                    self.draw_segment(&tail, &color)?;
+                }
+                Ok(())
+            })
+        })?;
+
+        unsafe {
+            self.dc.SetTarget(&self.baked);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || {
+                let eraser = stroke.brush.tool == Tool::Eraser;
+                let _copy = eraser.then(|| CopyBlendGuard::set(&self.dc));
+                unsafe {
+                    self.dc.DrawBitmap(
+                        &self.active,
+                        None,
+                        if eraser {
+                            1.0
+                        } else {
+                            stroke.brush.opacity as f32
+                        },
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+                Ok(())
+            })
+        })?;
+        Ok(())
+    }
+
+    fn draw_cached_canvas_layers(&self) {
+        let eraser = self
+            .active_stroke
+            .as_ref()
+            .is_some_and(|active| active.brush.tool == Tool::Eraser);
+        unsafe {
+            // Eraser scratch は baked の複製を含むので二重描画しない。
+            if !eraser {
+                self.dc.DrawBitmap(
+                    &self.baked,
+                    None,
+                    1.0,
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                    None,
+                );
+            }
+            if let Some(active) = &self.active_stroke {
+                self.dc.DrawBitmap(
+                    &self.active,
+                    None,
+                    if eraser {
+                        1.0
+                    } else {
+                        active.brush.opacity as f32
+                    },
+                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
     fn draw_item(&self, item: &CanvasItem) -> Result<()> {
         match item {
             CanvasItem::Stroke { stroke } => self.draw_stroke(stroke),
@@ -400,24 +760,15 @@ impl Renderer {
 
     fn draw_stroke(&self, stroke: &Stroke) -> Result<()> {
         // eraser は COPY ブレンドで透明色を書き込み、既存ピクセルを消す。
-        // marker (半透明) はアルファ直描きのため自己交差部がわずかに濃くなる
-        // (overlay はストローク単位レイヤー合成)。厳密な一致は M3 で対応
+        // 半透明strokeは呼び出し側で不透明scratchへ描いてから一括合成する。
         let eraser = stroke.brush.tool == Tool::Eraser;
+        let _copy = eraser.then(|| CopyBlendGuard::set(&self.dc));
         let brush = if eraser {
-            unsafe {
-                self.dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-                self.dc.CreateSolidColorBrush(&transparent(), None)?
-            }
+            unsafe { self.dc.CreateSolidColorBrush(&transparent(), None)? }
         } else {
             self.solid_brush(&stroke.brush)?
         };
-        let result = self.draw_stroke_shape(stroke, &brush);
-        if eraser {
-            unsafe {
-                self.dc.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
-            }
-        }
-        result
+        self.draw_stroke_shape(stroke, &brush)
     }
 
     fn draw_stroke_shape(&self, stroke: &Stroke, brush: &ID2D1SolidColorBrush) -> Result<()> {
@@ -1200,6 +1551,14 @@ impl Renderer {
         unsafe { Ok(self.dc.CreateSolidColorBrush(&color, None)?) }
     }
 
+    /// Browser Source の stroke scratch と同じく、stroke opacity は bitmap 合成時に
+    /// 一度だけ掛けるため、segment 自体は不透明で描く。
+    fn opaque_brush(&self, brush: &Brush) -> Result<ID2D1SolidColorBrush> {
+        let (r, g, b) = parse_color(&brush.color);
+        let color = D2D1_COLOR_F { r, g, b, a: 1.0 };
+        unsafe { Ok(self.dc.CreateSolidColorBrush(&color, None)?) }
+    }
+
     fn line_brush(&self, style: &LineStyle) -> Result<ID2D1SolidColorBrush> {
         let (r, g, b) = parse_color(&style.color);
         let color = D2D1_COLOR_F {
@@ -1299,6 +1658,10 @@ fn transparent() -> D2D1_COLOR_F {
     }
 }
 
+fn stroke_uses_opacity_scratch(stroke: &Stroke) -> bool {
+    stroke.brush.tool != Tool::Eraser && stroke.brush.opacity < 1.0
+}
+
 fn parse_color(hex: &str) -> (f32, f32, f32) {
     let hex = hex.trim_start_matches('#');
     if hex.len() != 6 {
@@ -1315,6 +1678,7 @@ mod tests {
         ID2D1Image, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_MAP_OPTIONS_READ,
     };
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+    use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, WS_POPUP};
 
     const TEST_SIZE: D2D_SIZE_U = D2D_SIZE_U {
         width: 64,
@@ -1324,6 +1688,16 @@ mod tests {
     struct Pixels {
         bytes: Vec<u8>,
         pitch: usize,
+    }
+
+    struct TestWindow(HWND);
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
     }
 
     impl Pixels {
@@ -1370,6 +1744,62 @@ mod tests {
             )?;
             dc.SetTarget(&target);
             Ok((dc, target))
+        }
+    }
+
+    fn test_renderer() -> Result<(Renderer, TestWindow)> {
+        unsafe {
+            // STATIC はWindows組み込みclassなので、並列テストでもclass登録を共有しない。
+            let hwnd = CreateWindowExW(
+                Default::default(),
+                w!("STATIC"),
+                w!("StreamPainter renderer test"),
+                WS_POPUP,
+                0,
+                0,
+                TEST_SIZE.width as i32,
+                TEST_SIZE.height as i32,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            let renderer = Renderer::new_with_driver(
+                hwnd,
+                TEST_SIZE.width,
+                TEST_SIZE.height,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: TEST_SIZE.width as f64,
+                    height: TEST_SIZE.height as f64,
+                },
+                &[],
+                D3D_DRIVER_TYPE_WARP,
+            )?;
+            Ok((renderer, TestWindow(hwnd)))
+        }
+    }
+
+    fn test_stroke(id: &str, tool: Tool, opacity: f64, pts: Vec<crate::protocol::Point>) -> Stroke {
+        Stroke {
+            stroke_id: id.into(),
+            brush: Brush {
+                tool,
+                color: "#ff0000".into(),
+                opacity,
+                width_n: 0.2,
+                pressure_width: false,
+            },
+            pts,
+            done: false,
+            ended_at: None,
+        }
+    }
+
+    fn stroke_item(stroke: &Stroke) -> CanvasItem {
+        CanvasItem::Stroke {
+            stroke: stroke.clone(),
         }
     }
 
@@ -1436,6 +1866,157 @@ mod tests {
             b: 1.0,
             a: 1.0,
         }
+    }
+
+    #[test]
+    fn native_active_scratch_is_incremental_rebuildable_and_cancel_safe() -> Result<()> {
+        let (mut renderer, _window) = test_renderer()?;
+        renderer.rebuild_baked(&[])?;
+
+        let mut marker = test_stroke(
+            "marker",
+            Tool::Marker,
+            0.5,
+            vec![
+                (0.1, 0.5, 1.0, 0.0),
+                (0.35, 0.5, 1.0, 1.0),
+                (0.65, 0.5, 1.0, 2.0),
+            ],
+        );
+        renderer.sync_active_stroke(&[stroke_item(&marker)])?;
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(2)
+        );
+
+        // 同じ点列を再同期しても確定segmentを再描画しない。
+        renderer.sync_active_stroke(&[stroke_item(&marker)])?;
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(2)
+        );
+        marker.pts.push((0.9, 0.5, 1.0, 3.0));
+        renderer.sync_active_stroke(&[stroke_item(&marker)])?;
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(3)
+        );
+        let active_pixels = read_pixels(&renderer.dc, &renderer.active)?;
+        assert_eq!(active_pixels.bgra(32, 24), [0, 0, 255, 255]);
+
+        // baked rebuild / device再生成相当ではcursorを捨て、最新点列から再同期できる。
+        renderer.rebuild_baked(&[])?;
+        assert!(renderer.active_stroke.is_none());
+        renderer.sync_active_stroke(&[stroke_item(&marker)])?;
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(3)
+        );
+
+        marker.done = true;
+        marker.ended_at = Some(4.0);
+        renderer.bake_item(&stroke_item(&marker))?;
+        assert!(renderer.active_stroke.is_none());
+        let baked_marker = read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24);
+        assert_eq!(&baked_marker[..2], &[0, 0]);
+        assert!((120..=136).contains(&baked_marker[2]));
+        assert!((120..=136).contains(&baked_marker[3]));
+        renderer.rebuild_baked(&[stroke_item(&marker)])?;
+        assert_eq!(
+            read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24),
+            baked_marker
+        );
+
+        let mut eraser = test_stroke(
+            "eraser",
+            Tool::Eraser,
+            1.0,
+            vec![
+                (0.5, 0.1, 1.0, 0.0),
+                (0.5, 0.5, 1.0, 1.0),
+                (0.5, 0.9, 1.0, 2.0),
+            ],
+        );
+        renderer.sync_active_stroke(&[stroke_item(&eraser)])?;
+        assert_eq!(
+            read_pixels(&renderer.dc, &renderer.active)?.bgra(32, 24),
+            [0, 0, 0, 0]
+        );
+        // preview/cancelは確定bakedを破壊しない。
+        assert_eq!(
+            read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24),
+            baked_marker
+        );
+        renderer.sync_active_stroke(&[])?;
+        assert!(renderer.active_stroke.is_none());
+        assert_eq!(
+            read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24),
+            baked_marker
+        );
+
+        renderer.sync_active_stroke(&[stroke_item(&eraser)])?;
+        eraser.done = true;
+        eraser.ended_at = Some(5.0);
+        renderer.bake_item(&stroke_item(&eraser))?;
+        assert_eq!(
+            read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24),
+            [0, 0, 0, 0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ten_thousand_point_native_scratch_measures_only_the_new_segment() -> Result<()> {
+        let (mut renderer, _window) = test_renderer()?;
+        renderer.rebuild_baked(&[])?;
+        let mut stroke = test_stroke(
+            "long-stroke",
+            Tool::Pen,
+            1.0,
+            (0..9_999)
+                .map(|index| (index as f64 / 9_999.0, 0.5, 1.0, index as f64 * 0.25))
+                .collect(),
+        );
+        renderer.sync_active_stroke(&[stroke_item(&stroke)])?;
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(9_998)
+        );
+
+        stroke.pts.push((1.0, 0.5, 1.0, 2_499.75));
+        let started = std::time::Instant::now();
+        renderer.sync_active_stroke(&[stroke_item(&stroke)])?;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "10,000-point native Direct2D scratch: {:.6} ms for the final segment",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(9_999)
+        );
+        // Wall-clock tests can be descheduled on shared CI. The averaged pure geometry test
+        // enforces 16.67ms; this only guards a catastrophic native regression.
+        assert!(elapsed < std::time::Duration::from_millis(250));
+        Ok(())
     }
 
     #[test]

@@ -70,6 +70,33 @@ obs-websocket経由でプロジェクターを開くこともできます。
 StreamPainterがOBSを最前面へ移した場合は、プロジェクターの終了・最小化または
 StreamPainterの終了時に元のTopmost状態へ戻します。
 
+## ネイティブ描画性能
+
+Windowsオーバーレイは描画中ストローク用のGPU bitmapと、次に描く確定segment番号を保持します。
+各pointer updateでは点列を更新して低優先度の`WM_PAINT`を予約します。Windowsはqueued inputを
+paintより先に処理し、同じinvalid regionへの要求も統合するため、連続入力を1回の`Present(1)`へ
+集約できます。VSync待ち自体をframe paceとして使うため、16ms timerを重ねて30fps相当へ
+落としません。フレーム時は中点法で新たに確定したsegmentだけをbitmapへ追記するため、
+1点の更新コストは、それ以前の点数ではなく新規segment数に比例します。ペンとマーカーは不透明な
+scratchを最後にstroke opacityで1回合成し、消しゴムは開始時のbaked複製へ作用するので、
+キャンセル時に確定履歴を壊しません。確定時も未処理segmentとtail（またはdot）だけを追加します。
+
+目標は60fpsの1フレーム予算である16.67ms未満です。10,000点strokeの9,999点目まで処理済みの
+cursorへ最後の1点を追加する計測テストを2,000回平均し、この予算未満であることを検証します。
+WindowsではWARP device上のactive bitmapへ最後のDirect2D pathを追記する時間も別に記録し、
+cursorが1segmentだけ進むことを確認します（共有CIのwall-clock揺らぎを考慮し、こちらの厳密な
+16.67ms判定は純geometry側で行います）。
+同じテスト群で、全10,000点を1点ずつ増分生成したgeometryが一括生成結果と一致すること、および
+Browser Source側も同じ1-origin cursorと数式で一致することを検証します。
+
+```console
+cargo test --locked --manifest-path painter/Cargo.toml ten_thousand_point -- --nocapture
+bun test client/src/Overlay/renderer/geometry.test.ts
+```
+
+`Present(1)`のVSync待ち、履歴変更によるbaked再構築、GPU device-lossからの復旧はこの純geometry
+計測には含みません。後二者は例外経路として完全履歴を優先し、復旧後に増分cursorを作り直します。
+
 ## 設定
 
 タスクトレイアイコンの「設定...」から、次の項目を編集できます。
