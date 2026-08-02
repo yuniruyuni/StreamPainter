@@ -6,7 +6,7 @@
 
 ```text
 Win32 UI thread
-├─ pointer / hotkey / tray
+├─ WM_POINTER device分類 / pen pressure・tilt正規化 / hotkey / tray
 ├─ CanvasItem engine
 └─ Direct2D local echo
         │ bounded-size PaintEvent
@@ -59,6 +59,11 @@ bakedレイヤーへ追記します。全履歴の再構築はUndo、スタン�
 レイヤー上の1枚だけを更新します。同一描画フレーム内の更新は最新状態へ畳み込み、確定座標は
 `stamp_move`としてポインタを離した時点で即時送信します。履歴全体の再構築はドラッグの開始時と
 確定時に各1回だけ行います。
+
+`WM_POINTER`のpointer IDはmessage処理中だけWin32 APIへ渡し、取得したscalar metadataだけを
+platform非依存のengineへ渡します。mouse、touch、pen、touchpadを分類し、penの有効なmaskが示す
+筆圧・傾きだけを正規化します。pointとtool別brush tuningをprotocolへ含めるため、Direct2Dと
+Browser Sourceはplatform固有状態を参照せず同じgeometry式を再現できます。
 
 ## Web assets
 

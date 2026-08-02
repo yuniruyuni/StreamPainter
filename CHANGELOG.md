@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 
+### Added
+
+- Windows Pointer APIでペンの筆圧をペン／マーカーへ、傾きの大きさをマーカーへ反映し、
+  能力を報告しないdeviceでは従来の一定幅を維持
+
+### Changed
+
+- ローカルWebSocketプロトコルを筆圧・傾きとtool別brush tuningを含むversion 6へ更新し、
+  Direct2DとBrowser Sourceで同じ線幅計算を使用
+
 ## [0.5.1] - 2026-08-03
 
 ### Fixed

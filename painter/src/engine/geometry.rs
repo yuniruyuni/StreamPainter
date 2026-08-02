@@ -19,13 +19,45 @@ pub struct Segment {
     pub width: f64,
 }
 
-/// 筆圧 → 線幅
-pub fn stroke_width(brush: &Brush, pressure: f64, canvas_height: f64) -> f64 {
+const MIN_PRESSURE_SCALE: f64 = 0.05;
+const MAX_TILT_SCALE: f64 = 4.0;
+
+/// 筆圧・傾き → 線幅。
+///
+/// 不正な値は、筆圧は従来幅(1)、傾きは直立(0)へfallbackする。Windows入力と
+/// Browser Sourceの双方が同じ式を使い、markerだけが最初のtilt対応brushとなる。
+pub fn stroke_width(
+    brush: &Brush,
+    pressure: f64,
+    tilt_x: f64,
+    tilt_y: f64,
+    canvas_height: f64,
+) -> f64 {
     let base = brush.width_n * canvas_height;
-    if brush.pressure_width {
-        base * (0.35 + 0.65 * pressure)
+    let pressure_scale = if brush.pressure_width {
+        let pressure = finite_or(pressure, 1.0).clamp(0.0, 1.0);
+        let minimum = finite_or(brush.pressure_min, 1.0).clamp(MIN_PRESSURE_SCALE, 1.0);
+        minimum + (1.0 - minimum) * pressure
     } else {
-        base
+        1.0
+    };
+    let tilt_scale = if brush.tilt_width {
+        let x = finite_or(tilt_x, 0.0).clamp(-1.0, 1.0);
+        let y = finite_or(tilt_y, 0.0).clamp(-1.0, 1.0);
+        let magnitude = x.hypot(y).min(1.0);
+        let maximum = finite_or(brush.tilt_max_scale, 1.0).clamp(1.0, MAX_TILT_SCALE);
+        1.0 + (maximum - 1.0) * magnitude
+    } else {
+        1.0
+    };
+    base * pressure_scale * tilt_scale
+}
+
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
     }
 }
 
@@ -69,7 +101,7 @@ pub fn stable_segments(
             from: if j == 1 { prev } else { mid(prev, curr) },
             ctrl: curr,
             to: mid(curr, next),
-            width: stroke_width(brush, pts[j].2, canvas_h),
+            width: stroke_width(brush, pts[j].2, pts[j].4, pts[j].5, canvas_h),
         });
     }
     segments
@@ -87,7 +119,7 @@ pub fn tail_segment(pts: &[Point], canvas_w: f64, canvas_h: f64, brush: &Brush) 
         from: if n == 2 { prev } else { mid(prev, last) },
         ctrl: last,
         to: last,
-        width: stroke_width(brush, pts[n - 1].2, canvas_h),
+        width: stroke_width(brush, pts[n - 1].2, pts[n - 1].4, pts[n - 1].5, canvas_h),
     })
 }
 
@@ -98,7 +130,7 @@ pub fn dot(pts: &[Point], canvas_w: f64, canvas_h: f64, brush: &Brush) -> Option
     }
     Some((
         pos(&pts[0], canvas_w, canvas_h),
-        stroke_width(brush, pts[0].2, canvas_h) / 2.0,
+        stroke_width(brush, pts[0].2, pts[0].4, pts[0].5, canvas_h) / 2.0,
     ))
 }
 
@@ -125,23 +157,40 @@ mod tests {
             opacity: 1.0,
             width_n: 0.01,
             pressure_width: true,
+            pressure_min: 0.2,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
         }
     }
 
     fn pts() -> Vec<Point> {
         vec![
-            (0.0, 0.0, 0.5, 0.0),
-            (0.1, 0.0, 0.5, 16.0),
-            (0.2, 0.0, 0.5, 32.0),
-            (0.3, 0.0, 0.5, 48.0),
+            (0.0, 0.0, 0.5, 0.0, 0.0, 0.0),
+            (0.1, 0.0, 0.5, 16.0, 0.0, 0.0),
+            (0.2, 0.0, 0.5, 32.0, 0.0, 0.0),
+            (0.3, 0.0, 0.5, 48.0, 0.0, 0.0),
         ]
     }
 
     #[test]
     fn width_reflects_pressure() {
-        assert!((stroke_width(&brush(), 1.0, 1000.0) - 10.0).abs() < 1e-9);
-        assert!((stroke_width(&brush(), 0.0, 1000.0) - 3.5).abs() < 1e-9);
-        assert!((stroke_width(&brush(), 0.5, 1000.0) - 6.75).abs() < 1e-9);
+        assert!((stroke_width(&brush(), 1.0, 0.0, 0.0, 1000.0) - 10.0).abs() < 1e-9);
+        assert!((stroke_width(&brush(), 0.0, 0.0, 0.0, 1000.0) - 2.0).abs() < 1e-9);
+        assert!((stroke_width(&brush(), 0.5, 0.0, 0.0, 1000.0) - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn marker_tilt_uses_normalized_magnitude() {
+        let marker = Brush {
+            tool: Tool::Marker,
+            tilt_width: true,
+            tilt_max_scale: 1.75,
+            ..brush()
+        };
+        assert!((stroke_width(&marker, 1.0, 0.0, 0.0, 1000.0) - 10.0).abs() < 1e-9);
+        assert!((stroke_width(&marker, 1.0, 0.6, 0.8, 1000.0) - 17.5).abs() < 1e-9);
+        // Invalid protocol data cannot create negative, infinite, or unbounded widths.
+        assert!((stroke_width(&marker, f64::NAN, 10.0, f64::NAN, 1000.0) - 17.5).abs() < 1e-9);
     }
 
     #[test]
@@ -179,7 +228,7 @@ mod tests {
         assert!(tail_segment(&pts()[..1], 1000.0, 1000.0, &brush()).is_none());
         let (center, radius) = dot(&pts()[..1], 1000.0, 1000.0, &brush()).unwrap();
         assert_eq!(center, Vec2 { x: 0.0, y: 0.0 });
-        assert!((radius - 6.75 / 2.0).abs() < 1e-9);
+        assert!((radius - 6.0 / 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -193,7 +242,14 @@ mod tests {
                 let u = index as f64 / (point_count - 1) as f64;
                 let v = ((index * 37) % 997) as f64 / 996.0;
                 let pressure = (index % 101) as f64 / 100.0;
-                (u, v, pressure, index as f64 * 0.25)
+                (
+                    u,
+                    v,
+                    pressure,
+                    index as f64 * 0.25,
+                    (index % 91) as f64 / 90.0,
+                    -((index % 46) as f64 / 45.0),
+                )
             })
             .collect()
     }

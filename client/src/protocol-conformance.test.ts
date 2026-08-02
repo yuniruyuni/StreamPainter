@@ -69,7 +69,16 @@ const MESSAGE_FIELDS = {
 } as const satisfies Record<MessageType, readonly string[]>;
 
 const OBJECT_FIELDS = {
-  brush: ["color", "opacity", "pressureWidth", "tool", "widthN"],
+  brush: [
+    "color",
+    "opacity",
+    "pressureMin",
+    "pressureWidth",
+    "tiltMaxScale",
+    "tiltWidth",
+    "tool",
+    "widthN",
+  ],
   strokeItem: ["brush", "done", "endedAt", "kind", "pts", "strokeId"],
   lineStyle: ["color", "opacity", "widthN"],
   shapeItem: [
@@ -329,6 +338,9 @@ function validateBrush(value: unknown, label: string): void {
   expectFiniteNumber(brush.opacity, `${label}.opacity`);
   expectFiniteNumber(brush.widthN, `${label}.widthN`);
   expectBoolean(brush.pressureWidth, `${label}.pressureWidth`);
+  expectFiniteNumber(brush.pressureMin, `${label}.pressureMin`);
+  expectBoolean(brush.tiltWidth, `${label}.tiltWidth`);
+  expectFiniteNumber(brush.tiltMaxScale, `${label}.tiltMaxScale`);
 }
 
 function validateLineStyle(value: unknown, label: string): void {
@@ -346,7 +358,7 @@ function validateStrokeItem(value: unknown, label: string): void {
   expectString(stroke.strokeId, `${label}.strokeId`);
   validateBrush(stroke.brush, `${label}.brush`);
   expectArray(stroke.pts, `${label}.pts`).forEach((point, index) => {
-    expectNumberTuple(point, 4, `${label}.pts[${index}]`);
+    expectNumberTuple(point, 6, `${label}.pts[${index}]`);
   });
   expectBoolean(stroke.done, `${label}.done`);
   expectNullableNumber(stroke.endedAt, `${label}.endedAt`);
@@ -446,7 +458,7 @@ function decodeServerMessage(value: unknown): ServerToOverlayMessage {
     case "stroke_points":
       expectString(message.strokeId, "stroke_points.strokeId");
       expectArray(message.pts, "stroke_points.pts").forEach((point, index) => {
-        expectNumberTuple(point, 4, `stroke_points.pts[${index}]`);
+        expectNumberTuple(point, 6, `stroke_points.pts[${index}]`);
       });
       break;
     case "stroke_end":
@@ -520,6 +532,9 @@ const fixtureBrush: Brush = {
   opacity: 0.8,
   widthN: 0.0075,
   pressureWidth: true,
+  pressureMin: 0.2,
+  tiltWidth: false,
+  tiltMaxScale: 1,
 };
 const fixtureStamp = (id: string): StampItem => ({
   itemId: id,
@@ -535,7 +550,7 @@ const fixtureStamp = (id: string): StampItem => ({
 function fixturePoints(count: number): StrokePoint[] {
   return Array.from(
     { length: count },
-    (_, index) => [0.1, 0.2, 0.5, index] as StrokePoint,
+    (_, index) => [0.1, 0.2, 0.5, index, 0, 0] as StrokePoint,
   );
 }
 
@@ -641,6 +656,9 @@ describe("Rust / TypeScript protocol conformance", () => {
           opacity: 0.8,
           widthN: "0.0075",
           pressureWidth: true,
+          pressureMin: 0.2,
+          tiltWidth: false,
+          tiltMaxScale: 1,
         },
       }),
     ).toThrow("stroke_begin.brush.widthN must be a finite number");
@@ -652,7 +670,7 @@ describe("Rust / TypeScript protocol conformance", () => {
         strokeId: "invalid-point",
         pts: [[0.1, 0.2, 0.5]],
       }),
-    ).toThrow("stroke_points.pts[0] must contain exactly 4 numbers");
+    ).toThrow("stroke_points.pts[0] must contain exactly 6 numbers");
   });
 
   test("Rustが生成した全control messageをdecodeできる", () => {

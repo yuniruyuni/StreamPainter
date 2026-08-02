@@ -1,13 +1,21 @@
 // Rust 側 `painter/src/protocol.rs` と JSON 表現を揃えるローカル WS 型。
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 export const MAX_ITEMS = 500;
 export const MAX_STROKES = MAX_ITEMS;
 export const MAX_TOTAL_POINTS = 200_000;
 export const MAX_STROKE_POINTS = 10_000;
 export const MAX_POINTS_PER_MESSAGE = 512;
 
-export type StrokePoint = [u: number, v: number, pressure: number, dt: number];
+// v6 appends normalized Windows tilt to the complete v5 tuple prefix.
+export type StrokePoint = [
+  u: number,
+  v: number,
+  pressure: number,
+  dt: number,
+  tiltX: number,
+  tiltY: number,
+];
 export type Tool = "pen" | "marker" | "eraser";
 
 export interface Brush {
@@ -16,6 +24,9 @@ export interface Brush {
   opacity: number;
   widthN: number;
   pressureWidth: boolean;
+  pressureMin: number;
+  tiltWidth: boolean;
+  tiltMaxScale: number;
 }
 
 export interface Stroke {

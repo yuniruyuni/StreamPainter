@@ -5,6 +5,7 @@ pub mod hotkey;
 pub mod logging;
 pub mod menu;
 pub mod monitor;
+pub mod pointer;
 pub mod projector;
 pub mod radial_menu;
 pub mod render;

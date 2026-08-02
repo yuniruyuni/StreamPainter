@@ -1705,6 +1705,13 @@ mod tests {
             let offset = y as usize * self.pitch + x as usize * 4;
             self.bytes[offset..offset + 4].try_into().unwrap()
         }
+
+        fn visible_pixel_count(&self) -> usize {
+            (0..TEST_SIZE.height)
+                .flat_map(|y| (0..TEST_SIZE.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| self.bgra(x, y)[3] != 0)
+                .count()
+        }
     }
 
     fn test_context() -> Result<(ID2D1DeviceContext, ID2D1Bitmap1)> {
@@ -1790,6 +1797,9 @@ mod tests {
                 opacity,
                 width_n: 0.2,
                 pressure_width: false,
+                pressure_min: 1.0,
+                tilt_width: false,
+                tilt_max_scale: 1.0,
             },
             pts,
             done: false,
@@ -1878,9 +1888,9 @@ mod tests {
             Tool::Marker,
             0.5,
             vec![
-                (0.1, 0.5, 1.0, 0.0),
-                (0.35, 0.5, 1.0, 1.0),
-                (0.65, 0.5, 1.0, 2.0),
+                (0.1, 0.5, 1.0, 0.0, 0.0, 0.0),
+                (0.35, 0.5, 1.0, 1.0, 0.0, 0.0),
+                (0.65, 0.5, 1.0, 2.0, 0.0, 0.0),
             ],
         );
         renderer.sync_active_stroke(&[stroke_item(&marker)])?;
@@ -1901,7 +1911,7 @@ mod tests {
                 .map(|active| active.next_segment),
             Some(2)
         );
-        marker.pts.push((0.9, 0.5, 1.0, 3.0));
+        marker.pts.push((0.9, 0.5, 1.0, 3.0, 0.0, 0.0));
         renderer.sync_active_stroke(&[stroke_item(&marker)])?;
         assert_eq!(
             renderer
@@ -1944,9 +1954,9 @@ mod tests {
             Tool::Eraser,
             1.0,
             vec![
-                (0.5, 0.1, 1.0, 0.0),
-                (0.5, 0.5, 1.0, 1.0),
-                (0.5, 0.9, 1.0, 2.0),
+                (0.5, 0.1, 1.0, 0.0, 0.0, 0.0),
+                (0.5, 0.5, 1.0, 1.0, 0.0, 0.0),
+                (0.5, 0.9, 1.0, 2.0, 0.0, 0.0),
             ],
         );
         renderer.sync_active_stroke(&[stroke_item(&eraser)])?;
@@ -1986,7 +1996,16 @@ mod tests {
             Tool::Pen,
             1.0,
             (0..9_999)
-                .map(|index| (index as f64 / 9_999.0, 0.5, 1.0, index as f64 * 0.25))
+                .map(|index| {
+                    (
+                        index as f64 / 9_999.0,
+                        0.5,
+                        1.0,
+                        index as f64 * 0.25,
+                        0.0,
+                        0.0,
+                    )
+                })
                 .collect(),
         );
         renderer.sync_active_stroke(&[stroke_item(&stroke)])?;
@@ -1998,7 +2017,7 @@ mod tests {
             Some(9_998)
         );
 
-        stroke.pts.push((1.0, 0.5, 1.0, 2_499.75));
+        stroke.pts.push((1.0, 0.5, 1.0, 2_499.75, 0.0, 0.0));
         let started = std::time::Instant::now();
         renderer.sync_active_stroke(&[stroke_item(&stroke)])?;
         let elapsed = started.elapsed();
@@ -2016,6 +2035,53 @@ mod tests {
         // Wall-clock tests can be descheduled on shared CI. The averaged pure geometry test
         // enforces 16.67ms; this only guards a catastrophic native regression.
         assert!(elapsed < std::time::Duration::from_millis(250));
+        Ok(())
+    }
+
+    #[test]
+    fn native_warp_renderer_reflects_pressure_and_tilt_widths() -> Result<()> {
+        let (mut renderer, _window) = test_renderer()?;
+        let points = |pressure, tilt_x, tilt_y| {
+            vec![
+                (0.15, 0.5, pressure, 0.0, tilt_x, tilt_y),
+                (0.5, 0.5, pressure, 1.0, tilt_x, tilt_y),
+                (0.85, 0.5, pressure, 2.0, tilt_x, tilt_y),
+            ]
+        };
+
+        let mut pen = test_stroke("pen-low", Tool::Pen, 1.0, points(0.0, 0.0, 0.0));
+        pen.done = true;
+        pen.brush.width_n = 0.18;
+        pen.brush.pressure_width = true;
+        pen.brush.pressure_min = 0.2;
+        renderer.rebuild_baked(&[stroke_item(&pen)])?;
+        let low_pressure = read_pixels(&renderer.dc, &renderer.baked)?.visible_pixel_count();
+
+        pen.stroke_id = "pen-high".into();
+        pen.pts = points(1.0, 0.0, 0.0);
+        renderer.rebuild_baked(&[stroke_item(&pen)])?;
+        let high_pressure = read_pixels(&renderer.dc, &renderer.baked)?.visible_pixel_count();
+        assert!(
+            high_pressure > low_pressure * 2,
+            "pressure coverage did not grow: low={low_pressure}, high={high_pressure}"
+        );
+
+        let mut marker = test_stroke("marker-upright", Tool::Marker, 1.0, points(1.0, 0.0, 0.0));
+        marker.done = true;
+        marker.brush.width_n = 0.12;
+        marker.brush.tilt_width = true;
+        marker.brush.tilt_max_scale = 1.75;
+        renderer.rebuild_baked(&[stroke_item(&marker)])?;
+        let upright = read_pixels(&renderer.dc, &renderer.baked)?.visible_pixel_count();
+
+        marker.stroke_id = "marker-tilted".into();
+        marker.pts = points(1.0, 0.6, 0.8);
+        renderer.rebuild_baked(&[stroke_item(&marker)])?;
+        let tilted = read_pixels(&renderer.dc, &renderer.baked)?.visible_pixel_count();
+        assert!(
+            tilted * 10 > upright * 13,
+            "tilt coverage did not grow: upright={upright}, tilted={tilted}"
+        );
         Ok(())
     }
 

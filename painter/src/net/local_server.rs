@@ -957,6 +957,9 @@ mod protocol_conformance {
             opacity: 0.8,
             width_n: 0.0075,
             pressure_width: true,
+            pressure_min: 0.2,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
         }
     }
 
@@ -966,7 +969,7 @@ mod protocol_conformance {
                 stroke_id: id.into(),
                 brush: brush(tool),
                 pts: (0..point_count)
-                    .map(|index| (0.1, 0.2, 0.5, index as f64))
+                    .map(|index| (0.1, 0.2, 0.5, index as f64, 0.0, 0.0))
                     .collect(),
                 done,
                 ended_at: done.then_some(1_700_000_000_100.0),
@@ -1176,7 +1179,7 @@ mod protocol_conformance {
                 PainterMessage::StrokePoints {
                     stroke_id: "fixture-limit-stroke-new".into(),
                     offset: 0,
-                    pts: vec![(0.8, 0.9, 0.6, 0.0)],
+                    pts: vec![(0.8, 0.9, 0.6, 0.0, 0.0, 0.0)],
                 },
             ],
         );
@@ -1194,9 +1197,9 @@ mod protocol_conformance {
                 stroke_id: "fixture-stroke-cap".into(),
                 offset: initial_stroke_points,
                 pts: vec![
-                    (0.6, 0.7, 0.8, 16.0),
-                    (0.7, 0.8, 0.9, 32.0),
-                    (0.8, 0.9, 1.0, 48.0),
+                    (0.6, 0.7, 0.8, 16.0, 0.0, 0.0),
+                    (0.7, 0.8, 0.9, 32.0, 0.0, 0.0),
+                    (0.8, 0.9, 1.0, 48.0, 0.0, 0.0),
                 ],
             }],
         );
@@ -1417,6 +1420,9 @@ mod tests {
             opacity: 1.0,
             width_n: 0.005,
             pressure_width: true,
+            pressure_min: 0.2,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
         }
     }
 
@@ -1557,7 +1563,7 @@ mod tests {
             PainterMessage::StrokePoints {
                 stroke_id: "s1".into(),
                 offset: 0,
-                pts: vec![(0.1, 0.2, 0.5, 0.0)],
+                pts: vec![(0.1, 0.2, 0.5, 0.0, 0.0, 0.0)],
             },
         )
         .await;
@@ -1612,9 +1618,9 @@ mod tests {
 
     #[test]
     fn hub_applies_stroke_points_idempotently_by_absolute_offset() {
-        let p0 = (0.1, 0.2, 0.5, 0.0);
-        let p1 = (0.2, 0.3, 0.5, 16.0);
-        let p2 = (0.3, 0.4, 0.5, 32.0);
+        let p0 = (0.1, 0.2, 0.5, 0.0, 0.0, 0.0);
+        let p1 = (0.2, 0.3, 0.5, 16.0, 0.0, 0.0);
+        let p2 = (0.3, 0.4, 0.5, 32.0, 0.0, 0.0);
         let mut state = HubState::default();
         state.replace_items(vec![CanvasItem::Stroke {
             stroke: Stroke {
@@ -1634,7 +1640,7 @@ mod tests {
             })
             .unwrap();
         assert!(!event.contains("offset"));
-        assert!(event.contains("\"pts\":[[0.3,0.4,0.5,32.0]]"));
+        assert!(event.contains("\"pts\":[[0.3,0.4,0.5,32.0,0.0,0.0]]"));
         let CanvasItem::Stroke { stroke } = &state.items[0] else {
             panic!("expected stroke");
         };
@@ -1652,14 +1658,14 @@ mod tests {
             .apply(PainterMessage::StrokePoints {
                 stroke_id: "s1".into(),
                 offset: 4,
-                pts: vec![(0.5, 0.6, 0.5, 48.0)],
+                pts: vec![(0.5, 0.6, 0.5, 48.0, 0.0, 0.0)],
             })
             .is_none());
         assert!(state
             .apply(PainterMessage::StrokePoints {
                 stroke_id: "s1".into(),
                 offset: 1,
-                pts: vec![(0.9, 0.9, 0.5, 16.0)],
+                pts: vec![(0.9, 0.9, 0.5, 16.0, 0.0, 0.0)],
             })
             .is_none());
         assert_eq!(state.revision, revision);
@@ -1830,7 +1836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hub_preserves_shape_and_stamp_order_in_v5_snapshot() {
+    async fn hub_preserves_shape_and_stamp_order_in_snapshot() {
         let hub = test_hub();
         let shape = ShapeItem {
             item_id: "shape-1".into(),

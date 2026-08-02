@@ -8,6 +8,9 @@ const brush: Brush = {
   opacity: 1,
   widthN: 0.005,
   pressureWidth: false,
+  pressureMin: 1,
+  tiltWidth: false,
+  tiltMaxScale: 1,
 };
 
 function stroke(id: string, pointCount: number): Stroke {
@@ -19,6 +22,8 @@ function stroke(id: string, pointCount: number): Stroke {
       0,
       1,
       index,
+      0,
+      0,
     ]),
     done: false,
     endedAt: null,

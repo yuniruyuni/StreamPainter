@@ -15,27 +15,44 @@ const brush: Brush = {
   opacity: 1,
   widthN: 0.01,
   pressureWidth: true,
+  pressureMin: 0.2,
+  tiltWidth: false,
+  tiltMaxScale: 1,
 };
 
 const pts: StrokePoint[] = [
-  [0.0, 0.0, 0.5, 0],
-  [0.1, 0.0, 0.5, 16],
-  [0.2, 0.0, 0.5, 32],
-  [0.3, 0.0, 0.5, 48],
+  [0.0, 0.0, 0.5, 0, 0, 0],
+  [0.1, 0.0, 0.5, 16, 0, 0],
+  [0.2, 0.0, 0.5, 32, 0, 0],
+  [0.3, 0.0, 0.5, 48, 0, 0],
 ];
 
 describe("strokeWidth", () => {
   test("筆圧が線幅に反映される", () => {
-    // w(p) = widthN * height * (0.35 + 0.65p)
-    expect(strokeWidth(brush, 1, 1000)).toBeCloseTo(10);
-    expect(strokeWidth(brush, 0, 1000)).toBeCloseTo(3.5);
-    expect(strokeWidth(brush, 0.5, 1000)).toBeCloseTo(6.75);
+    // w(p) = widthN * height * (pressureMin + (1-pressureMin)p)
+    expect(strokeWidth(brush, 1, 0, 0, 1000)).toBeCloseTo(10);
+    expect(strokeWidth(brush, 0, 0, 0, 1000)).toBeCloseTo(2);
+    expect(strokeWidth(brush, 0.5, 0, 0, 1000)).toBeCloseTo(6);
   });
 
   test("pressureWidth: false なら常に基準幅", () => {
     const fixed = { ...brush, pressureWidth: false };
-    expect(strokeWidth(fixed, 0, 1000)).toBeCloseTo(10);
-    expect(strokeWidth(fixed, 1, 1000)).toBeCloseTo(10);
+    expect(strokeWidth(fixed, 0, 0, 0, 1000)).toBeCloseTo(10);
+    expect(strokeWidth(fixed, 1, 0, 0, 1000)).toBeCloseTo(10);
+  });
+
+  test("marker tiltは正規化された傾きの大きさで幅を広げる", () => {
+    const marker = {
+      ...brush,
+      tool: "marker" as const,
+      tiltWidth: true,
+      tiltMaxScale: 1.75,
+    };
+    expect(strokeWidth(marker, 1, 0, 0, 1000)).toBeCloseTo(10);
+    expect(strokeWidth(marker, 1, 0.6, 0.8, 1000)).toBeCloseTo(17.5);
+    expect(strokeWidth(marker, Number.NaN, 10, Number.NaN, 1000)).toBeCloseTo(
+      17.5,
+    );
   });
 });
 
@@ -69,6 +86,8 @@ describe("stableSegments", () => {
       ((index * 37) % 997) / 996,
       (index % 101) / 100,
       index * 0.25,
+      (index % 91) / 90,
+      -((index % 46) / 45),
     ]);
     const received: StrokePoint[] = [];
     const incremental: ReturnType<typeof stableSegments> = [];
@@ -104,7 +123,7 @@ describe("tailSegment / dot / fullSegments", () => {
     expect(tailSegment(pts.slice(0, 1), 1000, 1000, brush)).toBeNull();
     const d = dot(pts.slice(0, 1), 1000, 1000, brush);
     expect(d?.center).toEqual({ x: 0, y: 0 });
-    expect(d?.radius).toBeCloseTo(strokeWidth(brush, 0.5, 1000) / 2);
+    expect(d?.radius).toBeCloseTo(strokeWidth(brush, 0.5, 0, 0, 1000) / 2);
   });
 
   test("fullSegments = 確定分 + 末尾", () => {

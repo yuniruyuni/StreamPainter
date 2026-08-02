@@ -12,11 +12,41 @@ TLSを使わないのはloopback内で完結するためです。代わりにサ
 
 ## Coordinates
 
-点は `[u, v, pressure, dt]` です。
+点は `[u, v, pressure, dt, tiltX, tiltY]` です。
 
 - `u`, `v`: OBS canvas content rectに対する正規化座標
-- `pressure`: 0..1
+- `pressure`: 0..1。0が無荷重、1が最大荷重
 - `dt`: `stroke_begin` からの相対ミリ秒
+- `tiltX`, `tiltY`: Windowsが返す±90度を-1..1へ正規化したペンの傾き。`tiltX`の正は
+  画面右、`tiltY`の正はユーザー側
+
+Windowsの`WM_POINTER`入力ではmouse、touch、pen、touchpadを区別し、penだけ
+`POINTER_PEN_INFO`を読みます。`PEN_MASK_PRESSURE`がある場合は0..1024を0..1へ、
+`PEN_MASK_TILT_X/Y`がある場合は-90..90度を-1..1へ変換し、範囲外のdriver値はclampします。
+該当maskがない、API取得が失敗した、またはpen以外の場合は`pressure=1`、`tiltX=tiltY=0`です。
+このfallbackにより、筆圧非対応ペン・マウス・touchの線幅は従来どおり一定になります。
+
+`Brush`は入力値の反映方法をストロークごとに固定します。
+
+- `pressureWidth`: 筆圧を線幅へ反映するか
+- `pressureMin`: `pressure=0`での最小倍率。描画時は0.05..1へclamp
+- `tiltWidth`: 傾きの大きさを線幅へ反映するか
+- `tiltMaxScale`: 傾きの大きさが1のときの最大倍率。描画時は1..4へclamp
+
+contentの高さを`H`とした線幅は、RustのDirect2D描画とBrowser SourceのCanvas 2D描画で
+次の同じ式を使います。非有限値は筆圧1、傾き0へfallbackします。
+
+```text
+base = widthN * H
+pressureScale = pressureWidth ? pressureMin + (1 - pressureMin) * pressure : 1
+tiltMagnitude = min(hypot(tiltX, tiltY), 1)
+tiltScale = tiltWidth ? 1 + (tiltMaxScale - 1) * tiltMagnitude : 1
+width = base * pressureScale * tiltScale
+```
+
+現在のpresetは、ペンが`pressureMin=0.2`で筆圧のみ、マーカーが`pressureMin=0.65`で筆圧と
+最大1.75倍の傾き、消しゴムが筆圧・傾きとも無効です。現時点では傾きの向きではなく大きさだけを
+丸いマーカーの幅へ使います。
 
 JSONフィールドはcamelCase、`type`値はsnake_caseです。
 
@@ -27,7 +57,7 @@ JSONフィールドはcamelCase、`type`値はsnake_caseです。
 ```json
 {
   "type": "snapshot",
-  "protocolVersion": 5,
+  "protocolVersion": 6,
   "rev": 12,
   "fadeAfterMs": null,
   "items": []
@@ -39,8 +69,8 @@ overlayは`protocolVersion`が対応版と一致することを確認し、`item
 その後、以下の増分イベントを`rev`の連番どおりに適用します。
 
 ```json
-{"type":"stroke_begin","rev":13,"strokeId":"...","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":false}}
-{"type":"stroke_points","rev":14,"strokeId":"...","pts":[[0.1,0.2,1,0]]}
+{"type":"stroke_begin","rev":13,"strokeId":"...","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true,"pressureMin":0.2,"tiltWidth":false,"tiltMaxScale":1}}
+{"type":"stroke_points","rev":14,"strokeId":"...","pts":[[0.1,0.2,0.75,0,0.25,-0.5]]}
 {"type":"stroke_end","rev":15,"strokeId":"...","endedAt":1785380000000}
 {"type":"stroke_cancel","rev":16,"strokeId":"..."}
 {"type":"shape_begin","rev":17,"shape":{"itemId":"...","shape":"arrow","style":{"color":"#ff4d6d","opacity":1,"widthN":0.005},"start":[0.1,0.2],"end":[0.1,0.2],"done":false,"endedAt":null}}
@@ -68,6 +98,13 @@ Undo／Redoも、確定位置だけを示す`stamp_move`として配信します
 どおり`undo`／`redo`を使います。
 
 `endedAt` はUnix epoch millisecondsです。
+
+version 6はversion 5の4要素point prefix `[u,v,pressure,dt]`をそのまま保ち、傾きを末尾へ
+追加したものです。ただしdecoderは曖昧な部分互換を行わず、snapshotの`protocolVersion`が完全に
+一致しなければ接続を閉じます。serverとBrowser Source assetsは同じexeへ埋め込み、同じbuildで
+更新されます。更新時にOBSがversion 5のページを保持している場合、WebSocketの再接続だけでは
+読み込み済みJavaScriptは置き換わりません。OBSのBrowser Sourceを「現在のページを再読み込み」
+してversion 6のassetsとsnapshotへ揃えてください。
 
 ## Liveness
 

@@ -1,20 +1,24 @@
 //! ローカル WebSocket プロトコルの serde 型 (docs/protocol.md)。
 //! TypeScript 側の `client/src/protocol.ts` と JSON 表現を揃える。
-//! フィールドは camelCase、type タグは snake_case、点は [u, v, p, dt] の配列。
+//! フィールドは camelCase、type タグは snake_case、点は
+//! [u, v, pressure, dt, tilt_x, tilt_y] の配列。
 
 use serde::{Deserialize, Serialize};
 
-/// [u, v, p, dt] — 正規化座標・筆圧 0..1・stroke_begin からの相対 ms
-pub type Point = (f64, f64, f64, f64);
+/// [u, v, pressure, dt, tilt_x, tilt_y]
+///
+/// 座標・筆圧は0..1、tiltはWindowsの±90°を-1..1へ正規化した値。
+/// dtはstroke_beginからの相対ms。v5の4要素prefixを保ったままtiltを末尾へ追加する。
+pub type Point = (f64, f64, f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
 pub const MAX_POINTS_PER_MESSAGE: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tool {
     Pen,
@@ -30,6 +34,12 @@ pub struct Brush {
     pub opacity: f64,
     pub width_n: f64,
     pub pressure_width: bool,
+    /// pressure=0のときの基準幅に対する倍率。0.05..1。
+    pub pressure_min: f64,
+    /// tilt magnitudeを線幅へ反映するか。
+    pub tilt_width: bool,
+    /// tilt magnitude=1のときの最大倍率。1..4。
+    pub tilt_max_scale: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -189,7 +199,10 @@ define_painter_messages! {
     } => PainterMessage::StrokePoints {
         stroke_id: "fixture-stroke-points".into(),
         offset: 1,
-        pts: vec![(0.2, 0.3, 0.6, 16.0), (0.4, 0.5, 0.7, 32.0)],
+        pts: vec![
+            (0.2, 0.3, 0.6, 16.0, 0.25, -0.5),
+            (0.4, 0.5, 0.7, 32.0, 0.5, -0.25),
+        ],
     },
     #[serde(rename_all = "camelCase")]
     StrokeEnd {
@@ -274,6 +287,9 @@ fn fixture_brush(tool: Tool) -> Brush {
         opacity: 0.75,
         width_n: 0.0125,
         pressure_width: true,
+        pressure_min: 0.2,
+        tilt_width: tool == Tool::Marker,
+        tilt_max_scale: if tool == Tool::Marker { 1.75 } else { 1.0 },
     }
 }
 
@@ -379,7 +395,7 @@ fn fixture_canvas_items() -> Vec<CanvasItem> {
             stroke: Stroke {
                 stroke_id: "fixture-snapshot-stroke".into(),
                 brush: fixture_brush(Tool::Pen),
-                pts: vec![(0.1, 0.2, 0.5, 0.0)],
+                pts: vec![(0.1, 0.2, 0.5, 0.0, 0.25, -0.5)],
                 done: true,
                 ended_at: Some(1_700_000_000_100.0),
             },
@@ -415,6 +431,9 @@ mod tests {
             opacity: 1.0,
             width_n: 0.005,
             pressure_width: true,
+            pressure_min: 0.2,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
         }
     }
 
@@ -436,6 +455,9 @@ mod tests {
                     "opacity": 1.0,
                     "widthN": 0.005,
                     "pressureWidth": true,
+                    "pressureMin": 0.2,
+                    "tiltWidth": false,
+                    "tiltMaxScale": 1.0,
                 },
             })
         );
@@ -446,7 +468,10 @@ mod tests {
         let msg = PainterMessage::StrokePoints {
             stroke_id: "s1".into(),
             offset: 0,
-            pts: vec![(0.1, 0.2, 0.5, 0.0), (0.15, 0.25, 0.6, 16.0)],
+            pts: vec![
+                (0.1, 0.2, 0.5, 0.0, 0.0, 0.0),
+                (0.15, 0.25, 0.6, 16.0, 0.25, -0.5),
+            ],
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -454,7 +479,10 @@ mod tests {
             serde_json::json!({
                 "type": "stroke_points",
                 "strokeId": "s1",
-                "pts": [[0.1, 0.2, 0.5, 0.0], [0.15, 0.25, 0.6, 16.0]],
+                "pts": [
+                    [0.1, 0.2, 0.5, 0.0, 0.0, 0.0],
+                    [0.15, 0.25, 0.6, 16.0, 0.25, -0.5]
+                ],
             })
         );
         assert_eq!(serde_json::from_value::<PainterMessage>(json).unwrap(), msg);
@@ -482,7 +510,7 @@ mod tests {
     #[test]
     fn overlay_message_roundtrips_snapshot() {
         let msg: OverlayControlMessage = serde_json::from_str(
-            r##"{"type":"snapshot","protocolVersion":5,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true},"pts":[[0.1,0.2,0.5,0]],"done":true,"endedAt":123}]}"##,
+            r##"{"type":"snapshot","protocolVersion":6,"rev":3,"fadeAfterMs":null,"items":[{"kind":"stroke","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true,"pressureMin":0.2,"tiltWidth":false,"tiltMaxScale":1},"pts":[[0.1,0.2,0.5,0,0,0]],"done":true,"endedAt":123}]}"##,
         )
         .unwrap();
         match msg {

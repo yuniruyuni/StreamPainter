@@ -6,14 +6,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::engine::pointer_input::PointerDynamics;
 use crate::protocol::{
     Brush, CanvasItem, LineStyle, PainterMessage, Point, ShapeItem, ShapeKind, StampItem, Stroke,
     MAX_ITEMS, MAX_POINTS_PER_MESSAGE, MAX_STROKE_POINTS, MAX_TOTAL_POINTS,
 };
 
-/// 間引き閾値: 距離 (正規化) と筆圧変化の両方が小さい点は捨てる
+/// 間引き閾値: 距離 (正規化)・筆圧・傾きの変化がすべて小さい点は捨てる。
 const MIN_DISTANCE: f64 = 0.0005;
 const MIN_PRESSURE_DELTA: f64 = 0.05;
+const MIN_TILT_DELTA: f64 = 0.02;
 
 pub type SharedItems = Arc<Mutex<Vec<CanvasItem>>>;
 
@@ -150,13 +152,36 @@ impl CanvasEngine {
     }
 
     /// フリーハンドのペンダウン。stroke_begin を返す。
-    pub fn begin(
+    #[cfg(test)]
+    pub(crate) fn begin(
         &mut self,
         pointer_id: u32,
         brush: Brush,
         u: f64,
         v: f64,
-        p: f64,
+        pressure: f64,
+        now_ms: f64,
+    ) -> Vec<PainterMessage> {
+        self.begin_with_dynamics(
+            pointer_id,
+            brush,
+            u,
+            v,
+            PointerDynamics {
+                pressure,
+                ..PointerDynamics::FALLBACK
+            },
+            now_ms,
+        )
+    }
+
+    pub fn begin_with_dynamics(
+        &mut self,
+        pointer_id: u32,
+        brush: Brush,
+        u: f64,
+        v: f64,
+        dynamics: PointerDynamics,
         now_ms: f64,
     ) -> Vec<PainterMessage> {
         if self.active.is_some() {
@@ -164,7 +189,7 @@ impl CanvasEngine {
         }
         self.redo_actions.clear();
         let stroke_id = uuid::Uuid::now_v7().to_string();
-        let first: Point = (round5(u), round5(v), round2(p), 0.0);
+        let first = point(u, v, dynamics, 0.0);
         let stroke = Stroke {
             stroke_id: stroke_id.clone(),
             brush: brush.clone(),
@@ -343,12 +368,33 @@ impl CanvasEngine {
 
     /// ポインタ移動。ストロークでは点を追加し、図形では終点を更新する。
     /// ストロークの点数上限に達した場合のみ、ここから強制確定メッセージを返す。
-    pub fn move_to(
+    #[cfg(test)]
+    pub(crate) fn move_to(
         &mut self,
         pointer_id: u32,
         u: f64,
         v: f64,
-        p: f64,
+        pressure: f64,
+        now_ms: f64,
+    ) -> Vec<PainterMessage> {
+        self.move_to_with_dynamics(
+            pointer_id,
+            u,
+            v,
+            PointerDynamics {
+                pressure,
+                ..PointerDynamics::FALLBACK
+            },
+            now_ms,
+        )
+    }
+
+    pub fn move_to_with_dynamics(
+        &mut self,
+        pointer_id: u32,
+        u: f64,
+        v: f64,
+        dynamics: PointerDynamics,
         now_ms: f64,
     ) -> Vec<PainterMessage> {
         if !self.owns_pointer(pointer_id) {
@@ -374,11 +420,15 @@ impl CanvasEngine {
             }
             ActiveItem::Stroke(active) => {
                 let dt = (now_ms - active.started_at).max(0.0);
-                let pt: Point = (round5(u), round5(v), round2(p), dt);
+                let pt = point(u, v, dynamics, dt);
 
                 if let Some(last) = active.last {
                     let dist = ((pt.0 - last.0).powi(2) + (pt.1 - last.1).powi(2)).sqrt();
-                    if dist < MIN_DISTANCE && (pt.2 - last.2).abs() < MIN_PRESSURE_DELTA {
+                    if dist < MIN_DISTANCE
+                        && (pt.2 - last.2).abs() < MIN_PRESSURE_DELTA
+                        && (pt.4 - last.4).abs() < MIN_TILT_DELTA
+                        && (pt.5 - last.5).abs() < MIN_TILT_DELTA
+                    {
                         return Vec::new();
                     }
                 }
@@ -782,6 +832,32 @@ fn round2(v: f64) -> f64 {
     (v * 1e2).round() / 1e2
 }
 
+fn point(u: f64, v: f64, dynamics: PointerDynamics, dt: f64) -> Point {
+    let pressure = if dynamics.pressure.is_finite() {
+        dynamics.pressure.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let tilt_x = if dynamics.tilt_x.is_finite() {
+        dynamics.tilt_x.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    let tilt_y = if dynamics.tilt_y.is_finite() {
+        dynamics.tilt_y.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    (
+        round5(u),
+        round5(v),
+        round2(pressure),
+        dt,
+        round2(tilt_x),
+        round2(tilt_y),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +872,9 @@ mod tests {
             opacity: 1.0,
             width_n: 0.005,
             pressure_width: true,
+            pressure_min: 0.2,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
         }
     }
 
@@ -856,6 +935,65 @@ mod tests {
         let stroke = first_stroke(&items);
         assert!(stroke.done);
         assert_eq!(stroke.ended_at, Some(1100.0));
+    }
+
+    #[test]
+    fn pointer_dynamics_are_serialized_and_tilt_changes_survive_thinning() {
+        let mut engine = CanvasEngine::new();
+        engine.begin_with_dynamics(
+            POINTER_ID,
+            brush(),
+            0.1,
+            0.1,
+            PointerDynamics {
+                pressure: 0.37,
+                tilt_x: 0.25,
+                tilt_y: -0.5,
+            },
+            1_000.0,
+        );
+        // A stationary point with a meaningful tilt change still changes the
+        // rendered width and must not be discarded as pointer jitter.
+        engine.move_to_with_dynamics(
+            POINTER_ID,
+            0.1,
+            0.1,
+            PointerDynamics {
+                pressure: 0.37,
+                tilt_x: 0.28,
+                tilt_y: -0.5,
+            },
+            1_016.0,
+        );
+
+        let flushed = engine.flush();
+        let [PainterMessage::StrokePoints { pts, .. }] = &flushed[..] else {
+            panic!("expected one stroke_points message");
+        };
+        assert_eq!(
+            pts,
+            &[
+                (0.1, 0.1, 0.37, 0.0, 0.25, -0.5),
+                (0.1, 0.1, 0.37, 16.0, 0.28, -0.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_dynamics_use_safe_constant_width_fallbacks() {
+        assert_eq!(
+            point(
+                0.1,
+                0.2,
+                PointerDynamics {
+                    pressure: f64::NAN,
+                    tilt_x: f64::INFINITY,
+                    tilt_y: f64::NEG_INFINITY,
+                },
+                0.0,
+            ),
+            (0.1, 0.2, 1.0, 0.0, 0.0, 0.0)
+        );
     }
 
     #[test]

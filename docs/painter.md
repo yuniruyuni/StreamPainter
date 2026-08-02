@@ -51,8 +51,12 @@ Browser Sourceは移動中のスタンプだけを別レイヤーで描き直す
 操作として記録します。移動後も選択は維持されるため続けて調整でき、別ツールへの切替または
 空所クリックで解除します。
 
-現在のペン・マーカー・消しゴムは、マウス相当の一定幅で描画します。設定したブラシ幅が
-そのまま基準幅になり、ペンタブレットの筆圧・傾き取得は今後の対応項目です。
+Windows Pointer APIでpenとして識別できる入力は、筆圧と傾きをローカル表示・OBS表示の両方へ
+反映します。ペンは筆圧で基準幅の20%から100%、マーカーは筆圧で65%から100%になり、さらに
+傾きの大きさで最大1.75倍まで太くなります。消しゴムは操作を予測しやすい固定幅です。
+マウス、touch、筆圧・傾きを報告しないペンは筆圧100%・傾きなしとして扱うため、従来の一定幅を
+維持します。ブラシpresetはストロークへ記録されるので、WindowsオーバーレイとBrowser Sourceが
+同じ数式・同じ見た目を使います。
 全消去は確認画面で承認した場合だけ実行します。
 スタンプ移動も1回の操作としてUndo／Redoできます。Undoした操作はRedoで戻せます。Undo後に
 新しく描画、スタンプ配置、またはスタンプ移動をするとRedo履歴は破棄されます。
@@ -90,6 +94,13 @@ cursorが1segmentだけ進むことを確認します（共有CIのwall-clock揺
 16.67ms判定は純geometry側で行います）。
 同じテスト群で、全10,000点を1点ずつ増分生成したgeometryが一括生成結果と一致すること、および
 Browser Source側も同じ1-origin cursorと数式で一致することを検証します。
+
+筆圧・傾きについては、platform非依存テストでWindowsの0..1024の筆圧、±90度の傾き、mask欠落、
+範囲外値、mouse／touch fallbackを検証し、WindowsのWARP Direct2Dテストで筆圧・傾きに応じて
+実描画pixelの被覆面積が変わることを検証します。2026-08-03時点で、物理ペンと固有driverを使った
+確認済み構成はまだありません。Surface Pen、Windows Ink対応ペンタブレットなどでの実機確認では、
+ペン先からの入力、最小・最大筆圧、X/Y両方向の傾き、hoverから接触への遷移、mouse fallbackを
+確認し、機種名・driver version・Windows versionをこの節へ追記してください。
 
 ```console
 cargo test --locked --manifest-path painter/Cargo.toml ten_thousand_point -- --nocapture

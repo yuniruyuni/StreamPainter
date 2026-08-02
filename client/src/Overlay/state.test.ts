@@ -15,13 +15,16 @@ const brush: Brush = {
   opacity: 1,
   widthN: 0.005,
   pressureWidth: true,
+  pressureMin: 0.2,
+  tiltWidth: false,
+  tiltMaxScale: 1,
 };
 
 function doneStroke(id: string): Stroke {
   return {
     strokeId: id,
     brush,
-    pts: [[0.1, 0.1, 0.5, 0]],
+    pts: [[0.1, 0.1, 0.5, 0, 0, 0]],
     done: true,
     endedAt: 100,
   };
@@ -96,8 +99,8 @@ describe("OverlayState", () => {
       type: "stroke_points",
       strokeId: "s1",
       pts: [
-        [0.1, 0.1, 0.5, 0],
-        [0.2, 0.2, 0.6, 16],
+        [0.1, 0.1, 0.5, 0, 0, 0],
+        [0.2, 0.2, 0.6, 16, 0.2, -0.1],
       ],
     });
     expect(points.kind).toBe("active");
@@ -118,7 +121,7 @@ describe("OverlayState", () => {
     const effect = applyNext(state, {
       type: "stroke_points",
       strokeId: "unknown",
-      pts: [[0, 0, 0.5, 0]],
+      pts: [[0, 0, 0.5, 0, 0, 0]],
     });
     expect(effect.kind).toBe("none");
     expect(state.rev).toBe(1);
@@ -156,7 +159,7 @@ describe("OverlayState", () => {
     expect(state.items[0]).toMatchObject({ done: true, endedAt: 123 });
   });
 
-  test("v5 snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
+  test("snapshot と undo はストローク・スタンプ共通の描画順を使う", () => {
     const state = synchronizedState(
       [
         strokeItem("s1"),

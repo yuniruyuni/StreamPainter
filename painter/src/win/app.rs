@@ -41,14 +41,13 @@ use crate::protocol::{Brush, LineStyle, ShapeKind, StampItem, Tool};
 use crate::win::hotkey::{self, ChangeCommand, HotkeyManager};
 use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
+use crate::win::pointer;
 use crate::win::projector;
 use crate::win::radial_menu::{self, RadialMenu, RadialRelease};
 use crate::win::render::Renderer;
 use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
 
-/// 現在はポインタ種別を区別しないため、マウス相当の一定入力として扱う。
-const POINTER_PRESSURE: f64 = 1.0;
 /// 動画フレームに合わせた約60fpsのバッチ送信。
 const FLUSH_TIMER_ID: usize = 1;
 const FLUSH_INTERVAL_MS: u32 = 16;
@@ -466,38 +465,57 @@ fn clamp_stamp_center(stamp: &StampItem, center: (f64, f64)) -> (f64, f64) {
     )
 }
 
+/// Freehand tool dynamics are serialized with each stroke so Direct2D and the
+/// Browser Source never need hidden platform-specific tuning.
+fn brush_for_tool(tool: &DrawTool, color: &str, width_n: f64) -> Option<Brush> {
+    match tool {
+        DrawTool::Pen => Some(Brush {
+            tool: Tool::Pen,
+            color: color.to_owned(),
+            opacity: 1.0,
+            width_n,
+            pressure_width: true,
+            pressure_min: 0.2,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
+        }),
+        DrawTool::Marker => Some(Brush {
+            tool: Tool::Marker,
+            color: color.to_owned(),
+            opacity: 0.5,
+            width_n: width_n * 3.0,
+            // Marker pressure is deliberately gentler than the pen. Tilt
+            // magnitude broadens the round highlighter up to 1.75x.
+            pressure_width: true,
+            pressure_min: 0.65,
+            tilt_width: true,
+            tilt_max_scale: 1.75,
+        }),
+        DrawTool::Eraser => Some(Brush {
+            tool: Tool::Eraser,
+            color: "#000000".into(),
+            opacity: 1.0,
+            width_n: width_n * 3.0,
+            // A fixed eraser remains predictable and exactly matches the old
+            // mouse/touch behavior even when a pen reports contact pressure.
+            pressure_width: false,
+            pressure_min: 1.0,
+            tilt_width: false,
+            tilt_max_scale: 1.0,
+        }),
+        DrawTool::Select
+        | DrawTool::Line
+        | DrawTool::Arrow
+        | DrawTool::Rectangle
+        | DrawTool::Ellipse
+        | DrawTool::Stamp(_) => None,
+    }
+}
+
 impl App {
     /// 現在のツール・色から Brush を組み立てる (テストページと同じマッピング)
     fn current_brush(&self) -> Option<Brush> {
-        match &self.tool {
-            DrawTool::Pen => Some(Brush {
-                tool: Tool::Pen,
-                color: self.color.clone(),
-                opacity: 1.0,
-                width_n: self.width_n,
-                pressure_width: false,
-            }),
-            DrawTool::Marker => Some(Brush {
-                tool: Tool::Marker,
-                color: self.color.clone(),
-                opacity: 0.5,
-                width_n: self.width_n * 3.0,
-                pressure_width: false,
-            }),
-            DrawTool::Eraser => Some(Brush {
-                tool: Tool::Eraser,
-                color: "#000000".into(),
-                opacity: 1.0,
-                width_n: self.width_n * 3.0,
-                pressure_width: false,
-            }),
-            DrawTool::Select
-            | DrawTool::Line
-            | DrawTool::Arrow
-            | DrawTool::Rectangle
-            | DrawTool::Ellipse
-            | DrawTool::Stamp(_) => None,
-        }
+        brush_for_tool(&self.tool, &self.color, self.width_n)
     }
 
     fn current_line_style(&self) -> LineStyle {
@@ -1398,8 +1416,9 @@ impl App {
                 let Some(brush) = self.current_brush() else {
                     return;
                 };
+                let dynamics = pointer::sample(pointer_id).dynamics;
                 self.engine
-                    .begin(pointer_id, brush, u, v, POINTER_PRESSURE, now_ms())
+                    .begin_with_dynamics(pointer_id, brush, u, v, dynamics, now_ms())
             }
             DrawTool::Line => self.engine.begin_shape(
                 pointer_id,
@@ -1482,9 +1501,10 @@ impl App {
             return;
         }
         let (u, v) = self.pointer_uv(lparam);
+        let dynamics = pointer::sample(pointer_id).dynamics;
         let msgs = self
             .engine
-            .move_to(pointer_id, u, v, POINTER_PRESSURE, now_ms());
+            .move_to_with_dynamics(pointer_id, u, v, dynamics, now_ms());
         let trimmed = self.engine.take_rebuild_required();
         if !msgs.is_empty() {
             // 総点数上限による強制確定
@@ -1897,6 +1917,29 @@ mod tests {
         assert_eq!(select_monitor(&monitors, 1), Some((1, monitors[1])));
         assert_eq!(select_monitor(&monitors, 9), Some((0, monitors[0])));
         assert_eq!(select_monitor(&[], 0), None);
+    }
+
+    #[test]
+    fn freehand_tools_serialize_their_pointer_dynamics_tuning() {
+        let pen = brush_for_tool(&DrawTool::Pen, "#123456", 0.01).unwrap();
+        assert_eq!(pen.tool, Tool::Pen);
+        assert!(pen.pressure_width);
+        assert_eq!(pen.pressure_min, 0.2);
+        assert!(!pen.tilt_width);
+
+        let marker = brush_for_tool(&DrawTool::Marker, "#123456", 0.01).unwrap();
+        assert_eq!(marker.tool, Tool::Marker);
+        assert!(marker.pressure_width);
+        assert_eq!(marker.pressure_min, 0.65);
+        assert!(marker.tilt_width);
+        assert_eq!(marker.tilt_max_scale, 1.75);
+
+        let eraser = brush_for_tool(&DrawTool::Eraser, "#123456", 0.01).unwrap();
+        assert_eq!(eraser.tool, Tool::Eraser);
+        assert!(!eraser.pressure_width);
+        assert!(!eraser.tilt_width);
+        assert_eq!(eraser.pressure_min, 1.0);
+        assert_eq!(eraser.tilt_max_scale, 1.0);
     }
 
     #[test]

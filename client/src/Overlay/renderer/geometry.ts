@@ -27,10 +27,34 @@ export interface Segment {
 export function strokeWidth(
   brush: Brush,
   pressure: number,
+  tiltX: number,
+  tiltY: number,
   canvasHeight: number,
 ): number {
   const base = brush.widthN * canvasHeight;
-  return brush.pressureWidth ? base * (0.35 + 0.65 * pressure) : base;
+  const safePressure = Number.isFinite(pressure)
+    ? Math.min(1, Math.max(0, pressure))
+    : 1;
+  const minimum = Number.isFinite(brush.pressureMin)
+    ? Math.min(1, Math.max(0.05, brush.pressureMin))
+    : 1;
+  const pressureScale = brush.pressureWidth
+    ? minimum + (1 - minimum) * safePressure
+    : 1;
+  const safeTiltX = Number.isFinite(tiltX)
+    ? Math.min(1, Math.max(-1, tiltX))
+    : 0;
+  const safeTiltY = Number.isFinite(tiltY)
+    ? Math.min(1, Math.max(-1, tiltY))
+    : 0;
+  const maxTiltScale = Number.isFinite(brush.tiltMaxScale)
+    ? Math.min(4, Math.max(1, brush.tiltMaxScale))
+    : 1;
+  const tiltMagnitude = Math.min(1, Math.hypot(safeTiltX, safeTiltY));
+  const tiltScale = brush.tiltWidth
+    ? 1 + (maxTiltScale - 1) * tiltMagnitude
+    : 1;
+  return base * pressureScale * tiltScale;
 }
 
 function pos(pt: StrokePoint, w: number, h: number): Vec2 {
@@ -66,7 +90,7 @@ export function stableSegments(
       from: j === 1 ? prevPos : mid(prevPos, currPos),
       ctrl: currPos,
       to: mid(currPos, nextPos),
-      width: strokeWidth(brush, curr[2], canvasHeight),
+      width: strokeWidth(brush, curr[2], curr[4], curr[5], canvasHeight),
     });
   }
   return segments;
@@ -90,7 +114,7 @@ export function tailSegment(
     from,
     ctrl: lastPos,
     to: lastPos,
-    width: strokeWidth(brush, last[2], canvasHeight),
+    width: strokeWidth(brush, last[2], last[4], last[5], canvasHeight),
   };
 }
 
@@ -105,7 +129,7 @@ export function dot(
   const pt = pts[0] as StrokePoint;
   return {
     center: pos(pt, canvasWidth, canvasHeight),
-    radius: strokeWidth(brush, pt[2], canvasHeight) / 2,
+    radius: strokeWidth(brush, pt[2], pt[4], pt[5], canvasHeight) / 2,
   };
 }
 

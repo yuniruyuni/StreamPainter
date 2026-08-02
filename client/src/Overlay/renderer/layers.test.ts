@@ -229,8 +229,8 @@ function marker(
   index: number,
   opacity = 0.4,
   pts: Extract<CanvasItem, { kind: "stroke" }>["pts"] = [
-    [0.1, 0.1, 1, 0],
-    [0.9, 0.9, 1, 1],
+    [0.1, 0.1, 1, 0, 0, 0],
+    [0.9, 0.9, 1, 1, 0, 0],
   ],
 ): Extract<CanvasItem, { kind: "stroke" }> {
   return {
@@ -242,6 +242,9 @@ function marker(
       opacity,
       widthN: 0.02,
       pressureWidth: false,
+      pressureMin: 1,
+      tiltWidth: false,
+      tiltMaxScale: 1,
     },
     pts,
     done: true,
@@ -302,11 +305,11 @@ describe("OverlayLayers marker compositing scratch", () => {
   test("自己交差する半透明strokeを不透明scratchから1回だけ合成する", () => {
     const { layers, baked, runtime } = harness();
     const crossingPoints: Extract<CanvasItem, { kind: "stroke" }>["pts"] = [
-      [0.2, 0.2, 1, 0],
-      [0.8, 0.8, 1, 1],
-      [0.2, 0.8, 1, 2],
-      [0.8, 0.2, 1, 3],
-      [0.2, 0.2, 1, 4],
+      [0.2, 0.2, 1, 0, 0, 0],
+      [0.8, 0.8, 1, 1, 0, 0],
+      [0.2, 0.8, 1, 2, 0, 0],
+      [0.8, 0.2, 1, 3, 0, 0],
+      [0.2, 0.2, 1, 4, 0, 0],
     ];
 
     layers.rebuild([marker(1, 0.35, crossingPoints)]);

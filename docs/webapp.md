@@ -21,6 +21,13 @@ WebSocketイベントはいったん上限128件のqueueへ積み、`requestAnim
 直線・矢印・四角形・楕円はCanvas 2D primitivesで描き、スタンプPNGは同一originから遅延取得
 して画像キャッシュへ保持します。画像のロード完了時は現在のCanvasItem履歴を再構築します。
 
+protocol version 6の各stroke pointは`[u,v,pressure,dt,tiltX,tiltY]`です。Browser Sourceは
+`pressureWidth`／`pressureMin`と`tiltWidth`／`tiltMaxScale`を含むbrushを受け取り、
+[protocol](protocol.md)に定義したDirect2D側と同じ式でsegment幅を計算します。欠落能力のfallbackは
+server側ですでに`pressure=1`、傾き0として直列化され、非有限値や範囲外値もrenderer側で防御します。
+versionが一致しないsnapshotは描画せず再接続するため、古い4要素pointを新しいrendererが誤解して
+部分描画することはありません。
+
 ## Reconnect
 
 WebSocket切断は画面上へエラーUIを出さず、自動再接続します。接続後のsnapshotで全状態を
