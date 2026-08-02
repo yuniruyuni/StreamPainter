@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-03
+
+### Changed
+
+- Browser Sourceで半透明マーカーの履歴を再構築するとき、画面サイズの合成用Canvasを再利用
+
+### Fixed
+
+- ローカルhubの入力キュー復旧後、未送信ストロークの先頭点が重複する問題を修正
+- 一時的に読み込めなかったスタンプ画像を、上限付き指数backoffで再試行
+- 画面端や小さい解像度でもラジアルメニューの全項目を表示・操作可能に調整
+- Browser SourceのWebSocket切断が3秒を超えた場合、古い描画を透明化して再接続後に復元
+- Windowsの設定保存失敗時にも、直前の設定と既存backupを保持
+
 ## [0.3.2] - 2026-08-03
 
 ### Changed
@@ -74,7 +88,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.2.0...v0.3.0
