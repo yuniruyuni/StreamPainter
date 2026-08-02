@@ -115,6 +115,7 @@ export const OverlayApp: React.FC = () => {
       window.removeEventListener("resize", size);
       cancelScheduledRender();
       conn.close();
+      layers.dispose();
     };
   }, []);
 

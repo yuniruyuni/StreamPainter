@@ -22,6 +22,33 @@ interface ActiveEntry {
   nextSegment: number; // 次に描く確定済みセグメント番号 (1-origin)
 }
 
+const STAMP_RETRY_MIN_MS = 1_000;
+const STAMP_RETRY_MAX_MS = 30_000;
+
+type TimerHandle = number;
+
+type StampImageEntry =
+  | {
+      state: "loading";
+      image: HTMLImageElement;
+      failureCount: number;
+    }
+  | { state: "retry_wait"; timer: TimerHandle; failureCount: number }
+  | { state: "ready"; image: HTMLImageElement };
+
+/** Imageとtimerを決定的なテストへ差し替えるための最小実行環境。 */
+export interface OverlayLayersRuntime {
+  createImage(): HTMLImageElement;
+  setTimeout(callback: () => void, delayMs: number): TimerHandle;
+  clearTimeout(handle: TimerHandle): void;
+}
+
+const browserRuntime: OverlayLayersRuntime = {
+  createImage: () => new Image(),
+  setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => window.clearTimeout(handle),
+};
+
 function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("2d context unavailable");
@@ -31,12 +58,14 @@ function context2d(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
 export class OverlayLayers {
   private actives = new Map<string, ActiveEntry>();
   private latestItems: CanvasItem[] = [];
-  private stampImages = new Map<string, HTMLImageElement | null>();
+  private stampImages = new Map<string, StampImageEntry>();
   private movingStamp: StampItem | null = null;
+  private disposed = false;
 
   constructor(
     private baked: HTMLCanvasElement,
     private active: HTMLCanvasElement,
+    private runtime: OverlayLayersRuntime = browserRuntime,
   ) {}
 
   get width(): number {
@@ -47,6 +76,7 @@ export class OverlayLayers {
   }
 
   resize(width: number, height: number, items: CanvasItem[]): void {
+    this.setItems(items);
     for (const canvas of [this.baked, this.active]) {
       canvas.width = width;
       canvas.height = height;
@@ -61,11 +91,13 @@ export class OverlayLayers {
 
   setItems(items: CanvasItem[]): void {
     this.latestItems = items;
+    this.pruneUnusedStampLoads();
   }
 
   // 確定 CanvasItem 一覧から baked を全再構築する。
   rebuild(items: CanvasItem[]): void {
     this.movingStamp = null;
+    this.setItems(items);
     this.rebuildBaked(items);
     this.renderActive();
   }
@@ -74,6 +106,19 @@ export class OverlayLayers {
   previewStamp(stamp: StampItem, rebuildBaked: boolean): void {
     this.movingStamp = stamp;
     if (rebuildBaked) this.rebuildBaked(this.latestItems, stamp.itemId);
+  }
+
+  /** component破棄後に画像callbackやretry timerがcanvasへ触れないよう停止する。 */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    for (const entry of this.stampImages.values()) {
+      this.cancelStampImageEntry(entry);
+    }
+    this.stampImages.clear();
+    this.actives.clear();
+    this.latestItems = [];
+    this.movingStamp = null;
   }
 
   private rebuildBaked(items: CanvasItem[], excludedStampId?: string): void {
@@ -322,8 +367,9 @@ export class OverlayLayers {
   }
 
   private drawStamp(ctx: CanvasRenderingContext2D, stamp: StampItem): void {
-    const image = this.stampImages.get(stamp.stampId);
-    if (image) {
+    if (this.disposed) return;
+    const entry = this.stampImages.get(stamp.stampId);
+    if (entry?.state === "ready") {
       const width = stamp.widthN * this.width;
       const height = stamp.heightN * this.height;
       const centerX = stamp.center[0] * this.width;
@@ -332,7 +378,7 @@ export class OverlayLayers {
       ctx.globalCompositeOperation = "source-over";
       ctx.globalAlpha = stamp.opacity;
       ctx.drawImage(
-        image,
+        entry.image,
         centerX - width / 2,
         centerY - height / 2,
         width,
@@ -341,23 +387,100 @@ export class OverlayLayers {
       ctx.restore();
       return;
     }
-    if (this.stampImages.has(stamp.stampId)) return;
+    if (entry) return;
 
-    this.stampImages.set(stamp.stampId, null);
-    const pending = new Image();
+    this.startStampImageLoad(stamp.stampId, 0);
+  }
+
+  private startStampImageLoad(stampId: string, failureCount: number): void {
+    if (this.disposed || !this.stampIsNeeded(stampId)) return;
+
+    const pending = this.runtime.createImage();
+    const loading: StampImageEntry = {
+      state: "loading",
+      image: pending,
+      failureCount,
+    };
+    this.stampImages.set(stampId, loading);
     pending.decoding = "async";
     pending.onload = () => {
-      this.stampImages.set(stamp.stampId, pending);
-      if (this.movingStamp) {
-        this.rebuildBaked(this.latestItems, this.movingStamp.itemId);
-        this.renderActive();
-      } else {
-        this.rebuild(this.latestItems);
-      }
+      if (this.disposed || this.stampImages.get(stampId) !== loading) return;
+      pending.onload = null;
+      pending.onerror = null;
+      this.stampImages.set(stampId, { state: "ready", image: pending });
+      this.redrawAfterStampLoad();
     };
     pending.onerror = () => {
-      console.warn(`overlay: failed to load stamp ${stamp.stampId}`);
+      if (this.disposed || this.stampImages.get(stampId) !== loading) return;
+      pending.onload = null;
+      pending.onerror = null;
+      const nextFailureCount = failureCount + 1;
+      const delayMs = stampRetryDelay(nextFailureCount);
+      const waiting: Extract<StampImageEntry, { state: "retry_wait" }> = {
+        state: "retry_wait",
+        timer: 0,
+        failureCount: nextFailureCount,
+      };
+      this.stampImages.set(stampId, waiting);
+      waiting.timer = this.runtime.setTimeout(() => {
+        if (
+          this.disposed ||
+          this.stampImages.get(stampId) !== waiting ||
+          !this.stampIsNeeded(stampId)
+        ) {
+          return;
+        }
+        this.stampImages.delete(stampId);
+        this.startStampImageLoad(stampId, nextFailureCount);
+      }, delayMs);
+      console.warn(
+        `overlay: failed to load stamp ${stampId}; retrying in ${delayMs}ms`,
+      );
     };
-    pending.src = `/stamps/${encodeURIComponent(stamp.stampId)}`;
+    const retryQuery = failureCount > 0 ? `?retry=${failureCount}` : "";
+    pending.src = `/stamps/${encodeURIComponent(stampId)}${retryQuery}`;
   }
+
+  private redrawAfterStampLoad(): void {
+    if (this.movingStamp) {
+      this.rebuildBaked(this.latestItems, this.movingStamp.itemId);
+      this.renderActive();
+    } else {
+      this.rebuild(this.latestItems);
+    }
+  }
+
+  private stampIsNeeded(stampId: string): boolean {
+    return (
+      this.movingStamp?.stampId === stampId ||
+      this.latestItems.some(
+        (item) => item.kind === "stamp" && item.stampId === stampId,
+      )
+    );
+  }
+
+  private pruneUnusedStampLoads(): void {
+    for (const [stampId, entry] of this.stampImages) {
+      if (entry.state === "ready" || this.stampIsNeeded(stampId)) continue;
+      this.cancelStampImageEntry(entry);
+      this.stampImages.delete(stampId);
+    }
+  }
+
+  private cancelStampImageEntry(entry: StampImageEntry): void {
+    if (entry.state === "loading") {
+      entry.image.onload = null;
+      entry.image.onerror = null;
+    } else if (entry.state === "retry_wait") {
+      this.runtime.clearTimeout(entry.timer);
+    }
+  }
+}
+
+function stampRetryDelay(failureCount: number): number {
+  const maxExponent = Math.ceil(
+    Math.log2(STAMP_RETRY_MAX_MS / STAMP_RETRY_MIN_MS),
+  );
+  const exponent = Math.min(Math.max(0, failureCount - 1), maxExponent);
+  return Math.min(STAMP_RETRY_MIN_MS * 2 ** exponent, STAMP_RETRY_MAX_MS);
 }
