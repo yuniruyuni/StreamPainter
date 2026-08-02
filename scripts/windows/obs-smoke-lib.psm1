@@ -55,6 +55,19 @@ function Get-ObsWebSocketAuthentication {
     return Get-Sha256Base64 "$secret$Challenge"
 }
 
+function Wait-ObsSmokeTask {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Threading.Tasks.Task]$Task
+    )
+
+    # PowerShell exposes VoidTaskResult from non-generic Task.GetResult() on
+    # its success stream. Suppress it so callers receive only their intended
+    # WebSocket handle or payload.
+    [void]$Task.GetAwaiter().GetResult()
+}
+
 function Get-AspectFitRect {
     [CmdletBinding()]
     param(
@@ -316,6 +329,7 @@ function Assert-StreamPainterSmokeImage {
 Export-ModuleMember -Function @(
     'Assert-ObsArchiveIdentity',
     'Get-ObsWebSocketAuthentication',
+    'Wait-ObsSmokeTask',
     'Get-AspectFitRect',
     'Select-StreamPainterOverlayWindowRecord',
     'Format-TopLevelWindowDiagnostics',

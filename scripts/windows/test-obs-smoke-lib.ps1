@@ -111,6 +111,53 @@ Assert-Equal -Label 'obs-websocket authentication' `
     -Actual $authentication `
     -Expected 'zZgWipvwSGrw748kHN4gNpBC1IaeiiWX3Hjkrm849Sc='
 
+$taskOutput = @(Wait-ObsSmokeTask -Task ([System.Threading.Tasks.Task]::CompletedTask))
+Assert-Equal -Label 'non-generic task success output suppressed' `
+    -Actual $taskOutput.Count `
+    -Expected 0
+$faultedTask = [System.Threading.Tasks.Task]::FromException(
+    [InvalidOperationException]::new('expected smoke task failure')
+)
+Assert-Throws -Label 'non-generic task failure propagated' -Action {
+    Wait-ObsSmokeTask -Task $faultedTask
+}
+
+$runScriptTokens = $null
+$runScriptErrors = $null
+$runScriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PSScriptRoot 'run-obs-smoke.ps1'),
+    [ref]$runScriptTokens,
+    [ref]$runScriptErrors
+)
+Assert-Equal -Label 'run script parse errors' -Actual $runScriptErrors.Count -Expected 0
+$taskWaitCalls = @(
+    $runScriptAst.FindAll(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -eq 'Wait-ObsSmokeTask'
+        },
+        $true
+    )
+)
+Assert-Equal -Label 'non-generic WebSocket task waits' -Actual $taskWaitCalls.Count -Expected 3
+$directGetResultCalls = @(
+    $runScriptAst.FindAll(
+        {
+            param($node)
+            $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member.Value -eq 'GetResult'
+        },
+        $true
+    )
+)
+Assert-Equal -Label 'direct generic WebSocket task result count' `
+    -Actual $directGetResultCalls.Count `
+    -Expected 1
+Assert-Equal -Label 'direct task result belongs to ReceiveAsync' `
+    -Actual $directGetResultCalls[0].Extent.Text.StartsWith('$Client.ReceiveAsync(') `
+    -Expected $true
+
 $same = Get-AspectFitRect -ScreenWidth 1920 -ScreenHeight 1080
 Assert-Equal -Label 'same-aspect x' -Actual $same.X -Expected 0
 Assert-Equal -Label 'same-aspect y' -Actual $same.Y -Expected 0

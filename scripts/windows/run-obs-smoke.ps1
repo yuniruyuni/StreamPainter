@@ -486,12 +486,13 @@ function Send-WebSocketJson {
     $segment = [ArraySegment[byte]]::new($bytes)
     $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
     try {
-        $Client.SendAsync(
+        $sendTask = $Client.SendAsync(
             $segment,
             [System.Net.WebSockets.WebSocketMessageType]::Text,
             $true,
             $cancellation.Token
-        ).GetAwaiter().GetResult()
+        )
+        Wait-ObsSmokeTask -Task $sendTask
     }
     finally {
         $cancellation.Dispose()
@@ -536,20 +537,22 @@ function Receive-WebSocketJson {
 }
 
 function Connect-WebSocket {
+    [OutputType([System.Net.WebSockets.ClientWebSocket])]
     param(
         [Parameter(Mandatory = $true)][uri]$Uri,
         [string]$Origin,
         [int]$TimeoutSeconds = 10
     )
 
-    $client = [System.Net.WebSockets.ClientWebSocket]::new()
+    [System.Net.WebSockets.ClientWebSocket]$client = [System.Net.WebSockets.ClientWebSocket]::new()
     if (-not [string]::IsNullOrEmpty($Origin)) {
         $client.Options.SetRequestHeader('Origin', $Origin)
     }
     $client.Options.KeepAliveInterval = [TimeSpan]::FromSeconds(10)
     $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
     try {
-        $client.ConnectAsync($Uri, $cancellation.Token).GetAwaiter().GetResult()
+        $connectTask = $client.ConnectAsync($Uri, $cancellation.Token)
+        Wait-ObsSmokeTask -Task $connectTask
         return $client
     }
     catch {
@@ -571,11 +574,12 @@ function Close-WebSocket {
         if ($Client.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
             $cancellation = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(2))
             try {
-                $Client.CloseAsync(
+                $closeTask = $Client.CloseAsync(
                     [System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure,
                     'smoke test complete',
                     $cancellation.Token
-                ).GetAwaiter().GetResult()
+                )
+                Wait-ObsSmokeTask -Task $closeTask
             }
             finally {
                 $cancellation.Dispose()
@@ -591,7 +595,7 @@ function Close-WebSocket {
 }
 
 function Get-StreamPainterSnapshot {
-    $client = Connect-WebSocket `
+    [System.Net.WebSockets.ClientWebSocket]$client = Connect-WebSocket `
         -Uri ([uri]'ws://127.0.0.1:16873/ws') `
         -Origin 'http://127.0.0.1:16873'
     try {
@@ -605,7 +609,8 @@ function Get-StreamPainterSnapshot {
 function Connect-ObsWebSocketOnce {
     param([Parameter(Mandatory = $true)][string]$Password)
 
-    $client = Connect-WebSocket -Uri ([uri]'ws://127.0.0.1:4455')
+    [System.Net.WebSockets.ClientWebSocket]$client = Connect-WebSocket `
+        -Uri ([uri]'ws://127.0.0.1:4455')
     try {
         $hello = Receive-WebSocketJson -Client $client
         if ($hello.op -ne 0) {
