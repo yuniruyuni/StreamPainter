@@ -36,14 +36,16 @@ type StampImageEntry =
   | { state: "retry_wait"; timer: TimerHandle; failureCount: number }
   | { state: "ready"; image: HTMLImageElement };
 
-/** Imageとtimerを決定的なテストへ差し替えるための最小実行環境。 */
+/** Canvas・Image・timerを決定的なテストへ差し替えるための最小実行環境。 */
 export interface OverlayLayersRuntime {
+  createCanvas(): HTMLCanvasElement;
   createImage(): HTMLImageElement;
   setTimeout(callback: () => void, delayMs: number): TimerHandle;
   clearTimeout(handle: TimerHandle): void;
 }
 
 const browserRuntime: OverlayLayersRuntime = {
+  createCanvas: () => document.createElement("canvas"),
   createImage: () => new Image(),
   setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
   clearTimeout: (handle) => window.clearTimeout(handle),
@@ -59,6 +61,7 @@ export class OverlayLayers {
   private actives = new Map<string, ActiveEntry>();
   private latestItems: CanvasItem[] = [];
   private stampImages = new Map<string, StampImageEntry>();
+  private strokeCompositingScratch: HTMLCanvasElement | null = null;
   private movingStamp: StampItem | null = null;
   private disposed = false;
 
@@ -81,6 +84,7 @@ export class OverlayLayers {
       canvas.width = width;
       canvas.height = height;
     }
+    this.resizeStrokeCompositingScratch(width, height);
     if (this.movingStamp) {
       this.rebuildBaked(items, this.movingStamp.itemId);
       this.renderActive();
@@ -114,6 +118,13 @@ export class OverlayLayers {
     this.disposed = true;
     for (const entry of this.stampImages.values()) {
       this.cancelStampImageEntry(entry);
+    }
+    for (const entry of this.actives.values()) {
+      if (entry.scratch) this.releaseCanvas(entry.scratch);
+    }
+    if (this.strokeCompositingScratch) {
+      this.releaseCanvas(this.strokeCompositingScratch);
+      this.strokeCompositingScratch = null;
     }
     this.stampImages.clear();
     this.actives.clear();
@@ -166,7 +177,7 @@ export class OverlayLayers {
     if (this.actives.has(stroke.strokeId)) return;
     let scratch: HTMLCanvasElement | null = null;
     if (stroke.brush.tool !== "eraser") {
-      scratch = document.createElement("canvas");
+      scratch = this.runtime.createCanvas();
       scratch.width = this.width;
       scratch.height = this.height;
     }
@@ -282,13 +293,36 @@ export class OverlayLayers {
       drawFullStroke(ctx, stroke, this.width, this.height);
       return;
     }
-    const scratch = document.createElement("canvas");
-    scratch.width = this.width;
-    scratch.height = this.height;
-    drawFullStroke(context2d(scratch), stroke, this.width, this.height);
+    const scratch = this.getStrokeCompositingScratch();
+    const scratchCtx = context2d(scratch);
+    scratchCtx.globalAlpha = 1;
+    scratchCtx.globalCompositeOperation = "source-over";
+    scratchCtx.clearRect(0, 0, this.width, this.height);
+    drawFullStroke(scratchCtx, stroke, this.width, this.height);
     ctx.globalAlpha = stroke.brush.opacity;
     ctx.drawImage(scratch, 0, 0);
     ctx.globalAlpha = 1;
+  }
+
+  private getStrokeCompositingScratch(): HTMLCanvasElement {
+    if (!this.strokeCompositingScratch) {
+      this.strokeCompositingScratch = this.runtime.createCanvas();
+      this.strokeCompositingScratch.width = this.width;
+      this.strokeCompositingScratch.height = this.height;
+    }
+    return this.strokeCompositingScratch;
+  }
+
+  private resizeStrokeCompositingScratch(width: number, height: number): void {
+    const scratch = this.strokeCompositingScratch;
+    if (!scratch) return;
+    if (scratch.width !== width) scratch.width = width;
+    if (scratch.height !== height) scratch.height = height;
+  }
+
+  private releaseCanvas(canvas: HTMLCanvasElement): void {
+    canvas.width = 0;
+    canvas.height = 0;
   }
 
   private drawShape(ctx: CanvasRenderingContext2D, shape: ShapeItem): void {

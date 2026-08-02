@@ -70,22 +70,86 @@ interface DrawImageCall {
   args: number[];
 }
 
+interface ContextOperation {
+  kind: "clear" | "draw_image" | "fill" | "stroke";
+  alpha: number;
+  compositeOperation: GlobalCompositeOperation;
+  image?: CanvasImageSource;
+}
+
 class FakeCanvasContext {
   globalAlpha = 1;
   globalCompositeOperation: GlobalCompositeOperation = "source-over";
+  fillStyle: string | CanvasGradient | CanvasPattern = "#000000";
+  lineCap: CanvasLineCap = "butt";
+  lineJoin: CanvasLineJoin = "miter";
+  lineWidth = 1;
+  strokeStyle: string | CanvasGradient | CanvasPattern = "#000000";
   clearRectCalls = 0;
   drawImageCalls: DrawImageCall[] = [];
+  operations: ContextOperation[] = [];
+  private stateStack: Array<{
+    alpha: number;
+    compositeOperation: GlobalCompositeOperation;
+  }> = [];
 
   clearRect(): void {
     this.clearRectCalls++;
+    this.record("clear");
   }
 
   drawImage(image: CanvasImageSource, ...args: number[]): void {
     this.drawImageCalls.push({ image, args });
+    this.record("draw_image", image);
   }
 
-  save(): void {}
-  restore(): void {}
+  beginPath(): void {}
+  moveTo(): void {}
+  lineTo(): void {}
+  quadraticCurveTo(): void {}
+  arc(): void {}
+  rect(): void {}
+  ellipse(): void {}
+
+  fill(): void {
+    this.record("fill");
+  }
+
+  stroke(): void {
+    this.record("stroke");
+  }
+
+  save(): void {
+    this.stateStack.push({
+      alpha: this.globalAlpha,
+      compositeOperation: this.globalCompositeOperation,
+    });
+  }
+
+  restore(): void {
+    const state = this.stateStack.pop();
+    if (!state) return;
+    this.globalAlpha = state.alpha;
+    this.globalCompositeOperation = state.compositeOperation;
+  }
+
+  resetLogs(): void {
+    this.clearRectCalls = 0;
+    this.drawImageCalls = [];
+    this.operations = [];
+  }
+
+  private record(
+    kind: ContextOperation["kind"],
+    image?: CanvasImageSource,
+  ): void {
+    this.operations.push({
+      kind,
+      alpha: this.globalAlpha,
+      compositeOperation: this.globalCompositeOperation,
+      ...(image ? { image } : {}),
+    });
+  }
 }
 
 class FakeCanvas {
@@ -107,7 +171,14 @@ class FakeCanvas {
 
 class FakeRuntime implements OverlayLayersRuntime {
   readonly timers = new FakeTimers();
+  readonly canvases: FakeCanvas[] = [];
   readonly images: FakeImage[] = [];
+
+  createCanvas = (): HTMLCanvasElement => {
+    const canvas = new FakeCanvas(0, 0);
+    this.canvases.push(canvas);
+    return canvas.asCanvas();
+  };
 
   createImage = (): HTMLImageElement => {
     const image = new FakeImage();
@@ -154,6 +225,52 @@ function stamp(
   };
 }
 
+function marker(
+  index: number,
+  opacity = 0.4,
+  pts: Extract<CanvasItem, { kind: "stroke" }>["pts"] = [
+    [0.1, 0.1, 1, 0],
+    [0.9, 0.9, 1, 1],
+  ],
+): Extract<CanvasItem, { kind: "stroke" }> {
+  return {
+    kind: "stroke",
+    strokeId: `marker-${index}`,
+    brush: {
+      tool: "marker",
+      color: "#ff00ff",
+      opacity,
+      widthN: 0.02,
+      pressureWidth: false,
+    },
+    pts,
+    done: true,
+    endedAt: index,
+  };
+}
+
+function eraser(index: number): Extract<CanvasItem, { kind: "stroke" }> {
+  const item = marker(index, 1);
+  return {
+    ...item,
+    strokeId: `eraser-${index}`,
+    brush: { ...item.brush, tool: "eraser" },
+  };
+}
+
+function lineShape(): Extract<CanvasItem, { kind: "shape" }> {
+  return {
+    kind: "shape",
+    itemId: "shape-1",
+    shape: "line",
+    style: { color: "#00ffff", opacity: 0.7, widthN: 0.01 },
+    start: [0.2, 0.8],
+    end: [0.8, 0.2],
+    done: true,
+    endedAt: 1,
+  };
+}
+
 function withoutWarnings(callback: () => void): void {
   const warning = spyOn(console, "warn").mockImplementation(() => {});
   try {
@@ -162,6 +279,132 @@ function withoutWarnings(callback: () => void): void {
     warning.mockRestore();
   }
 }
+
+describe("OverlayLayers marker compositing scratch", () => {
+  test("自己交差する半透明strokeを不透明scratchから1回だけ合成する", () => {
+    const { layers, baked, runtime } = harness();
+    const crossingPoints: Extract<CanvasItem, { kind: "stroke" }>["pts"] = [
+      [0.2, 0.2, 1, 0],
+      [0.8, 0.8, 1, 1],
+      [0.2, 0.8, 1, 2],
+      [0.8, 0.2, 1, 3],
+      [0.2, 0.2, 1, 4],
+    ];
+
+    layers.rebuild([marker(1, 0.35, crossingPoints)]);
+
+    expect(runtime.canvases).toHaveLength(1);
+    const scratch = runtime.canvases[0] as FakeCanvas;
+    const scratchStrokes = scratch.context.operations.filter(
+      (operation) => operation.kind === "stroke",
+    );
+    expect(scratchStrokes).toHaveLength(4);
+    expect(
+      scratchStrokes.every(
+        (operation) =>
+          operation.alpha === 1 &&
+          operation.compositeOperation === "source-over",
+      ),
+    ).toBe(true);
+    expect(baked.context.drawImageCalls).toEqual([
+      { image: scratch.asCanvas(), args: [0, 0] },
+    ]);
+    expect(
+      baked.context.operations.filter(
+        (operation) => operation.kind === "draw_image",
+      ),
+    ).toEqual([
+      {
+        kind: "draw_image",
+        alpha: 0.35,
+        compositeOperation: "source-over",
+        image: scratch.asCanvas(),
+      },
+    ]);
+  });
+
+  test("marker・shape・stamp・eraserの履歴順を保って同じscratchを再利用する", () => {
+    const { layers, baked, runtime } = harness();
+    const stampItem = { ...stamp(), opacity: 0.8 };
+    layers.rebuild([stampItem]);
+    runtime.images[0]?.succeed();
+    baked.context.resetLogs();
+
+    layers.rebuild([
+      marker(1, 0.4),
+      lineShape(),
+      stampItem,
+      eraser(2),
+      marker(3, 0.6),
+    ]);
+
+    const scratch = runtime.canvases[0] as FakeCanvas;
+    const renderOperations = baked.context.operations.filter(
+      (operation) => operation.kind !== "clear",
+    );
+    expect(
+      renderOperations.map((operation) => [
+        operation.kind,
+        operation.alpha,
+        operation.compositeOperation,
+      ]),
+    ).toEqual([
+      ["draw_image", 0.4, "source-over"],
+      ["stroke", 0.7, "source-over"],
+      ["draw_image", 0.8, "source-over"],
+      ["stroke", 1, "destination-out"],
+      ["draw_image", 0.6, "source-over"],
+    ]);
+    expect(
+      renderOperations
+        .filter((operation) => operation.kind === "draw_image")
+        .map((operation) => operation.image),
+    ).toEqual([
+      scratch.asCanvas(),
+      runtime.images[0]?.asImage(),
+      scratch.asCanvas(),
+    ]);
+    expect(runtime.canvases).toHaveLength(1);
+  });
+
+  test("1080p・4Kの500 markersを1枚のscratchで再構築する", () => {
+    const { layers, baked, runtime } = harness();
+    const items = Array.from({ length: 500 }, (_, index) => marker(index));
+    const rebuildLimitMs = 250;
+
+    const rebuildAt = (width: number, height: number): number => {
+      baked.context.resetLogs();
+      const startedAt = performance.now();
+      layers.resize(width, height, items);
+      const elapsedMs = performance.now() - startedAt;
+      expect(elapsedMs).toBeLessThan(rebuildLimitMs);
+      expect(baked.context.drawImageCalls).toHaveLength(500);
+      return elapsedMs;
+    };
+
+    rebuildAt(1_920, 1_080);
+    expect(runtime.canvases).toHaveLength(1);
+    const scratch = runtime.canvases[0] as FakeCanvas;
+    expect([scratch.width, scratch.height]).toEqual([1_920, 1_080]);
+    expect(scratch.context.clearRectCalls).toBe(500);
+
+    rebuildAt(3_840, 2_160);
+    expect(runtime.canvases).toHaveLength(1);
+    expect(runtime.canvases[0]).toBe(scratch);
+    expect([scratch.width, scratch.height]).toEqual([3_840, 2_160]);
+    expect(scratch.context.clearRectCalls).toBe(1_000);
+
+    baked.context.resetLogs();
+    const startedAt = performance.now();
+    layers.rebuild(items);
+    expect(performance.now() - startedAt).toBeLessThan(rebuildLimitMs);
+    expect(runtime.canvases).toHaveLength(1);
+    expect(baked.context.drawImageCalls).toHaveLength(500);
+
+    layers.dispose();
+    expect([scratch.width, scratch.height]).toEqual([0, 0]);
+  });
+});
 
 describe("OverlayLayers stamp image retry", () => {
   test("一時失敗後にretry成功するとbakedへ再描画する", () => {
