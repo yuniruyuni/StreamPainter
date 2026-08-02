@@ -1,0 +1,2609 @@
+{
+  "clientMessages": [
+    {
+      "t": 1700000001500.0,
+      "type": "ping"
+    }
+  ],
+  "controlMessages": [
+    {
+      "fadeAfterMs": 2500.0,
+      "items": [
+        {
+          "brush": {
+            "color": "#12abef",
+            "opacity": 0.75,
+            "pressureWidth": true,
+            "tool": "pen",
+            "widthN": 0.0125
+          },
+          "done": true,
+          "endedAt": 1700000000100.0,
+          "kind": "stroke",
+          "pts": [
+            [
+              0.1,
+              0.2,
+              0.5,
+              0.0
+            ]
+          ],
+          "strokeId": "fixture-snapshot-stroke"
+        },
+        {
+          "done": true,
+          "end": [
+            0.3,
+            0.4
+          ],
+          "endedAt": 1700000000000.0,
+          "itemId": "fixture-snapshot-shape",
+          "kind": "shape",
+          "shape": "ellipse",
+          "start": [
+            0.1,
+            0.2
+          ],
+          "style": {
+            "color": "#fedcba",
+            "opacity": 0.625,
+            "widthN": 0.01
+          }
+        },
+        {
+          "center": [
+            0.25,
+            0.35
+          ],
+          "done": true,
+          "endedAt": 1700000000789.0,
+          "heightN": 0.225,
+          "itemId": "fixture-snapshot-stamp",
+          "kind": "stamp",
+          "opacity": 0.875,
+          "stampId": "fixture-stamp",
+          "widthN": 0.125
+        }
+      ],
+      "protocolVersion": 5,
+      "rev": 40,
+      "type": "snapshot"
+    },
+    {
+      "t": 1700000001000.0,
+      "type": "pong"
+    }
+  ],
+  "enumValues": {
+    "canvasKinds": [
+      "stroke",
+      "shape",
+      "stamp"
+    ],
+    "shapeKinds": [
+      "line",
+      "arrow",
+      "rectangle",
+      "ellipse"
+    ],
+    "tools": [
+      "pen",
+      "marker",
+      "eraser"
+    ]
+  },
+  "eventCases": [
+    {
+      "expected": {
+        "items": [
+          {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-preserved-stamp",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          },
+          {
+            "brush": {
+              "color": "#12abef",
+              "opacity": 0.75,
+              "pressureWidth": true,
+              "tool": "marker",
+              "widthN": 0.0125
+            },
+            "done": false,
+            "endedAt": null,
+            "kind": "stroke",
+            "pts": [],
+            "strokeId": "fixture-stroke-begin"
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-preserved-stamp",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "brush": {
+          "color": "#12abef",
+          "opacity": 0.75,
+          "pressureWidth": true,
+          "tool": "marker",
+          "widthN": 0.0125
+        },
+        "rev": 41,
+        "strokeId": "fixture-stroke-begin",
+        "type": "stroke_begin"
+      },
+      "name": "stroke_begin"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": false,
+            "endedAt": null,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ],
+              [
+                0.2,
+                0.3,
+                0.6,
+                16.0
+              ],
+              [
+                0.4,
+                0.5,
+                0.7,
+                32.0
+              ]
+            ],
+            "strokeId": "fixture-stroke-points"
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": false,
+            "endedAt": null,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-stroke-points"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "pts": [
+          [
+            0.2,
+            0.3,
+            0.6,
+            16.0
+          ],
+          [
+            0.4,
+            0.5,
+            0.7,
+            32.0
+          ]
+        ],
+        "rev": 41,
+        "strokeId": "fixture-stroke-points",
+        "type": "stroke_points"
+      },
+      "name": "stroke_points"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "marker",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000123.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ],
+              [
+                0.1,
+                0.2,
+                0.5,
+                1.0
+              ]
+            ],
+            "strokeId": "fixture-stroke-end"
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "marker",
+              "widthN": 0.0075
+            },
+            "done": false,
+            "endedAt": null,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ],
+              [
+                0.1,
+                0.2,
+                0.5,
+                1.0
+              ]
+            ],
+            "strokeId": "fixture-stroke-end"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "endedAt": 1700000000123.0,
+        "rev": 41,
+        "strokeId": "fixture-stroke-end",
+        "type": "stroke_end"
+      },
+      "name": "stroke_end"
+    },
+    {
+      "expected": {
+        "items": [],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "eraser",
+              "widthN": 0.0075
+            },
+            "done": false,
+            "endedAt": null,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ],
+              [
+                0.1,
+                0.2,
+                0.5,
+                1.0
+              ]
+            ],
+            "strokeId": "fixture-stroke-cancel"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 41,
+        "strokeId": "fixture-stroke-cancel",
+        "type": "stroke_cancel"
+      },
+      "name": "stroke_cancel"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-preserved-stroke"
+          },
+          {
+            "done": false,
+            "end": [
+              0.3,
+              0.4
+            ],
+            "endedAt": null,
+            "itemId": "fixture-shape-begin",
+            "kind": "shape",
+            "shape": "arrow",
+            "start": [
+              0.1,
+              0.2
+            ],
+            "style": {
+              "color": "#fedcba",
+              "opacity": 0.625,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-preserved-stroke"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 41,
+        "shape": {
+          "done": false,
+          "end": [
+            0.3,
+            0.4
+          ],
+          "endedAt": null,
+          "itemId": "fixture-shape-begin",
+          "shape": "arrow",
+          "start": [
+            0.1,
+            0.2
+          ],
+          "style": {
+            "color": "#fedcba",
+            "opacity": 0.625,
+            "widthN": 0.01
+          }
+        },
+        "type": "shape_begin"
+      },
+      "name": "shape_begin"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": false,
+            "end": [
+              0.8,
+              0.7
+            ],
+            "endedAt": null,
+            "itemId": "fixture-shape-update",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": false,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": null,
+            "itemId": "fixture-shape-update",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "end": [
+          0.8,
+          0.7
+        ],
+        "itemId": "fixture-shape-update",
+        "rev": 41,
+        "type": "shape_update"
+      },
+      "name": "shape_update"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000456.0,
+            "itemId": "fixture-shape-end",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": false,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": null,
+            "itemId": "fixture-shape-end",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "endedAt": 1700000000456.0,
+        "itemId": "fixture-shape-end",
+        "rev": 41,
+        "type": "shape_end"
+      },
+      "name": "shape_end"
+    },
+    {
+      "expected": {
+        "items": [],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": false,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": null,
+            "itemId": "fixture-shape-cancel",
+            "kind": "shape",
+            "shape": "rectangle",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "itemId": "fixture-shape-cancel",
+        "rev": 41,
+        "type": "shape_cancel"
+      },
+      "name": "shape_cancel"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-preserved-shape",
+            "kind": "shape",
+            "shape": "line",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          },
+          {
+            "center": [
+              0.25,
+              0.35
+            ],
+            "done": true,
+            "endedAt": 1700000000789.0,
+            "heightN": 0.225,
+            "itemId": "fixture-stamp-add",
+            "kind": "stamp",
+            "opacity": 0.875,
+            "stampId": "fixture-stamp",
+            "widthN": 0.125
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-preserved-shape",
+            "kind": "shape",
+            "shape": "line",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 41,
+        "stamp": {
+          "center": [
+            0.25,
+            0.35
+          ],
+          "done": true,
+          "endedAt": 1700000000789.0,
+          "heightN": 0.225,
+          "itemId": "fixture-stamp-add",
+          "opacity": 0.875,
+          "stampId": "fixture-stamp",
+          "widthN": 0.125
+        },
+        "type": "stamp_add"
+      },
+      "name": "stamp_add"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "center": [
+              0.65,
+              0.45
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-stamp-preview",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-stamp-preview",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "center": [
+          0.65,
+          0.45
+        ],
+        "itemId": "fixture-stamp-preview",
+        "rev": 41,
+        "type": "stamp_move_preview"
+      },
+      "name": "stamp_move_preview"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "center": [
+              0.75,
+              0.6
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-stamp-move",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-stamp-move",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "center": [
+          0.75,
+          0.6
+        ],
+        "itemId": "fixture-stamp-move",
+        "rev": 41,
+        "type": "stamp_move"
+      },
+      "name": "stamp_move"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": false,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": null,
+            "itemId": "fixture-undo-active",
+            "kind": "shape",
+            "shape": "ellipse",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ],
+              [
+                0.1,
+                0.2,
+                0.5,
+                1.0
+              ]
+            ],
+            "strokeId": "fixture-undo-target"
+          },
+          {
+            "done": false,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": null,
+            "itemId": "fixture-undo-active",
+            "kind": "shape",
+            "shape": "ellipse",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 41,
+        "type": "undo"
+      },
+      "name": "undo"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-redo-preserved",
+            "kind": "shape",
+            "shape": "arrow",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          },
+          {
+            "center": [
+              0.25,
+              0.35
+            ],
+            "done": true,
+            "endedAt": 1700000000789.0,
+            "heightN": 0.225,
+            "itemId": "fixture-redo",
+            "kind": "stamp",
+            "opacity": 0.875,
+            "stampId": "fixture-stamp",
+            "widthN": 0.125
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-redo-preserved",
+            "kind": "shape",
+            "shape": "arrow",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "item": {
+          "center": [
+            0.25,
+            0.35
+          ],
+          "done": true,
+          "endedAt": 1700000000789.0,
+          "heightN": 0.225,
+          "itemId": "fixture-redo",
+          "kind": "stamp",
+          "opacity": 0.875,
+          "stampId": "fixture-stamp",
+          "widthN": 0.125
+        },
+        "rev": 41,
+        "type": "redo"
+      },
+      "name": "redo"
+    },
+    {
+      "expected": {
+        "items": [],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-clear-stroke"
+          },
+          {
+            "done": true,
+            "end": [
+              0.35,
+              0.45
+            ],
+            "endedAt": 1700000000200.0,
+            "itemId": "fixture-clear-shape",
+            "kind": "shape",
+            "shape": "ellipse",
+            "start": [
+              0.15,
+              0.25
+            ],
+            "style": {
+              "color": "#aabbcc",
+              "opacity": 0.7,
+              "widthN": 0.01
+            }
+          },
+          {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-clear-stamp",
+            "kind": "stamp",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 41,
+        "type": "clear"
+      },
+      "name": "clear"
+    }
+  ],
+  "fixtureVersion": 1,
+  "limits": {
+    "maxItems": 500,
+    "maxPointsPerMessage": 512,
+    "maxStrokePoints": 10000,
+    "maxTotalPoints": 200000
+  },
+  "messageFields": {
+    "clear": [
+      "rev",
+      "type"
+    ],
+    "pong": [
+      "t",
+      "type"
+    ],
+    "redo": [
+      "item",
+      "rev",
+      "type"
+    ],
+    "shape_begin": [
+      "rev",
+      "shape",
+      "type"
+    ],
+    "shape_cancel": [
+      "itemId",
+      "rev",
+      "type"
+    ],
+    "shape_end": [
+      "endedAt",
+      "itemId",
+      "rev",
+      "type"
+    ],
+    "shape_update": [
+      "end",
+      "itemId",
+      "rev",
+      "type"
+    ],
+    "snapshot": [
+      "fadeAfterMs",
+      "items",
+      "protocolVersion",
+      "rev",
+      "type"
+    ],
+    "stamp_add": [
+      "rev",
+      "stamp",
+      "type"
+    ],
+    "stamp_move": [
+      "center",
+      "itemId",
+      "rev",
+      "type"
+    ],
+    "stamp_move_preview": [
+      "center",
+      "itemId",
+      "rev",
+      "type"
+    ],
+    "stroke_begin": [
+      "brush",
+      "rev",
+      "strokeId",
+      "type"
+    ],
+    "stroke_cancel": [
+      "rev",
+      "strokeId",
+      "type"
+    ],
+    "stroke_end": [
+      "endedAt",
+      "rev",
+      "strokeId",
+      "type"
+    ],
+    "stroke_points": [
+      "pts",
+      "rev",
+      "strokeId",
+      "type"
+    ],
+    "undo": [
+      "rev",
+      "type"
+    ]
+  },
+  "objectFields": {
+    "brush": [
+      "color",
+      "opacity",
+      "pressureWidth",
+      "tool",
+      "widthN"
+    ],
+    "lineStyle": [
+      "color",
+      "opacity",
+      "widthN"
+    ],
+    "shapeItem": [
+      "done",
+      "end",
+      "endedAt",
+      "itemId",
+      "kind",
+      "shape",
+      "start",
+      "style"
+    ],
+    "stampItem": [
+      "center",
+      "done",
+      "endedAt",
+      "heightN",
+      "itemId",
+      "kind",
+      "opacity",
+      "stampId",
+      "widthN"
+    ],
+    "strokeItem": [
+      "brush",
+      "done",
+      "endedAt",
+      "kind",
+      "pts",
+      "strokeId"
+    ]
+  },
+  "protocolVersion": 5,
+  "revisionCases": [
+    {
+      "expected": {
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "rev": 10
+      },
+      "expectedEffect": "resync",
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 10,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 12,
+        "type": "clear"
+      },
+      "name": "missing_revision"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "rev": 10
+      },
+      "expectedEffect": "resync",
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 10,
+        "type": "snapshot"
+      },
+      "message": {
+        "rev": 10,
+        "type": "clear"
+      },
+      "name": "duplicate_revision"
+    },
+    {
+      "expected": {
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "rev": 10
+      },
+      "expectedEffect": "resync",
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [
+          {
+            "brush": {
+              "color": "#4455aa",
+              "opacity": 0.8,
+              "pressureWidth": true,
+              "tool": "pen",
+              "widthN": 0.0075
+            },
+            "done": true,
+            "endedAt": 1700000000100.0,
+            "kind": "stroke",
+            "pts": [
+              [
+                0.1,
+                0.2,
+                0.5,
+                0.0
+              ]
+            ],
+            "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "protocolVersion": 5,
+        "rev": 10,
+        "type": "snapshot"
+      },
+      "message": {
+        "fadeAfterMs": 1000.0,
+        "items": [],
+        "protocolVersion": 6,
+        "rev": 99,
+        "type": "snapshot"
+      },
+      "name": "unknown_protocol_version"
+    }
+  ],
+  "serverMessageTypes": [
+    "snapshot",
+    "pong",
+    "stroke_begin",
+    "stroke_points",
+    "stroke_end",
+    "stroke_cancel",
+    "shape_begin",
+    "shape_update",
+    "shape_end",
+    "shape_cancel",
+    "stamp_add",
+    "stamp_move_preview",
+    "stamp_move",
+    "undo",
+    "redo",
+    "clear"
+  ],
+  "trimCases": [
+    {
+      "expected": {
+        "itemIds": [
+          "fixture-limit-item-001",
+          "fixture-limit-item-002",
+          "fixture-limit-item-003",
+          "fixture-limit-item-004",
+          "fixture-limit-item-005",
+          "fixture-limit-item-006",
+          "fixture-limit-item-007",
+          "fixture-limit-item-008",
+          "fixture-limit-item-009",
+          "fixture-limit-item-010",
+          "fixture-limit-item-011",
+          "fixture-limit-item-012",
+          "fixture-limit-item-013",
+          "fixture-limit-item-014",
+          "fixture-limit-item-015",
+          "fixture-limit-item-016",
+          "fixture-limit-item-017",
+          "fixture-limit-item-018",
+          "fixture-limit-item-019",
+          "fixture-limit-item-020",
+          "fixture-limit-item-021",
+          "fixture-limit-item-022",
+          "fixture-limit-item-023",
+          "fixture-limit-item-024",
+          "fixture-limit-item-025",
+          "fixture-limit-item-026",
+          "fixture-limit-item-027",
+          "fixture-limit-item-028",
+          "fixture-limit-item-029",
+          "fixture-limit-item-030",
+          "fixture-limit-item-031",
+          "fixture-limit-item-032",
+          "fixture-limit-item-033",
+          "fixture-limit-item-034",
+          "fixture-limit-item-035",
+          "fixture-limit-item-036",
+          "fixture-limit-item-037",
+          "fixture-limit-item-038",
+          "fixture-limit-item-039",
+          "fixture-limit-item-040",
+          "fixture-limit-item-041",
+          "fixture-limit-item-042",
+          "fixture-limit-item-043",
+          "fixture-limit-item-044",
+          "fixture-limit-item-045",
+          "fixture-limit-item-046",
+          "fixture-limit-item-047",
+          "fixture-limit-item-048",
+          "fixture-limit-item-049",
+          "fixture-limit-item-050",
+          "fixture-limit-item-051",
+          "fixture-limit-item-052",
+          "fixture-limit-item-053",
+          "fixture-limit-item-054",
+          "fixture-limit-item-055",
+          "fixture-limit-item-056",
+          "fixture-limit-item-057",
+          "fixture-limit-item-058",
+          "fixture-limit-item-059",
+          "fixture-limit-item-060",
+          "fixture-limit-item-061",
+          "fixture-limit-item-062",
+          "fixture-limit-item-063",
+          "fixture-limit-item-064",
+          "fixture-limit-item-065",
+          "fixture-limit-item-066",
+          "fixture-limit-item-067",
+          "fixture-limit-item-068",
+          "fixture-limit-item-069",
+          "fixture-limit-item-070",
+          "fixture-limit-item-071",
+          "fixture-limit-item-072",
+          "fixture-limit-item-073",
+          "fixture-limit-item-074",
+          "fixture-limit-item-075",
+          "fixture-limit-item-076",
+          "fixture-limit-item-077",
+          "fixture-limit-item-078",
+          "fixture-limit-item-079",
+          "fixture-limit-item-080",
+          "fixture-limit-item-081",
+          "fixture-limit-item-082",
+          "fixture-limit-item-083",
+          "fixture-limit-item-084",
+          "fixture-limit-item-085",
+          "fixture-limit-item-086",
+          "fixture-limit-item-087",
+          "fixture-limit-item-088",
+          "fixture-limit-item-089",
+          "fixture-limit-item-090",
+          "fixture-limit-item-091",
+          "fixture-limit-item-092",
+          "fixture-limit-item-093",
+          "fixture-limit-item-094",
+          "fixture-limit-item-095",
+          "fixture-limit-item-096",
+          "fixture-limit-item-097",
+          "fixture-limit-item-098",
+          "fixture-limit-item-099",
+          "fixture-limit-item-100",
+          "fixture-limit-item-101",
+          "fixture-limit-item-102",
+          "fixture-limit-item-103",
+          "fixture-limit-item-104",
+          "fixture-limit-item-105",
+          "fixture-limit-item-106",
+          "fixture-limit-item-107",
+          "fixture-limit-item-108",
+          "fixture-limit-item-109",
+          "fixture-limit-item-110",
+          "fixture-limit-item-111",
+          "fixture-limit-item-112",
+          "fixture-limit-item-113",
+          "fixture-limit-item-114",
+          "fixture-limit-item-115",
+          "fixture-limit-item-116",
+          "fixture-limit-item-117",
+          "fixture-limit-item-118",
+          "fixture-limit-item-119",
+          "fixture-limit-item-120",
+          "fixture-limit-item-121",
+          "fixture-limit-item-122",
+          "fixture-limit-item-123",
+          "fixture-limit-item-124",
+          "fixture-limit-item-125",
+          "fixture-limit-item-126",
+          "fixture-limit-item-127",
+          "fixture-limit-item-128",
+          "fixture-limit-item-129",
+          "fixture-limit-item-130",
+          "fixture-limit-item-131",
+          "fixture-limit-item-132",
+          "fixture-limit-item-133",
+          "fixture-limit-item-134",
+          "fixture-limit-item-135",
+          "fixture-limit-item-136",
+          "fixture-limit-item-137",
+          "fixture-limit-item-138",
+          "fixture-limit-item-139",
+          "fixture-limit-item-140",
+          "fixture-limit-item-141",
+          "fixture-limit-item-142",
+          "fixture-limit-item-143",
+          "fixture-limit-item-144",
+          "fixture-limit-item-145",
+          "fixture-limit-item-146",
+          "fixture-limit-item-147",
+          "fixture-limit-item-148",
+          "fixture-limit-item-149",
+          "fixture-limit-item-150",
+          "fixture-limit-item-151",
+          "fixture-limit-item-152",
+          "fixture-limit-item-153",
+          "fixture-limit-item-154",
+          "fixture-limit-item-155",
+          "fixture-limit-item-156",
+          "fixture-limit-item-157",
+          "fixture-limit-item-158",
+          "fixture-limit-item-159",
+          "fixture-limit-item-160",
+          "fixture-limit-item-161",
+          "fixture-limit-item-162",
+          "fixture-limit-item-163",
+          "fixture-limit-item-164",
+          "fixture-limit-item-165",
+          "fixture-limit-item-166",
+          "fixture-limit-item-167",
+          "fixture-limit-item-168",
+          "fixture-limit-item-169",
+          "fixture-limit-item-170",
+          "fixture-limit-item-171",
+          "fixture-limit-item-172",
+          "fixture-limit-item-173",
+          "fixture-limit-item-174",
+          "fixture-limit-item-175",
+          "fixture-limit-item-176",
+          "fixture-limit-item-177",
+          "fixture-limit-item-178",
+          "fixture-limit-item-179",
+          "fixture-limit-item-180",
+          "fixture-limit-item-181",
+          "fixture-limit-item-182",
+          "fixture-limit-item-183",
+          "fixture-limit-item-184",
+          "fixture-limit-item-185",
+          "fixture-limit-item-186",
+          "fixture-limit-item-187",
+          "fixture-limit-item-188",
+          "fixture-limit-item-189",
+          "fixture-limit-item-190",
+          "fixture-limit-item-191",
+          "fixture-limit-item-192",
+          "fixture-limit-item-193",
+          "fixture-limit-item-194",
+          "fixture-limit-item-195",
+          "fixture-limit-item-196",
+          "fixture-limit-item-197",
+          "fixture-limit-item-198",
+          "fixture-limit-item-199",
+          "fixture-limit-item-200",
+          "fixture-limit-item-201",
+          "fixture-limit-item-202",
+          "fixture-limit-item-203",
+          "fixture-limit-item-204",
+          "fixture-limit-item-205",
+          "fixture-limit-item-206",
+          "fixture-limit-item-207",
+          "fixture-limit-item-208",
+          "fixture-limit-item-209",
+          "fixture-limit-item-210",
+          "fixture-limit-item-211",
+          "fixture-limit-item-212",
+          "fixture-limit-item-213",
+          "fixture-limit-item-214",
+          "fixture-limit-item-215",
+          "fixture-limit-item-216",
+          "fixture-limit-item-217",
+          "fixture-limit-item-218",
+          "fixture-limit-item-219",
+          "fixture-limit-item-220",
+          "fixture-limit-item-221",
+          "fixture-limit-item-222",
+          "fixture-limit-item-223",
+          "fixture-limit-item-224",
+          "fixture-limit-item-225",
+          "fixture-limit-item-226",
+          "fixture-limit-item-227",
+          "fixture-limit-item-228",
+          "fixture-limit-item-229",
+          "fixture-limit-item-230",
+          "fixture-limit-item-231",
+          "fixture-limit-item-232",
+          "fixture-limit-item-233",
+          "fixture-limit-item-234",
+          "fixture-limit-item-235",
+          "fixture-limit-item-236",
+          "fixture-limit-item-237",
+          "fixture-limit-item-238",
+          "fixture-limit-item-239",
+          "fixture-limit-item-240",
+          "fixture-limit-item-241",
+          "fixture-limit-item-242",
+          "fixture-limit-item-243",
+          "fixture-limit-item-244",
+          "fixture-limit-item-245",
+          "fixture-limit-item-246",
+          "fixture-limit-item-247",
+          "fixture-limit-item-248",
+          "fixture-limit-item-249",
+          "fixture-limit-item-250",
+          "fixture-limit-item-251",
+          "fixture-limit-item-252",
+          "fixture-limit-item-253",
+          "fixture-limit-item-254",
+          "fixture-limit-item-255",
+          "fixture-limit-item-256",
+          "fixture-limit-item-257",
+          "fixture-limit-item-258",
+          "fixture-limit-item-259",
+          "fixture-limit-item-260",
+          "fixture-limit-item-261",
+          "fixture-limit-item-262",
+          "fixture-limit-item-263",
+          "fixture-limit-item-264",
+          "fixture-limit-item-265",
+          "fixture-limit-item-266",
+          "fixture-limit-item-267",
+          "fixture-limit-item-268",
+          "fixture-limit-item-269",
+          "fixture-limit-item-270",
+          "fixture-limit-item-271",
+          "fixture-limit-item-272",
+          "fixture-limit-item-273",
+          "fixture-limit-item-274",
+          "fixture-limit-item-275",
+          "fixture-limit-item-276",
+          "fixture-limit-item-277",
+          "fixture-limit-item-278",
+          "fixture-limit-item-279",
+          "fixture-limit-item-280",
+          "fixture-limit-item-281",
+          "fixture-limit-item-282",
+          "fixture-limit-item-283",
+          "fixture-limit-item-284",
+          "fixture-limit-item-285",
+          "fixture-limit-item-286",
+          "fixture-limit-item-287",
+          "fixture-limit-item-288",
+          "fixture-limit-item-289",
+          "fixture-limit-item-290",
+          "fixture-limit-item-291",
+          "fixture-limit-item-292",
+          "fixture-limit-item-293",
+          "fixture-limit-item-294",
+          "fixture-limit-item-295",
+          "fixture-limit-item-296",
+          "fixture-limit-item-297",
+          "fixture-limit-item-298",
+          "fixture-limit-item-299",
+          "fixture-limit-item-300",
+          "fixture-limit-item-301",
+          "fixture-limit-item-302",
+          "fixture-limit-item-303",
+          "fixture-limit-item-304",
+          "fixture-limit-item-305",
+          "fixture-limit-item-306",
+          "fixture-limit-item-307",
+          "fixture-limit-item-308",
+          "fixture-limit-item-309",
+          "fixture-limit-item-310",
+          "fixture-limit-item-311",
+          "fixture-limit-item-312",
+          "fixture-limit-item-313",
+          "fixture-limit-item-314",
+          "fixture-limit-item-315",
+          "fixture-limit-item-316",
+          "fixture-limit-item-317",
+          "fixture-limit-item-318",
+          "fixture-limit-item-319",
+          "fixture-limit-item-320",
+          "fixture-limit-item-321",
+          "fixture-limit-item-322",
+          "fixture-limit-item-323",
+          "fixture-limit-item-324",
+          "fixture-limit-item-325",
+          "fixture-limit-item-326",
+          "fixture-limit-item-327",
+          "fixture-limit-item-328",
+          "fixture-limit-item-329",
+          "fixture-limit-item-330",
+          "fixture-limit-item-331",
+          "fixture-limit-item-332",
+          "fixture-limit-item-333",
+          "fixture-limit-item-334",
+          "fixture-limit-item-335",
+          "fixture-limit-item-336",
+          "fixture-limit-item-337",
+          "fixture-limit-item-338",
+          "fixture-limit-item-339",
+          "fixture-limit-item-340",
+          "fixture-limit-item-341",
+          "fixture-limit-item-342",
+          "fixture-limit-item-343",
+          "fixture-limit-item-344",
+          "fixture-limit-item-345",
+          "fixture-limit-item-346",
+          "fixture-limit-item-347",
+          "fixture-limit-item-348",
+          "fixture-limit-item-349",
+          "fixture-limit-item-350",
+          "fixture-limit-item-351",
+          "fixture-limit-item-352",
+          "fixture-limit-item-353",
+          "fixture-limit-item-354",
+          "fixture-limit-item-355",
+          "fixture-limit-item-356",
+          "fixture-limit-item-357",
+          "fixture-limit-item-358",
+          "fixture-limit-item-359",
+          "fixture-limit-item-360",
+          "fixture-limit-item-361",
+          "fixture-limit-item-362",
+          "fixture-limit-item-363",
+          "fixture-limit-item-364",
+          "fixture-limit-item-365",
+          "fixture-limit-item-366",
+          "fixture-limit-item-367",
+          "fixture-limit-item-368",
+          "fixture-limit-item-369",
+          "fixture-limit-item-370",
+          "fixture-limit-item-371",
+          "fixture-limit-item-372",
+          "fixture-limit-item-373",
+          "fixture-limit-item-374",
+          "fixture-limit-item-375",
+          "fixture-limit-item-376",
+          "fixture-limit-item-377",
+          "fixture-limit-item-378",
+          "fixture-limit-item-379",
+          "fixture-limit-item-380",
+          "fixture-limit-item-381",
+          "fixture-limit-item-382",
+          "fixture-limit-item-383",
+          "fixture-limit-item-384",
+          "fixture-limit-item-385",
+          "fixture-limit-item-386",
+          "fixture-limit-item-387",
+          "fixture-limit-item-388",
+          "fixture-limit-item-389",
+          "fixture-limit-item-390",
+          "fixture-limit-item-391",
+          "fixture-limit-item-392",
+          "fixture-limit-item-393",
+          "fixture-limit-item-394",
+          "fixture-limit-item-395",
+          "fixture-limit-item-396",
+          "fixture-limit-item-397",
+          "fixture-limit-item-398",
+          "fixture-limit-item-399",
+          "fixture-limit-item-400",
+          "fixture-limit-item-401",
+          "fixture-limit-item-402",
+          "fixture-limit-item-403",
+          "fixture-limit-item-404",
+          "fixture-limit-item-405",
+          "fixture-limit-item-406",
+          "fixture-limit-item-407",
+          "fixture-limit-item-408",
+          "fixture-limit-item-409",
+          "fixture-limit-item-410",
+          "fixture-limit-item-411",
+          "fixture-limit-item-412",
+          "fixture-limit-item-413",
+          "fixture-limit-item-414",
+          "fixture-limit-item-415",
+          "fixture-limit-item-416",
+          "fixture-limit-item-417",
+          "fixture-limit-item-418",
+          "fixture-limit-item-419",
+          "fixture-limit-item-420",
+          "fixture-limit-item-421",
+          "fixture-limit-item-422",
+          "fixture-limit-item-423",
+          "fixture-limit-item-424",
+          "fixture-limit-item-425",
+          "fixture-limit-item-426",
+          "fixture-limit-item-427",
+          "fixture-limit-item-428",
+          "fixture-limit-item-429",
+          "fixture-limit-item-430",
+          "fixture-limit-item-431",
+          "fixture-limit-item-432",
+          "fixture-limit-item-433",
+          "fixture-limit-item-434",
+          "fixture-limit-item-435",
+          "fixture-limit-item-436",
+          "fixture-limit-item-437",
+          "fixture-limit-item-438",
+          "fixture-limit-item-439",
+          "fixture-limit-item-440",
+          "fixture-limit-item-441",
+          "fixture-limit-item-442",
+          "fixture-limit-item-443",
+          "fixture-limit-item-444",
+          "fixture-limit-item-445",
+          "fixture-limit-item-446",
+          "fixture-limit-item-447",
+          "fixture-limit-item-448",
+          "fixture-limit-item-449",
+          "fixture-limit-item-450",
+          "fixture-limit-item-451",
+          "fixture-limit-item-452",
+          "fixture-limit-item-453",
+          "fixture-limit-item-454",
+          "fixture-limit-item-455",
+          "fixture-limit-item-456",
+          "fixture-limit-item-457",
+          "fixture-limit-item-458",
+          "fixture-limit-item-459",
+          "fixture-limit-item-460",
+          "fixture-limit-item-461",
+          "fixture-limit-item-462",
+          "fixture-limit-item-463",
+          "fixture-limit-item-464",
+          "fixture-limit-item-465",
+          "fixture-limit-item-466",
+          "fixture-limit-item-467",
+          "fixture-limit-item-468",
+          "fixture-limit-item-469",
+          "fixture-limit-item-470",
+          "fixture-limit-item-471",
+          "fixture-limit-item-472",
+          "fixture-limit-item-473",
+          "fixture-limit-item-474",
+          "fixture-limit-item-475",
+          "fixture-limit-item-476",
+          "fixture-limit-item-477",
+          "fixture-limit-item-478",
+          "fixture-limit-item-479",
+          "fixture-limit-item-480",
+          "fixture-limit-item-481",
+          "fixture-limit-item-482",
+          "fixture-limit-item-483",
+          "fixture-limit-item-484",
+          "fixture-limit-item-485",
+          "fixture-limit-item-486",
+          "fixture-limit-item-487",
+          "fixture-limit-item-488",
+          "fixture-limit-item-489",
+          "fixture-limit-item-490",
+          "fixture-limit-item-491",
+          "fixture-limit-item-492",
+          "fixture-limit-item-493",
+          "fixture-limit-item-494",
+          "fixture-limit-item-495",
+          "fixture-limit-item-496",
+          "fixture-limit-item-497",
+          "fixture-limit-item-498",
+          "fixture-limit-item-499",
+          "fixture-limit-item-new"
+        ],
+        "pointCounts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "rev": 41,
+        "totalPoints": 0
+      },
+      "initial": {
+        "count": 500,
+        "idPrefix": "fixture-limit-item-",
+        "kind": "done_stamps",
+        "revision": 40
+      },
+      "messages": [
+        {
+          "rev": 41,
+          "stamp": {
+            "center": [
+              0.45,
+              0.55
+            ],
+            "done": true,
+            "endedAt": 1700000000300.0,
+            "heightN": 0.2,
+            "itemId": "fixture-limit-item-new",
+            "opacity": 0.9,
+            "stampId": "fixture-stamp",
+            "widthN": 0.1
+          },
+          "type": "stamp_add"
+        }
+      ],
+      "name": "max_items"
+    },
+    {
+      "expected": {
+        "itemIds": [
+          "fixture-limit-stroke-001",
+          "fixture-limit-stroke-002",
+          "fixture-limit-stroke-003",
+          "fixture-limit-stroke-004",
+          "fixture-limit-stroke-005",
+          "fixture-limit-stroke-006",
+          "fixture-limit-stroke-007",
+          "fixture-limit-stroke-008",
+          "fixture-limit-stroke-009",
+          "fixture-limit-stroke-010",
+          "fixture-limit-stroke-011",
+          "fixture-limit-stroke-012",
+          "fixture-limit-stroke-013",
+          "fixture-limit-stroke-014",
+          "fixture-limit-stroke-015",
+          "fixture-limit-stroke-016",
+          "fixture-limit-stroke-017",
+          "fixture-limit-stroke-018",
+          "fixture-limit-stroke-019",
+          "fixture-limit-stroke-new"
+        ],
+        "pointCounts": [
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          10000,
+          1
+        ],
+        "rev": 42,
+        "totalPoints": 190001
+      },
+      "initial": {
+        "count": 20,
+        "idPrefix": "fixture-limit-stroke-",
+        "kind": "done_strokes",
+        "pointsPerItem": 10000,
+        "revision": 40
+      },
+      "messages": [
+        {
+          "brush": {
+            "color": "#4455aa",
+            "opacity": 0.8,
+            "pressureWidth": true,
+            "tool": "pen",
+            "widthN": 0.0075
+          },
+          "rev": 41,
+          "strokeId": "fixture-limit-stroke-new",
+          "type": "stroke_begin"
+        },
+        {
+          "pts": [
+            [
+              0.8,
+              0.9,
+              0.6,
+              0.0
+            ]
+          ],
+          "rev": 42,
+          "strokeId": "fixture-limit-stroke-new",
+          "type": "stroke_points"
+        }
+      ],
+      "name": "max_total_points"
+    },
+    {
+      "expected": {
+        "itemIds": [
+          "fixture-stroke-cap"
+        ],
+        "pointCounts": [
+          10000
+        ],
+        "rev": 41,
+        "totalPoints": 10000
+      },
+      "initial": {
+        "id": "fixture-stroke-cap",
+        "kind": "active_stroke",
+        "points": 9999,
+        "revision": 40
+      },
+      "messages": [
+        {
+          "pts": [
+            [
+              0.6,
+              0.7,
+              0.8,
+              16.0
+            ],
+            [
+              0.7,
+              0.8,
+              0.9,
+              32.0
+            ],
+            [
+              0.8,
+              0.9,
+              1.0,
+              48.0
+            ]
+          ],
+          "rev": 41,
+          "strokeId": "fixture-stroke-cap",
+          "type": "stroke_points"
+        }
+      ],
+      "name": "max_stroke_points"
+    }
+  ]
+}

@@ -13,6 +13,7 @@
     "check:type": "bun run --cwd client check:type",
     "fix:lint": "biome check --write client scripts",
     "generate:licenses": "bun scripts/generate-third-party-notices.ts",
+    "generate:protocol-fixtures": "bun run prepare:painter && bun scripts/generate-protocol-fixtures.ts",
     "prepare:painter": "bun run build && cargo fetch --locked --manifest-path painter/Cargo.toml && bun run generate:licenses"
   },
   "devDependencies": {

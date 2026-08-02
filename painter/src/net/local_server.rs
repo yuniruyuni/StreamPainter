@@ -780,6 +780,468 @@ async fn websocket_session(socket: WebSocket, hub: HubHandle) {
 }
 
 #[cfg(test)]
+mod protocol_conformance {
+    use super::*;
+    use crate::protocol::{
+        canonical_overlay_control_messages, canonical_painter_messages, Brush, LineStyle,
+        ShapeItem, ShapeKind, StampItem, Tool, MAX_POINTS_PER_MESSAGE,
+    };
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    const FIXTURE_REVISION: u64 = 40;
+    const UPDATE_FIXTURE_ENV: &str = "UPDATE_PROTOCOL_FIXTURES";
+
+    fn brush(tool: Tool) -> Brush {
+        Brush {
+            tool,
+            color: "#4455aa".into(),
+            opacity: 0.8,
+            width_n: 0.0075,
+            pressure_width: true,
+        }
+    }
+
+    fn stroke_item(id: &str, tool: Tool, done: bool, point_count: usize) -> CanvasItem {
+        CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: id.into(),
+                brush: brush(tool),
+                pts: (0..point_count)
+                    .map(|index| (0.1, 0.2, 0.5, index as f64))
+                    .collect(),
+                done,
+                ended_at: done.then_some(1_700_000_000_100.0),
+            },
+        }
+    }
+
+    fn shape_item(id: &str, kind: ShapeKind, done: bool) -> CanvasItem {
+        CanvasItem::Shape {
+            shape: ShapeItem {
+                item_id: id.into(),
+                shape: kind,
+                style: LineStyle {
+                    color: "#aabbcc".into(),
+                    opacity: 0.7,
+                    width_n: 0.01,
+                },
+                start: (0.15, 0.25),
+                end: (0.35, 0.45),
+                done,
+                ended_at: done.then_some(1_700_000_000_200.0),
+            },
+        }
+    }
+
+    fn stamp_item(id: &str, done: bool) -> CanvasItem {
+        CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: id.into(),
+                stamp_id: "fixture-stamp".into(),
+                center: (0.45, 0.55),
+                width_n: 0.1,
+                height_n: 0.2,
+                opacity: 0.9,
+                done,
+                ended_at: done.then_some(1_700_000_000_300.0),
+            },
+        }
+    }
+
+    fn hub_state(items: Vec<CanvasItem>) -> HubState {
+        let total_points = items.iter().map(CanvasItem::point_count).sum();
+        HubState {
+            items,
+            revision: FIXTURE_REVISION,
+            total_points,
+        }
+    }
+
+    // この exhaustive match が、enum macro に追加されたfixtureを各状態遷移へ
+    // 必ず接続させる。新variantのsetupを追加し忘れるとRustのコンパイルが失敗する。
+    fn initial_items(message: &PainterMessage) -> Vec<CanvasItem> {
+        match message {
+            PainterMessage::StrokeBegin { .. } => {
+                vec![stamp_item("fixture-preserved-stamp", true)]
+            }
+            PainterMessage::StrokePoints { stroke_id, .. } => {
+                vec![stroke_item(stroke_id, Tool::Pen, false, 1)]
+            }
+            PainterMessage::StrokeEnd { stroke_id, .. } => {
+                vec![stroke_item(stroke_id, Tool::Marker, false, 2)]
+            }
+            PainterMessage::StrokeCancel { stroke_id } => {
+                vec![stroke_item(stroke_id, Tool::Eraser, false, 2)]
+            }
+            PainterMessage::ShapeBegin { .. } => {
+                vec![stroke_item("fixture-preserved-stroke", Tool::Pen, true, 1)]
+            }
+            PainterMessage::ShapeUpdate { item_id, .. }
+            | PainterMessage::ShapeEnd { item_id, .. }
+            | PainterMessage::ShapeCancel { item_id } => {
+                vec![shape_item(item_id, ShapeKind::Rectangle, false)]
+            }
+            PainterMessage::StampAdd { .. } => {
+                vec![shape_item("fixture-preserved-shape", ShapeKind::Line, true)]
+            }
+            PainterMessage::StampMovePreview { item_id, .. }
+            | PainterMessage::StampMove { item_id, .. } => {
+                vec![stamp_item(item_id, true)]
+            }
+            PainterMessage::Undo {} => vec![
+                stroke_item("fixture-undo-target", Tool::Pen, true, 2),
+                shape_item("fixture-undo-active", ShapeKind::Ellipse, false),
+            ],
+            PainterMessage::Redo { .. } => {
+                vec![shape_item("fixture-redo-preserved", ShapeKind::Arrow, true)]
+            }
+            PainterMessage::Clear {} => vec![
+                stroke_item("fixture-clear-stroke", Tool::Pen, true, 1),
+                shape_item("fixture-clear-shape", ShapeKind::Ellipse, true),
+                stamp_item("fixture-clear-stamp", true),
+            ],
+        }
+    }
+
+    fn parse_json(text: &str) -> Value {
+        serde_json::from_str(text).expect("hub output must be JSON")
+    }
+
+    fn message_type(value: &Value) -> &str {
+        value
+            .get("type")
+            .and_then(Value::as_str)
+            .expect("canonical message must have a type")
+    }
+
+    fn top_level_fields(value: &Value) -> Vec<String> {
+        let mut fields: Vec<_> = value
+            .as_object()
+            .expect("canonical message must be an object")
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        fields
+    }
+
+    fn event_case(message: PainterMessage) -> Value {
+        let raw = serde_json::to_value(&message).expect("event fixture must serialize");
+        let name = message_type(&raw).to_owned();
+        let mut state = hub_state(initial_items(&message));
+        let initial = parse_json(&state.snapshot().expect("initial snapshot must serialize"));
+        let outbound = parse_json(
+            &state
+                .apply(message)
+                .unwrap_or_else(|| panic!("canonical {name} event was rejected by the hub")),
+        );
+        assert_eq!(message_type(&outbound), name);
+        json!({
+            "name": name,
+            "initial": initial,
+            "message": outbound,
+            "expected": {
+                "rev": state.revision,
+                "items": state.items,
+            },
+        })
+    }
+
+    fn revisioned_value(rev: u64, message: &PainterMessage) -> Value {
+        serde_json::to_value(OverlayEvent {
+            rev,
+            event: message,
+        })
+        .expect("revisioned event must serialize")
+    }
+
+    fn state_summary(state: &HubState) -> Value {
+        json!({
+            "rev": state.revision,
+            "itemIds": state.items.iter().map(CanvasItem::item_id).collect::<Vec<_>>(),
+            "pointCounts": state.items.iter().map(CanvasItem::point_count).collect::<Vec<_>>(),
+            "totalPoints": state.total_points,
+        })
+    }
+
+    fn apply_for_trim_fixture(state: &mut HubState, messages: Vec<PainterMessage>) -> Vec<Value> {
+        messages
+            .into_iter()
+            .map(|message| {
+                let wire = revisioned_value(state.revision + 1, &message);
+                state
+                    .apply(message)
+                    .expect("trim fixture event must be accepted");
+                wire
+            })
+            .collect()
+    }
+
+    fn trim_cases() -> Vec<Value> {
+        let mut item_state = hub_state(
+            (0..MAX_ITEMS)
+                .map(|index| stamp_item(&format!("fixture-limit-item-{index:03}"), true))
+                .collect(),
+        );
+        let item_messages = apply_for_trim_fixture(
+            &mut item_state,
+            vec![PainterMessage::StampAdd {
+                stamp: match stamp_item("fixture-limit-item-new", true) {
+                    CanvasItem::Stamp { stamp } => stamp,
+                    _ => unreachable!(),
+                },
+            }],
+        );
+
+        assert_eq!(MAX_TOTAL_POINTS % MAX_STROKE_POINTS, 0);
+        let point_item_count = MAX_TOTAL_POINTS / MAX_STROKE_POINTS;
+        let mut total_point_state = hub_state(
+            (0..point_item_count)
+                .map(|index| {
+                    stroke_item(
+                        &format!("fixture-limit-stroke-{index:03}"),
+                        Tool::Pen,
+                        true,
+                        MAX_STROKE_POINTS,
+                    )
+                })
+                .collect(),
+        );
+        let total_point_messages = apply_for_trim_fixture(
+            &mut total_point_state,
+            vec![
+                PainterMessage::StrokeBegin {
+                    stroke_id: "fixture-limit-stroke-new".into(),
+                    brush: brush(Tool::Pen),
+                },
+                PainterMessage::StrokePoints {
+                    stroke_id: "fixture-limit-stroke-new".into(),
+                    offset: 0,
+                    pts: vec![(0.8, 0.9, 0.6, 0.0)],
+                },
+            ],
+        );
+
+        let initial_stroke_points = MAX_STROKE_POINTS - 1;
+        let mut stroke_point_state = hub_state(vec![stroke_item(
+            "fixture-stroke-cap",
+            Tool::Marker,
+            false,
+            initial_stroke_points,
+        )]);
+        let stroke_point_messages = apply_for_trim_fixture(
+            &mut stroke_point_state,
+            vec![PainterMessage::StrokePoints {
+                stroke_id: "fixture-stroke-cap".into(),
+                offset: initial_stroke_points,
+                pts: vec![
+                    (0.6, 0.7, 0.8, 16.0),
+                    (0.7, 0.8, 0.9, 32.0),
+                    (0.8, 0.9, 1.0, 48.0),
+                ],
+            }],
+        );
+
+        vec![
+            json!({
+                "name": "max_items",
+                "initial": {
+                    "kind": "done_stamps",
+                    "revision": FIXTURE_REVISION,
+                    "count": MAX_ITEMS,
+                    "idPrefix": "fixture-limit-item-",
+                },
+                "messages": item_messages,
+                "expected": state_summary(&item_state),
+            }),
+            json!({
+                "name": "max_total_points",
+                "initial": {
+                    "kind": "done_strokes",
+                    "revision": FIXTURE_REVISION,
+                    "count": point_item_count,
+                    "pointsPerItem": MAX_STROKE_POINTS,
+                    "idPrefix": "fixture-limit-stroke-",
+                },
+                "messages": total_point_messages,
+                "expected": state_summary(&total_point_state),
+            }),
+            json!({
+                "name": "max_stroke_points",
+                "initial": {
+                    "kind": "active_stroke",
+                    "revision": FIXTURE_REVISION,
+                    "id": "fixture-stroke-cap",
+                    "points": initial_stroke_points,
+                },
+                "messages": stroke_point_messages,
+                "expected": state_summary(&stroke_point_state),
+            }),
+        ]
+    }
+
+    fn revision_cases() -> Vec<Value> {
+        let initial_items = vec![stroke_item(
+            "fixture-revision-preserved",
+            Tool::Pen,
+            true,
+            1,
+        )];
+        let state = HubState {
+            items: initial_items.clone(),
+            revision: 10,
+            total_points: 1,
+        };
+        let initial = parse_json(&state.snapshot().expect("revision snapshot must serialize"));
+        let expected = json!({ "rev": 10, "items": initial_items });
+
+        vec![
+            json!({
+                "name": "missing_revision",
+                "initial": initial,
+                "message": revisioned_value(12, &PainterMessage::Clear {}),
+                "expectedEffect": "resync",
+                "expected": expected,
+            }),
+            json!({
+                "name": "duplicate_revision",
+                "initial": initial,
+                "message": revisioned_value(10, &PainterMessage::Clear {}),
+                "expectedEffect": "resync",
+                "expected": expected,
+            }),
+            json!({
+                "name": "unknown_protocol_version",
+                "initial": initial,
+                "message": serde_json::to_value(OverlayControlMessage::Snapshot {
+                    protocol_version: PROTOCOL_VERSION + 1,
+                    rev: 99,
+                    fade_after_ms: Some(1_000.0),
+                    items: Vec::new(),
+                })
+                .expect("unknown-version snapshot must serialize"),
+                "expectedEffect": "resync",
+                "expected": expected,
+            }),
+        ]
+    }
+
+    fn canonical_fixture() -> Value {
+        let event_cases: Vec<_> = canonical_painter_messages()
+            .into_iter()
+            .map(event_case)
+            .collect();
+        let control_messages: Vec<Value> = canonical_overlay_control_messages()
+            .into_iter()
+            .map(|message| serde_json::to_value(message).expect("control fixture must serialize"))
+            .collect();
+
+        let mut message_fields = BTreeMap::new();
+        for value in control_messages
+            .iter()
+            .chain(event_cases.iter().map(|case| &case["message"]))
+        {
+            let name = message_type(value).to_owned();
+            assert!(message_fields
+                .insert(name, top_level_fields(value))
+                .is_none());
+        }
+
+        let server_message_types: Vec<_> = control_messages
+            .iter()
+            .map(message_type)
+            .chain(
+                event_cases
+                    .iter()
+                    .map(|case| message_type(&case["message"])),
+            )
+            .collect();
+        let snapshot = control_messages
+            .iter()
+            .find(|message| message_type(message) == "snapshot")
+            .expect("control fixtures must include a snapshot");
+        let snapshot_items = &snapshot["items"];
+        let enum_values = json!({
+            "tools": [Tool::Pen, Tool::Marker, Tool::Eraser],
+            "shapeKinds": [
+                ShapeKind::Line,
+                ShapeKind::Arrow,
+                ShapeKind::Rectangle,
+                ShapeKind::Ellipse,
+            ],
+            "canvasKinds": snapshot_items
+                .as_array()
+                .expect("snapshot items must be an array")
+                .iter()
+                .map(|item| item["kind"].clone())
+                .collect::<Vec<_>>(),
+        });
+
+        let ping = json!({ "type": "ping", "t": 1_700_000_001_500.0 });
+        serde_json::from_value::<OverlayClientMessage>(ping.clone())
+            .expect("client ping fixture must decode in Rust");
+
+        json!({
+            "fixtureVersion": 1,
+            "protocolVersion": PROTOCOL_VERSION,
+            "limits": {
+                "maxItems": MAX_ITEMS,
+                "maxTotalPoints": MAX_TOTAL_POINTS,
+                "maxStrokePoints": MAX_STROKE_POINTS,
+                "maxPointsPerMessage": MAX_POINTS_PER_MESSAGE,
+            },
+            "serverMessageTypes": server_message_types,
+            "messageFields": message_fields,
+            "objectFields": {
+                "brush": top_level_fields(&snapshot_items[0]["brush"]),
+                "strokeItem": top_level_fields(&snapshot_items[0]),
+                "lineStyle": top_level_fields(&snapshot_items[1]["style"]),
+                "shapeItem": top_level_fields(&snapshot_items[1]),
+                "stampItem": top_level_fields(&snapshot_items[2]),
+            },
+            "enumValues": enum_values,
+            "controlMessages": control_messages,
+            "clientMessages": [ping],
+            "eventCases": event_cases,
+            "revisionCases": revision_cases(),
+            "trimCases": trim_cases(),
+        })
+    }
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol-fixtures/canonical.json")
+    }
+
+    #[test]
+    fn canonical_protocol_fixture_is_current() {
+        let path = fixture_path();
+        let generated = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&canonical_fixture())
+                .expect("canonical fixture must serialize")
+        );
+        if std::env::var_os(UPDATE_FIXTURE_ENV).is_some() {
+            fs::create_dir_all(path.parent().expect("fixture must have a parent"))
+                .expect("fixture directory must be writable");
+            fs::write(&path, &generated).expect("fixture must be writable");
+        }
+        let tracked = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read {}: {error}; run `bun run generate:protocol-fixtures`",
+                path.display()
+            )
+        });
+        assert_eq!(
+            tracked, generated,
+            "canonical protocol fixture is stale; run `bun run generate:protocol-fixtures`"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::canvas_engine::CanvasEngine;

@@ -104,7 +104,7 @@ export class OverlayState {
         if (!stroke) return { kind: "none" };
         const available = Math.max(0, MAX_STROKE_POINTS - stroke.pts.length);
         stroke.pts.push(...msg.pts.slice(0, available));
-        return { kind: "active", stroke };
+        return this.trim() ? { kind: "rebuild" } : { kind: "active", stroke };
       }
       case "stroke_end": {
         const stroke = this.findActiveStroke(msg.strokeId);

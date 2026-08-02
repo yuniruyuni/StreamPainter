@@ -131,14 +131,50 @@ impl CanvasItem {
     }
 }
 
-/// Win32 入力層 → ローカル WebSocket ハブ → OBS overlay。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PainterMessage {
+// enum と canonical fixture の例を同じ宣言から作る。variant を追加したのに
+// Rust → TypeScript conformance fixture を追加し忘れるとコンパイルできない。
+macro_rules! define_painter_messages {
+    (
+        $(
+            $(#[$variant_meta:meta])*
+            $variant:ident {
+                $(
+                    $(#[$field_meta:meta])*
+                    $field:ident: $field_type:ty
+                ),* $(,)?
+            } => $fixture:expr
+        ),+ $(,)?
+    ) => {
+        /// Win32 入力層 → ローカル WebSocket ハブ → OBS overlay。
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        pub enum PainterMessage {
+            $(
+                $(#[$variant_meta])*
+                $variant {
+                    $(
+                        $(#[$field_meta])*
+                        $field: $field_type,
+                    )*
+                },
+            )+
+        }
+
+        #[cfg(test)]
+        pub(crate) fn canonical_painter_messages() -> Vec<PainterMessage> {
+            vec![$($fixture),+]
+        }
+    };
+}
+
+define_painter_messages! {
     #[serde(rename_all = "camelCase")]
     StrokeBegin {
         stroke_id: String,
         brush: Brush,
+    } => PainterMessage::StrokeBegin {
+        stroke_id: "fixture-stroke-begin".into(),
+        brush: fixture_brush(Tool::Marker),
     },
     #[serde(rename_all = "camelCase")]
     StrokePoints {
@@ -150,53 +186,126 @@ pub enum PainterMessage {
         #[serde(skip)]
         offset: usize,
         pts: Vec<Point>,
+    } => PainterMessage::StrokePoints {
+        stroke_id: "fixture-stroke-points".into(),
+        offset: 1,
+        pts: vec![(0.2, 0.3, 0.6, 16.0), (0.4, 0.5, 0.7, 32.0)],
     },
     #[serde(rename_all = "camelCase")]
     StrokeEnd {
         stroke_id: String,
         ended_at: f64,
+    } => PainterMessage::StrokeEnd {
+        stroke_id: "fixture-stroke-end".into(),
+        ended_at: 1_700_000_000_123.0,
     },
     #[serde(rename_all = "camelCase")]
     StrokeCancel {
         stroke_id: String,
+    } => PainterMessage::StrokeCancel {
+        stroke_id: "fixture-stroke-cancel".into(),
     },
     #[serde(rename_all = "camelCase")]
     ShapeBegin {
         shape: ShapeItem,
+    } => PainterMessage::ShapeBegin {
+        shape: fixture_shape("fixture-shape-begin", ShapeKind::Arrow, true),
     },
     #[serde(rename_all = "camelCase")]
     ShapeUpdate {
         item_id: String,
         end: Position,
+    } => PainterMessage::ShapeUpdate {
+        item_id: "fixture-shape-update".into(),
+        end: (0.8, 0.7),
     },
     #[serde(rename_all = "camelCase")]
     ShapeEnd {
         item_id: String,
         ended_at: f64,
+    } => PainterMessage::ShapeEnd {
+        item_id: "fixture-shape-end".into(),
+        ended_at: 1_700_000_000_456.0,
     },
     #[serde(rename_all = "camelCase")]
     ShapeCancel {
         item_id: String,
+    } => PainterMessage::ShapeCancel {
+        item_id: "fixture-shape-cancel".into(),
     },
     #[serde(rename_all = "camelCase")]
     StampAdd {
         stamp: StampItem,
+    } => PainterMessage::StampAdd {
+        stamp: fixture_stamp("fixture-stamp-add", false),
     },
     #[serde(rename_all = "camelCase")]
     StampMovePreview {
         item_id: String,
         center: Position,
+    } => PainterMessage::StampMovePreview {
+        item_id: "fixture-stamp-preview".into(),
+        center: (0.65, 0.45),
     },
     #[serde(rename_all = "camelCase")]
     StampMove {
         item_id: String,
         center: Position,
+    } => PainterMessage::StampMove {
+        item_id: "fixture-stamp-move".into(),
+        center: (0.75, 0.6),
     },
-    Undo {},
+    Undo {} => PainterMessage::Undo {},
     Redo {
         item: CanvasItem,
+    } => PainterMessage::Redo {
+        item: CanvasItem::Stamp {
+            stamp: fixture_stamp("fixture-redo", true),
+        },
     },
-    Clear {},
+    Clear {} => PainterMessage::Clear {},
+}
+
+#[cfg(test)]
+fn fixture_brush(tool: Tool) -> Brush {
+    Brush {
+        tool,
+        color: "#12abef".into(),
+        opacity: 0.75,
+        width_n: 0.0125,
+        pressure_width: true,
+    }
+}
+
+#[cfg(test)]
+fn fixture_shape(item_id: &str, shape: ShapeKind, done: bool) -> ShapeItem {
+    ShapeItem {
+        item_id: item_id.into(),
+        shape,
+        style: LineStyle {
+            color: "#fedcba".into(),
+            opacity: 0.625,
+            width_n: 0.01,
+        },
+        start: (0.1, 0.2),
+        end: (0.3, 0.4),
+        done,
+        ended_at: done.then_some(1_700_000_000_000.0),
+    }
+}
+
+#[cfg(test)]
+fn fixture_stamp(item_id: &str, done: bool) -> StampItem {
+    StampItem {
+        item_id: item_id.into(),
+        stamp_id: "fixture-stamp".into(),
+        center: (0.25, 0.35),
+        width_n: 0.125,
+        height_n: 0.225,
+        opacity: 0.875,
+        done,
+        ended_at: Some(1_700_000_000_789.0),
+    }
 }
 
 /// ハブが確定したrevisionを内部描画イベントへ付与した、overlay向け増分イベント。
@@ -208,10 +317,41 @@ pub struct OverlayEvent<'a> {
     pub event: &'a PainterMessage,
 }
 
-/// ローカルハブ → OBS overlay の接続管理メッセージ。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum OverlayControlMessage {
+macro_rules! define_overlay_control_messages {
+    (
+        $(
+            $(#[$variant_meta:meta])*
+            $variant:ident {
+                $(
+                    $(#[$field_meta:meta])*
+                    $field:ident: $field_type:ty
+                ),* $(,)?
+            } => $fixture:expr
+        ),+ $(,)?
+    ) => {
+        /// ローカルハブ → OBS overlay の接続管理メッセージ。
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        pub enum OverlayControlMessage {
+            $(
+                $(#[$variant_meta])*
+                $variant {
+                    $(
+                        $(#[$field_meta])*
+                        $field: $field_type,
+                    )*
+                },
+            )+
+        }
+
+        #[cfg(test)]
+        pub(crate) fn canonical_overlay_control_messages() -> Vec<OverlayControlMessage> {
+            vec![$($fixture),+]
+        }
+    };
+}
+
+define_overlay_control_messages! {
     #[serde(rename_all = "camelCase")]
     Snapshot {
         protocol_version: u32,
@@ -219,10 +359,38 @@ pub enum OverlayControlMessage {
         fade_after_ms: Option<f64>,
         /// 描画順を保つ完全な描画履歴。
         items: Vec<CanvasItem>,
+    } => OverlayControlMessage::Snapshot {
+        protocol_version: PROTOCOL_VERSION,
+        rev: 40,
+        fade_after_ms: Some(2_500.0),
+        items: fixture_canvas_items(),
     },
     Pong {
         t: f64,
+    } => OverlayControlMessage::Pong {
+        t: 1_700_000_001_000.0,
     },
+}
+
+#[cfg(test)]
+fn fixture_canvas_items() -> Vec<CanvasItem> {
+    vec![
+        CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: "fixture-snapshot-stroke".into(),
+                brush: fixture_brush(Tool::Pen),
+                pts: vec![(0.1, 0.2, 0.5, 0.0)],
+                done: true,
+                ended_at: Some(1_700_000_000_100.0),
+            },
+        },
+        CanvasItem::Shape {
+            shape: fixture_shape("fixture-snapshot-shape", ShapeKind::Ellipse, true),
+        },
+        CanvasItem::Stamp {
+            stamp: fixture_stamp("fixture-snapshot-stamp", true),
+        },
+    ]
 }
 
 /// OBS overlay → ローカルハブ。未知の type は前方互換のため無視する。

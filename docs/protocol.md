@@ -99,3 +99,21 @@ overlayは15秒ごとに次を送ります。
 
 送信待ちが上限に達したクライアントはハブから切断されます。描画入力は止めず、overlayが
 再接続して最新snapshotを受けることで復旧します。
+
+## Conformance fixture
+
+`protocol-fixtures/canonical.json` はRustのserde型とローカルハブ状態機械から生成する、
+追跡対象のcanonical fixtureです。全server message variant、JSONフィールド、定数、正常な
+状態遷移、revision欠落・重複、未知version、各上限でのtrim結果を含みます。TypeScriptのテストは
+このJSONをdecodeして`OverlayState`へ適用し、Rustが記録した状態と照合します。
+
+プロトコルを変更したときは次を実行し、RustとTypeScriptを同じコミットで更新してください。
+
+```console
+bun run generate:protocol-fixtures
+bun run check
+cargo test --locked --manifest-path painter/Cargo.toml
+```
+
+Rustテストは追跡fixtureをその場で生成した内容と比較するため、fixtureを更新し忘れた変更や、
+新しいmessage variantをTypeScript側へ反映し忘れた変更はCIで失敗します。
