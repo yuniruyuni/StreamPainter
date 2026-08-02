@@ -7,6 +7,43 @@ const PING_INTERVAL_MS = 15_000;
 const IDLE_TIMEOUT_MS = 30_000;
 const BACKOFF_MIN_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
+const SOCKET_OPEN = 1;
+const SOCKET_CLOSING = 2;
+
+type TimerHandle = number;
+
+export type OverlaySocket = Pick<
+  WebSocket,
+  | "readyState"
+  | "onopen"
+  | "onmessage"
+  | "onclose"
+  | "onerror"
+  | "send"
+  | "close"
+>;
+
+/** Browser APIを決定的な接続テストへ差し替えるための最小実行環境。 */
+export interface OverlayConnectionRuntime {
+  createWebSocket(url: string): OverlaySocket;
+  now(): number;
+  random(): number;
+  setTimeout(callback: () => void, delayMs: number): TimerHandle;
+  clearTimeout(handle: TimerHandle): void;
+  setInterval(callback: () => void, intervalMs: number): TimerHandle;
+  clearInterval(handle: TimerHandle): void;
+}
+
+const browserRuntime: OverlayConnectionRuntime = {
+  createWebSocket: (url) => new WebSocket(url),
+  now: () => Date.now(),
+  random: () => Math.random(),
+  setTimeout: (callback, delayMs) => window.setTimeout(callback, delayMs),
+  clearTimeout: (handle) => window.clearTimeout(handle),
+  setInterval: (callback, intervalMs) =>
+    window.setInterval(callback, intervalMs),
+  clearInterval: (handle) => window.clearInterval(handle),
+};
 
 export interface OverlayConnection {
   close(): void;
@@ -15,69 +52,76 @@ export interface OverlayConnection {
 export function connectOverlay(
   url: string,
   onMessage: (msg: ServerToOverlayMessage) => boolean,
+  runtime: OverlayConnectionRuntime = browserRuntime,
 ): OverlayConnection {
-  let ws: WebSocket | null = null;
+  let ws: OverlaySocket | null = null;
   let closed = false;
   let backoff = BACKOFF_MIN_MS;
-  let pingTimer: ReturnType<typeof setInterval> | null = null;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: TimerHandle | null = null;
+  let reconnectTimer: TimerHandle | null = null;
   let lastReceived = 0;
 
   function clearPing() {
-    if (pingTimer) clearInterval(pingTimer);
+    if (pingTimer !== null) runtime.clearInterval(pingTimer);
     pingTimer = null;
   }
 
-  function disconnect(socket: WebSocket) {
+  function disconnect(socket: OverlaySocket) {
     socket.onopen = null;
     socket.onmessage = null;
     socket.onclose = null;
     socket.onerror = null;
-    if (socket.readyState < WebSocket.CLOSING) socket.close();
+    if (socket.readyState < SOCKET_CLOSING) socket.close();
     if (ws === socket) ws = null;
   }
 
-  function scheduleReconnect(socket: WebSocket) {
+  function scheduleReconnect(socket: OverlaySocket) {
     if (closed || socket !== ws) return;
     clearPing();
     disconnect(socket);
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    const jitter = 1 + (Math.random() * 0.4 - 0.2);
-    reconnectTimer = setTimeout(connect, backoff * jitter);
+    if (reconnectTimer !== null) runtime.clearTimeout(reconnectTimer);
+    const jitter = 1 + (runtime.random() * 0.4 - 0.2);
+    reconnectTimer = runtime.setTimeout(connect, backoff * jitter);
     backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
   }
 
   function connect() {
     if (closed) return;
     reconnectTimer = null;
-    const socket = new WebSocket(url);
+    const socket = runtime.createWebSocket(url);
     ws = socket;
-    lastReceived = Date.now();
+    lastReceived = runtime.now();
 
     socket.onopen = () => {
       if (socket !== ws) return;
-      backoff = BACKOFF_MIN_MS;
       clearPing();
-      pingTimer = setInterval(() => {
-        if (Date.now() - lastReceived > IDLE_TIMEOUT_MS) {
+      pingTimer = runtime.setInterval(() => {
+        if (runtime.now() - lastReceived > IDLE_TIMEOUT_MS) {
           // pong が返らない: 死んだ接続とみなし再接続へ
           scheduleReconnect(socket);
           return;
         }
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "ping", t: Date.now() }));
+        if (socket.readyState === SOCKET_OPEN) {
+          socket.send(JSON.stringify({ type: "ping", t: runtime.now() }));
         }
       }, PING_INTERVAL_MS);
     };
 
     socket.onmessage = (event) => {
       if (socket !== ws) return;
-      lastReceived = Date.now();
+      lastReceived = runtime.now();
       try {
-        const keepConnection = onMessage(
-          JSON.parse(String(event.data)) as ServerToOverlayMessage,
-        );
-        if (!keepConnection) scheduleReconnect(socket);
+        const message = JSON.parse(
+          String(event.data),
+        ) as ServerToOverlayMessage;
+        const keepConnection = onMessage(message);
+        if (!keepConnection) {
+          scheduleReconnect(socket);
+          return;
+        }
+        // openだけでは、直後のprotocol mismatchや不正messageを成功扱いしてしまう。
+        // overlay状態が受理したsnapshotを同期成立点として初めてbackoffを戻す。
+        if (message.type === "snapshot") backoff = BACKOFF_MIN_MS;
       } catch (e) {
         console.warn("overlay: failed to handle message", e);
         scheduleReconnect(socket);
@@ -95,7 +139,8 @@ export function connectOverlay(
   return {
     close() {
       closed = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (reconnectTimer !== null) runtime.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
       clearPing();
       if (ws) disconnect(ws);
     },
