@@ -1,9 +1,7 @@
 //! 設定ファイル。%APPDATA%/StreamPainter/config/config.toml
 
-#[cfg(not(windows))]
-use std::fs::File;
 use std::{
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -245,16 +243,58 @@ fn write_synced(path: &Path, contents: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("failed to flush {}", path.display()))?;
-    Ok(())
+    let result = (|| {
+        file.write_all(contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to flush {}", path.display()))
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
+    let mut source_file =
+        File::open(source).with_context(|| format!("failed to open {}", source.display()))?;
+    let mut destination_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    let result = (|| {
+        std::io::copy(&mut source_file, &mut destination_file).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        destination_file
+            .sync_all()
+            .with_context(|| format!("failed to flush {}", destination.display()))
+    })();
+    drop(destination_file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    result
 }
 
 #[cfg(windows)]
-fn replace_config_file(temporary: &Path, destination: &Path, backup: &Path) -> Result<()> {
+fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
+
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn replace_file(replacement: &Path, destination: &Path) -> Result<()> {
     use windows::{
         core::PCWSTR,
         Win32::Storage::FileSystem::{
@@ -262,89 +302,286 @@ fn replace_config_file(temporary: &Path, destination: &Path, backup: &Path) -> R
         },
     };
 
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    };
-    let temporary_wide = wide(temporary);
-    let destination_wide = wide(destination);
-
-    if destination.exists() {
-        // ReplaceFileW は既存 backup を上書きしないため、置換前に古い世代だけを除く。
-        if backup.exists() {
-            std::fs::remove_file(backup)
-                .with_context(|| format!("failed to replace {}", backup.display()))?;
-        }
-        let backup_wide = wide(backup);
-        unsafe {
-            ReplaceFileW(
-                PCWSTR(destination_wide.as_ptr()),
-                PCWSTR(temporary_wide.as_ptr()),
-                PCWSTR(backup_wide.as_ptr()),
-                REPLACEFILE_WRITE_THROUGH,
-                None,
-                None,
-            )
-        }
-        .with_context(|| format!("failed to atomically replace {}", destination.display()))?;
-    } else {
-        unsafe {
+    let replacement_wide = wide_path(replacement);
+    let destination_wide = wide_path(destination);
+    if !destination.exists() {
+        return unsafe {
             MoveFileExW(
-                PCWSTR(temporary_wide.as_ptr()),
+                PCWSTR(replacement_wide.as_ptr()),
                 PCWSTR(destination_wide.as_ptr()),
                 MOVEFILE_WRITE_THROUGH,
             )
         }
-        .with_context(|| format!("failed to atomically create {}", destination.display()))?;
+        .with_context(|| format!("failed to atomically create {}", destination.display()));
     }
+
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(destination_wide.as_ptr()),
+            PCWSTR(replacement_wide.as_ptr()),
+            PCWSTR::null(),
+            REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )
+    }
+    .with_context(|| format!("failed to atomically replace {}", destination.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_file(replacement: &Path, destination: &Path) -> Result<()> {
+    std::fs::rename(replacement, destination)
+        .with_context(|| format!("failed to atomically replace {}", destination.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    // MoveFileExW / ReplaceFileW are both called with their write-through flags.
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn replace_config_file(temporary: &Path, destination: &Path, backup: &Path) -> Result<()> {
-    if destination.exists() {
-        let backup_temporary =
-            sibling_with_suffix(backup, &format!(".{}.tmp", uuid::Uuid::now_v7()))?;
-        std::fs::copy(destination, &backup_temporary).with_context(|| {
-            format!(
-                "failed to copy {} to {}",
-                destination.display(),
-                backup_temporary.display()
-            )
-        })?;
-        File::open(&backup_temporary)
-            .and_then(|file| file.sync_all())
-            .with_context(|| format!("failed to flush {}", backup_temporary.display()))?;
-        std::fs::rename(&backup_temporary, backup)
-            .with_context(|| format!("failed to replace {}", backup.display()))?;
-    }
-    std::fs::rename(temporary, destination)
-        .with_context(|| format!("failed to atomically replace {}", destination.display()))?;
-    if let Some(parent) = destination.parent() {
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("failed to flush {}", parent.display()))?;
-    }
-    Ok(())
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("failed to resolve parent directory"))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to flush {}", parent.display()))
 }
 
-fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+trait ConfigFileOps {
+    fn write_synced(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    fn copy_synced(&self, source: &Path, destination: &Path) -> Result<()>;
+    fn replace_file(&self, replacement: &Path, destination: &Path) -> Result<()>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    fn sync_parent(&self, path: &Path) -> Result<()>;
+}
+
+struct SystemConfigFileOps;
+
+impl ConfigFileOps for SystemConfigFileOps {
+    fn write_synced(&self, path: &Path, contents: &[u8]) -> Result<()> {
+        write_synced(path, contents)
+    }
+
+    fn copy_synced(&self, source: &Path, destination: &Path) -> Result<()> {
+        copy_synced(source, destination)
+    }
+
+    fn replace_file(&self, replacement: &Path, destination: &Path) -> Result<()> {
+        replace_file(replacement, destination)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to remove {}", path.display()))
+            }
+        }
+    }
+
+    fn sync_parent(&self, path: &Path) -> Result<()> {
+        sync_parent_directory(path)
+    }
+}
+
+struct TemporaryFileGuard {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl TemporaryFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn preserve(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for TemporaryFileGuard {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn temporary_path(path: &Path, purpose: &str) -> Result<PathBuf> {
+    sibling_with_suffix(path, &format!(".{purpose}.{}.tmp", uuid::Uuid::now_v7()))
+}
+
+fn files_have_same_contents(left: &Path, right: &Path) -> bool {
+    std::fs::read(left)
+        .and_then(|left| std::fs::read(right).map(|right| left == right))
+        .unwrap_or(false)
+}
+
+fn rollback_save<O: ConfigFileOps>(
+    ops: &O,
+    path: &Path,
+    backup: &Path,
+    previous_primary: &mut TemporaryFileGuard,
+    previous_backup: Option<&mut TemporaryFileGuard>,
+    restore_backup: bool,
+) -> Result<()> {
+    let mut failures = Vec::new();
+
+    if restore_backup {
+        match previous_backup {
+            Some(previous_backup) => {
+                if let Err(error) = ops.replace_file(previous_backup.path(), backup) {
+                    previous_backup.preserve();
+                    failures.push(format!(
+                        "failed to restore backup from {}: {error:#}",
+                        previous_backup.path().display()
+                    ));
+                }
+            }
+            None => {
+                if let Err(error) = ops.remove_file(backup) {
+                    failures.push(format!(
+                        "failed to remove newly-created backup {}: {error:#}",
+                        backup.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Err(error) = ops.replace_file(previous_primary.path(), path) {
+        previous_primary.preserve();
+        failures.push(format!(
+            "failed to restore primary from {}: {error:#}",
+            previous_primary.path().display()
+        ));
+    }
+
+    if let Err(error) = ops.sync_parent(path) {
+        failures.push(format!(
+            "failed to flush restored configuration directory: {error:#}"
+        ));
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(failures.join("; ")))
+    }
+}
+
+fn rollback_after<O: ConfigFileOps>(
+    error: anyhow::Error,
+    ops: &O,
+    path: &Path,
+    backup: &Path,
+    previous_primary: &mut TemporaryFileGuard,
+    previous_backup: Option<&mut TemporaryFileGuard>,
+    restore_backup: bool,
+) -> anyhow::Error {
+    match rollback_save(
+        ops,
+        path,
+        backup,
+        previous_primary,
+        previous_backup,
+        restore_backup,
+    ) {
+        Ok(()) => error,
+        Err(rollback_error) => error.context(format!("rollback also failed: {rollback_error:#}")),
+    }
+}
+
+fn write_atomically_with_ops<O: ConfigFileOps>(
+    path: &Path,
+    contents: &[u8],
+    ops: &O,
+) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("failed to resolve configuration directory"))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
 
-    let temporary = sibling_with_suffix(path, &format!(".{}.tmp", uuid::Uuid::now_v7()))?;
-    write_synced(&temporary, contents)?;
+    let temporary = temporary_path(path, "new")?;
+    let temporary = TemporaryFileGuard::new(temporary);
+    ops.write_synced(temporary.path(), contents)?;
     let backup = backup_path(path)?;
-    let result = replace_config_file(&temporary, path, &backup);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+
+    if !path.exists() {
+        if let Err(error) = ops
+            .replace_file(temporary.path(), path)
+            .and_then(|()| ops.sync_parent(path))
+        {
+            let rollback = ops.remove_file(path).and_then(|()| ops.sync_parent(path));
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => {
+                    Err(error.context(format!("rollback also failed: {rollback_error:#}")))
+                }
+            };
+        }
+        return Ok(());
     }
-    result
+
+    // 同期済みの復旧コピーを揃えるまで primary / backup には触れない。
+    // backup 更新候補を別に持つことで、昇格後にも復旧コピーを残す。
+    let previous_primary = temporary_path(path, "previous-primary")?;
+    let mut previous_primary = TemporaryFileGuard::new(previous_primary);
+    ops.copy_synced(path, previous_primary.path())?;
+
+    let mut previous_backup = if backup.exists() {
+        let previous_backup = temporary_path(&backup, "previous-backup")?;
+        let previous_backup = TemporaryFileGuard::new(previous_backup);
+        ops.copy_synced(&backup, previous_backup.path())?;
+        Some(previous_backup)
+    } else {
+        None
+    };
+
+    let backup_candidate = temporary_path(&backup, "candidate")?;
+    let backup_candidate = TemporaryFileGuard::new(backup_candidate);
+    ops.copy_synced(previous_primary.path(), backup_candidate.path())?;
+
+    let commit = ops
+        .replace_file(temporary.path(), path)
+        .map_err(|error| (error, false))
+        .and_then(|()| {
+            ops.replace_file(backup_candidate.path(), &backup)
+                .map_err(|error| (error, true))
+        })
+        .and_then(|()| ops.sync_parent(path).map_err(|error| (error, true)));
+    if let Err((error, restore_backup)) = commit {
+        if !restore_backup && files_have_same_contents(path, previous_primary.path()) {
+            return Err(error);
+        }
+        return Err(rollback_after(
+            error,
+            ops,
+            path,
+            &backup,
+            &mut previous_primary,
+            previous_backup.as_mut(),
+            restore_backup,
+        ));
+    }
+
+    Ok(())
+}
+
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    write_atomically_with_ops(path, contents, &SystemConfigFileOps)
 }
 
 #[cfg(windows)]
@@ -679,6 +916,124 @@ pub fn cleanup_unregistered_stamps(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SaveFailure {
+        WriteTemporary,
+        CopyPreviousPrimary,
+        CopyPreviousBackup,
+        CopyBackupCandidate,
+        ReplacePrimaryBefore,
+        ReplacePrimaryAfter,
+        PromoteBackupBefore,
+        PromoteBackupAfter,
+        SyncCommittedFiles,
+    }
+
+    struct InjectedConfigFileOps {
+        failure: SaveFailure,
+        fired: Cell<bool>,
+    }
+
+    impl InjectedConfigFileOps {
+        fn new(failure: SaveFailure) -> Self {
+            Self {
+                failure,
+                fired: Cell::new(false),
+            }
+        }
+
+        fn inject(&self, point: SaveFailure) -> bool {
+            self.failure == point && !self.fired.replace(true)
+        }
+
+        fn injected_error(point: SaveFailure) -> anyhow::Error {
+            anyhow!("injected save failure at {point:?}")
+        }
+    }
+
+    fn temporary_purpose(path: &Path) -> Option<SaveFailure> {
+        let name = path.file_name()?.to_string_lossy();
+        if name.contains(".previous-primary.") {
+            Some(SaveFailure::CopyPreviousPrimary)
+        } else if name.contains(".previous-backup.") {
+            Some(SaveFailure::CopyPreviousBackup)
+        } else if name.contains(".candidate.") {
+            Some(SaveFailure::CopyBackupCandidate)
+        } else {
+            None
+        }
+    }
+
+    impl ConfigFileOps for InjectedConfigFileOps {
+        fn write_synced(&self, path: &Path, contents: &[u8]) -> Result<()> {
+            if self.inject(SaveFailure::WriteTemporary) {
+                std::fs::write(path, b"partial")?;
+                return Err(Self::injected_error(SaveFailure::WriteTemporary));
+            }
+            SystemConfigFileOps.write_synced(path, contents)
+        }
+
+        fn copy_synced(&self, source: &Path, destination: &Path) -> Result<()> {
+            if let Some(point) = temporary_purpose(destination) {
+                if self.inject(point) {
+                    std::fs::write(destination, b"partial")?;
+                    return Err(Self::injected_error(point));
+                }
+            }
+            SystemConfigFileOps.copy_synced(source, destination)
+        }
+
+        fn replace_file(&self, replacement: &Path, destination: &Path) -> Result<()> {
+            let is_backup = destination
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".bak"));
+            let (before, after) = if is_backup {
+                (
+                    SaveFailure::PromoteBackupBefore,
+                    SaveFailure::PromoteBackupAfter,
+                )
+            } else {
+                (
+                    SaveFailure::ReplacePrimaryBefore,
+                    SaveFailure::ReplacePrimaryAfter,
+                )
+            };
+            if before == SaveFailure::ReplacePrimaryBefore && self.failure == before {
+                self.fired.set(true);
+                return Err(Self::injected_error(before));
+            }
+            if self.inject(before) {
+                return Err(Self::injected_error(before));
+            }
+            if self.failure == after && !self.fired.get() {
+                SystemConfigFileOps.replace_file(replacement, destination)?;
+                self.fired.set(true);
+                return Err(Self::injected_error(after));
+            }
+            SystemConfigFileOps.replace_file(replacement, destination)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<()> {
+            SystemConfigFileOps.remove_file(path)
+        }
+
+        fn sync_parent(&self, path: &Path) -> Result<()> {
+            if self.inject(SaveFailure::SyncCommittedFiles) {
+                return Err(Self::injected_error(SaveFailure::SyncCommittedFiles));
+            }
+            SystemConfigFileOps.sync_parent(path)
+        }
+    }
+
+    fn assert_no_temporary_files(directory: &Path) {
+        assert!(std::fs::read_dir(directory).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+    }
 
     #[test]
     fn config_paths_use_new_name_and_retain_legacy_lookup() {
@@ -873,21 +1228,83 @@ local_server_port = 18080
         let directory =
             std::env::temp_dir().join(format!("stream-painter-config-{}", uuid::Uuid::now_v7()));
         let path = directory.join("config.toml");
+        let backup = backup_path(&path).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(&path, b"previous").unwrap();
+        std::fs::write(&backup, b"older").unwrap();
 
         write_atomically(&path, b"current").unwrap();
 
         assert_eq!(std::fs::read(&path).unwrap(), b"current");
-        assert_eq!(
-            std::fs::read(backup_path(&path).unwrap()).unwrap(),
-            b"previous"
-        );
-        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".tmp")));
+        assert_eq!(std::fs::read(backup).unwrap(), b"previous");
+        assert_no_temporary_files(&directory);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_failure_preserves_primary_and_existing_backup() {
+        let failure_points = [
+            SaveFailure::WriteTemporary,
+            SaveFailure::CopyPreviousPrimary,
+            SaveFailure::CopyPreviousBackup,
+            SaveFailure::CopyBackupCandidate,
+            SaveFailure::ReplacePrimaryBefore,
+            SaveFailure::ReplacePrimaryAfter,
+            SaveFailure::PromoteBackupBefore,
+            SaveFailure::PromoteBackupAfter,
+            SaveFailure::SyncCommittedFiles,
+        ];
+
+        for failure in failure_points {
+            let directory = std::env::temp_dir().join(format!(
+                "stream-painter-config-failure-{}",
+                uuid::Uuid::now_v7()
+            ));
+            let path = directory.join("config.toml");
+            let backup = backup_path(&path).unwrap();
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(&path, b"previous").unwrap();
+            std::fs::write(&backup, b"older").unwrap();
+            let ops = InjectedConfigFileOps::new(failure);
+
+            let error = write_atomically_with_ops(&path, b"current", &ops).unwrap_err();
+
+            assert!(
+                ops.fired.get(),
+                "failure was not injected for {failure:?}: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"previous",
+                "primary changed after {failure:?}: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read(&backup).unwrap(),
+                b"older",
+                "backup changed after {failure:?}: {error:#}"
+            );
+            assert_no_temporary_files(&directory);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn atomic_write_failure_restores_an_absent_backup() {
+        let directory = std::env::temp_dir().join(format!(
+            "stream-painter-config-no-backup-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let path = directory.join("config.toml");
+        let backup = backup_path(&path).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&path, b"previous").unwrap();
+        let ops = InjectedConfigFileOps::new(SaveFailure::PromoteBackupAfter);
+
+        write_atomically_with_ops(&path, b"current", &ops).unwrap_err();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        assert!(!backup.exists());
+        assert_no_temporary_files(&directory);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
