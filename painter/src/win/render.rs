@@ -174,7 +174,7 @@ impl Renderer {
             )?;
 
             let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let radial_scale = radial_menu::scale_for_surface(width, height);
+            let radial_scale = radial_menu::scale_for_menu(width, height, stamps.len());
             let radial_text = dwrite_factory.CreateTextFormat(
                 w!("Segoe UI"),
                 None,
@@ -544,6 +544,7 @@ impl Renderer {
         stamps: &[StampConfig],
     ) -> Result<()> {
         debug_assert_eq!(menu.stamp_count(), stamps.len());
+        debug_assert!(menu.layout_within_surface());
         let center = menu.center_local();
         let outline = unsafe {
             self.dc.CreateSolidColorBrush(

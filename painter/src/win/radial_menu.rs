@@ -20,6 +20,9 @@ const COMMAND_HEIGHT: f32 = 38.0;
 const COMMAND_GAP: f32 = 8.0;
 const COMMAND_DOCK_GAP: f32 = 14.0;
 const VIEWPORT_MARGIN: f32 = 8.0;
+const PIN_ANCHOR_TOLERANCE: f32 = 8.0;
+const COMMAND_TOTAL_WIDTH: f32 = COMMAND_WIDTH * 3.0 + COMMAND_GAP * 2.0;
+const LAYOUT_EPSILON: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadialCommand {
@@ -98,6 +101,9 @@ impl RadialRelease {
 pub struct RadialMenu {
     pointer_id: Option<u32>,
     pinned: bool,
+    /// 初回右ホールドの開始位置。移動量とpin判定だけに使う。
+    anchor_screen: (f64, f64),
+    /// 補正後の描画・hit-test中心に対応するscreen座標。
     center_screen: (f64, f64),
     center_local: (f32, f32),
     surface_size: (f32, f32),
@@ -113,19 +119,32 @@ pub struct RadialMenu {
 impl RadialMenu {
     pub fn new(
         pointer_id: u32,
-        center_screen: (f64, f64),
-        center_local: (f32, f32),
+        anchor_screen: (f64, f64),
+        anchor_local: (f32, f32),
         surface_size: (u32, u32),
         scale: f32,
         stamp_count: usize,
         history_available: (bool, bool),
     ) -> Self {
+        let surface_size = (surface_size.0 as f32, surface_size.1 as f32);
+        let scale = fit_scale_for_layout(surface_size, scale, stamp_count);
+        let outer_radius = outer_radius_for_stamp_count(stamp_count, scale);
+        let margin = VIEWPORT_MARGIN * scale;
+        let fitted_center_local = (
+            clamp_center(anchor_local.0, outer_radius, surface_size.0, margin),
+            clamp_center(anchor_local.1, outer_radius, surface_size.1, margin),
+        );
+        let center_screen = (
+            anchor_screen.0 + f64::from(fitted_center_local.0 - anchor_local.0),
+            anchor_screen.1 + f64::from(fitted_center_local.1 - anchor_local.1),
+        );
         Self {
             pointer_id: Some(pointer_id),
             pinned: false,
+            anchor_screen,
             center_screen,
-            center_local,
-            surface_size: (surface_size.0 as f32, surface_size.1 as f32),
+            center_local: fitted_center_local,
+            surface_size,
             scale,
             stamp_count,
             stamp_mode: false,
@@ -147,10 +166,13 @@ impl RadialMenu {
 
     /// 選択候補が変わった場合は true。描画更新の抑制に使う。
     pub fn update(&mut self, screen: (f64, f64)) -> bool {
+        let gesture_dx = screen.0 - self.anchor_screen.0;
+        let gesture_dy = screen.1 - self.anchor_screen.1;
+        self.max_distance = self.max_distance.max(gesture_dx.hypot(gesture_dy));
+
         let dx = screen.0 - self.center_screen.0;
         let dy = screen.1 - self.center_screen.1;
         let distance = dx.hypot(dy);
-        self.max_distance = self.max_distance.max(distance);
         let next = self.selection_at(dx, dy, distance);
         if next == self.highlighted {
             return false;
@@ -164,8 +186,11 @@ impl RadialMenu {
         self.update(screen);
         self.pointer_id = None;
 
-        // 最初の右ホールドを中央で離した場合だけ、選択せず固定表示へ移る。
-        if !was_pinned && self.max_distance < f64::from(self.tool_inner_radius()) {
+        // 最初の右ホールドを動かさず離すか、補正後の中央へ戻した場合は固定表示へ移る。
+        if !was_pinned
+            && (self.max_distance < f64::from(PIN_ANCHOR_TOLERANCE * self.scale)
+                || self.highlighted == Some(RadialSelection::StandardMenu))
+        {
             self.pinned = true;
             self.stamp_mode = false;
             self.highlighted = Some(RadialSelection::StandardMenu);
@@ -274,6 +299,36 @@ impl RadialMenu {
             inner,
             inner + (COLOR_OUTER_RADIUS - COLOR_INNER_RADIUS) * self.scale,
         ))
+    }
+
+    fn outer_radius(&self) -> f32 {
+        self.stamp_ring_count()
+            .checked_sub(1)
+            .and_then(|ring| self.stamp_ring_radii(ring))
+            .map_or(self.color_outer_radius(), |(_, outer)| outer)
+    }
+
+    /// 描画する全リングとcommand dockがsurface内にあり、相互に重ならない。
+    pub fn layout_within_surface(&self) -> bool {
+        let outer = self.outer_radius();
+        let margin = VIEWPORT_MARGIN * self.scale;
+        let minimum = margin - LAYOUT_EPSILON;
+        let maximum_x = self.surface_size.0 - margin + LAYOUT_EPSILON;
+        let maximum_y = self.surface_size.1 - margin + LAYOUT_EPSILON;
+        let circle_fits = self.center_local.0 - outer >= minimum
+            && self.center_local.0 + outer <= maximum_x
+            && self.center_local.1 - outer >= minimum
+            && self.center_local.1 + outer <= maximum_y;
+        let color_outer = self.color_outer_radius();
+        circle_fits
+            && self.command_buttons().into_iter().all(|(_, rect)| {
+                rect.left >= minimum
+                    && rect.top >= minimum
+                    && rect.right <= maximum_x
+                    && rect.bottom <= maximum_y
+                    && (rect.bottom <= self.center_local.1 - color_outer
+                        || rect.top >= self.center_local.1 + color_outer)
+            })
     }
 
     /// 色リング表示中にだけ出す、円から独立した履歴・全消去ドック。
@@ -428,6 +483,15 @@ pub fn scale_for_surface(width: u32, height: u32) -> f32 {
     (width.min(height) as f32 / 1080.0).clamp(0.85, 1.6)
 }
 
+/// 解像度・登録スタンプ数を含む実レイアウト用scale。
+pub fn scale_for_menu(width: u32, height: u32, stamp_count: usize) -> f32 {
+    fit_scale_for_layout(
+        (width as f32, height as f32),
+        scale_for_surface(width, height),
+        stamp_count,
+    )
+}
+
 pub fn sector_angles(index: usize, count: usize) -> (f32, f32) {
     let width = std::f32::consts::TAU / count as f32;
     let center = -std::f32::consts::FRAC_PI_2 + index as f32 * width;
@@ -485,6 +549,27 @@ fn clamp_center(value: f32, half_size: f32, limit: f32, margin: f32) -> f32 {
     }
 }
 
+fn outer_radius_for_stamp_count(stamp_count: usize, scale: f32) -> f32 {
+    let ring_count = stamp_count.div_ceil(STAMPS_PER_RING);
+    if ring_count == 0 {
+        return COLOR_OUTER_RADIUS * scale;
+    }
+    let ring_width = COLOR_OUTER_RADIUS - COLOR_INNER_RADIUS;
+    let step = ring_width + STAMP_RING_GAP;
+    (COLOR_INNER_RADIUS + (ring_count - 1) as f32 * step + ring_width) * scale
+}
+
+fn fit_scale_for_layout(surface_size: (f32, f32), requested_scale: f32, stamp_count: usize) -> f32 {
+    let outer = outer_radius_for_stamp_count(stamp_count, 1.0);
+    let radial_width = outer * 2.0;
+    let radial_height = outer * 2.0;
+    let color_and_dock_height = COLOR_OUTER_RADIUS * 2.0 + COMMAND_DOCK_GAP + COMMAND_HEIGHT;
+    let required_width = radial_width.max(COMMAND_TOTAL_WIDTH) + VIEWPORT_MARGIN * 2.0;
+    let required_height = radial_height.max(color_and_dock_height) + VIEWPORT_MARGIN * 2.0;
+    let fit = (surface_size.0 / required_width).min(surface_size.1 / required_height);
+    requested_scale.min(fit).max(f32::EPSILON)
+}
+
 fn sector_index(dx: f64, dy: f64, count: usize) -> usize {
     let width = TAU / count as f64;
     let from_top = (dy.atan2(dx) + PI / 2.0 + width / 2.0).rem_euclid(TAU);
@@ -533,6 +618,53 @@ mod tests {
             f64::from(center.0 - menu.center_local().0),
             f64::from(center.1 - menu.center_local().1),
         )
+    }
+
+    fn screen_point(menu: &RadialMenu, offset: (f64, f64)) -> (f64, f64) {
+        (
+            menu.center_screen.0 + offset.0,
+            menu.center_screen.1 + offset.1,
+        )
+    }
+
+    fn screen_for_local(menu: &RadialMenu, local: (f32, f32)) -> (f64, f64) {
+        (
+            menu.center_screen.0 + f64::from(local.0 - menu.center_local.0),
+            menu.center_screen.1 + f64::from(local.1 - menu.center_local.1),
+        )
+    }
+
+    fn assert_screen_point_is_inside(menu: &RadialMenu, screen: (f64, f64)) {
+        let local = (
+            menu.center_local.0 + (screen.0 - menu.center_screen.0) as f32,
+            menu.center_local.1 + (screen.1 - menu.center_screen.1) as f32,
+        );
+        assert!(
+            local.0 >= 0.0
+                && local.0 <= menu.surface_size.0
+                && local.1 >= 0.0
+                && local.1 <= menu.surface_size.1,
+            "target {local:?} is outside {:?}",
+            menu.surface_size
+        );
+    }
+
+    fn viewport_anchors(width: u32, height: u32) -> [(f32, f32); 9] {
+        let right = width.saturating_sub(1) as f32;
+        let bottom = height.saturating_sub(1) as f32;
+        let middle_x = right / 2.0;
+        let middle_y = bottom / 2.0;
+        [
+            (0.0, 0.0),
+            (middle_x, 0.0),
+            (right, 0.0),
+            (0.0, middle_y),
+            (middle_x, middle_y),
+            (right, middle_y),
+            (0.0, bottom),
+            (middle_x, bottom),
+            (right, bottom),
+        ]
     }
 
     #[test]
@@ -704,9 +836,174 @@ mod tests {
     }
 
     #[test]
+    fn every_visible_item_stays_hittable_at_viewport_edges_and_corners() {
+        for (width, height) in [(640, 480), (1920, 1080), (7680, 4320)] {
+            for stamp_count in [0, 1, 8, 9, 32] {
+                for anchor_local in viewport_anchors(width, height) {
+                    let anchor_screen = (
+                        10_000.0 + f64::from(anchor_local.0),
+                        -5_000.0 + f64::from(anchor_local.1),
+                    );
+                    let mut menu = RadialMenu::new(
+                        1,
+                        anchor_screen,
+                        anchor_local,
+                        (width, height),
+                        scale_for_surface(width, height),
+                        stamp_count,
+                        (true, true),
+                    );
+                    assert!(
+                        menu.layout_within_surface(),
+                        "invalid layout for {width}x{height}, {stamp_count} stamps, anchor {anchor_local:?}: {menu:?}"
+                    );
+
+                    // 動かさずに離すpinは、描画中心を補正した場合もanchor基準で維持する。
+                    assert_eq!(menu.release(anchor_screen), RadialRelease::Pin);
+
+                    let center = menu.center_screen;
+                    assert_screen_point_is_inside(&menu, center);
+                    menu.update(center);
+                    assert_eq!(menu.highlighted(), Some(RadialSelection::StandardMenu));
+
+                    let tool_radius =
+                        f64::from((menu.tool_inner_radius() + menu.tool_outer_radius()) / 2.0);
+                    for index in 0..DRAW_TOOL_COUNT {
+                        let target = screen_point(&menu, point(index, TOOL_COUNT, tool_radius));
+                        assert_screen_point_is_inside(&menu, target);
+                        menu.update(target);
+                        assert_eq!(menu.highlighted(), Some(RadialSelection::Tool(index)));
+                    }
+
+                    // centerへ戻すとstamp modeを解除し、色・command dockを検証できる。
+                    menu.update(center);
+                    let color_radius =
+                        f64::from((menu.color_inner_radius() + menu.color_outer_radius()) / 2.0);
+                    for index in 0..COLOR_COUNT {
+                        let target = screen_point(&menu, point(index, COLOR_COUNT, color_radius));
+                        assert_screen_point_is_inside(&menu, target);
+                        menu.update(target);
+                        assert_eq!(menu.highlighted(), Some(RadialSelection::Color(index)));
+                    }
+
+                    menu.update(center);
+                    for (command, rect) in menu.command_buttons() {
+                        let target = screen_for_local(&menu, rect.center());
+                        assert_screen_point_is_inside(&menu, target);
+                        menu.update(target);
+                        assert_eq!(menu.highlighted(), Some(RadialSelection::Command(command)));
+                    }
+
+                    if stamp_count == 0 {
+                        continue;
+                    }
+                    let category =
+                        screen_point(&menu, point(STAMP_TOOL_INDEX, TOOL_COUNT, tool_radius));
+                    assert_screen_point_is_inside(&menu, category);
+                    menu.update(category);
+                    assert_eq!(menu.highlighted(), Some(RadialSelection::StampCategory));
+                    assert!(menu.stamp_mode());
+
+                    for index in 0..stamp_count {
+                        let ring = index / STAMPS_PER_RING;
+                        let slot = index % STAMPS_PER_RING;
+                        let (inner, outer) = menu.stamp_ring_radii(ring).unwrap();
+                        let target = screen_point(
+                            &menu,
+                            point(slot, STAMPS_PER_RING, f64::from((inner + outer) / 2.0)),
+                        );
+                        assert_screen_point_is_inside(&menu, target);
+                        menu.update(target);
+                        assert_eq!(menu.highlighted(), Some(RadialSelection::Stamp(index)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjusted_center_preserves_hold_pin_legacy_menu_and_pinned_clicks() {
+        let anchor = (2500.0, -1200.0);
+        let mut menu = RadialMenu::new(1, anchor, (0.0, 0.0), (640, 480), 1.6, 32, (true, true));
+        assert_ne!(menu.center_local(), (0.0, 0.0));
+        assert!(menu.scale() < 1.6);
+        assert!(menu.layout_within_surface());
+        assert_eq!(menu.release(anchor), RadialRelease::Pin);
+
+        assert!(menu.begin_click(2));
+        assert_eq!(menu.release(menu.center_screen), RadialRelease::LegacyMenu);
+
+        let mut menu = RadialMenu::new(1, anchor, (0.0, 0.0), (640, 480), 1.6, 32, (true, true));
+        assert_eq!(menu.release(anchor), RadialRelease::Pin);
+        assert!(menu.begin_click(2));
+        let target = screen_point(
+            &menu,
+            point(
+                2,
+                TOOL_COUNT,
+                f64::from((menu.tool_inner_radius() + menu.tool_outer_radius()) / 2.0),
+            ),
+        );
+        assert_eq!(
+            menu.release(target),
+            RadialRelease::Action {
+                action: MenuAction::SelectTool(DrawTool::Marker),
+                keep_open: false,
+            }
+        );
+    }
+
+    #[test]
+    fn returning_to_the_adjusted_visual_center_pins_the_hold_menu() {
+        let anchor = (0.0, 0.0);
+        let mut menu = RadialMenu::new(
+            1,
+            anchor,
+            (0.0, 0.0),
+            (640, 480),
+            scale_for_surface(640, 480),
+            32,
+            (false, false),
+        );
+        let tool = screen_point(
+            &menu,
+            point(
+                1,
+                TOOL_COUNT,
+                f64::from((menu.tool_inner_radius() + menu.tool_outer_radius()) / 2.0),
+            ),
+        );
+        menu.update(tool);
+        assert_eq!(menu.release(menu.center_screen), RadialRelease::Pin);
+    }
+
+    #[test]
+    fn viewport_fitting_accepts_different_requested_dpi_scales() {
+        for (width, height) in [(640, 480), (1920, 1080), (7680, 4320)] {
+            for requested_scale in [0.75, 1.0, 1.25, 1.5, 1.6, 2.0] {
+                for anchor in [(0.0, 0.0), (width as f32 - 1.0, height as f32 - 1.0)] {
+                    let menu = RadialMenu::new(
+                        1,
+                        (f64::from(anchor.0), f64::from(anchor.1)),
+                        anchor,
+                        (width, height),
+                        requested_scale,
+                        32,
+                        (true, true),
+                    );
+                    assert!(menu.scale() <= requested_scale);
+                    assert!(menu.layout_within_surface());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn surface_scale_is_bounded() {
         assert_eq!(scale_for_surface(640, 480), 0.85);
         assert_eq!(scale_for_surface(1920, 1080), 1.0);
         assert_eq!(scale_for_surface(7680, 4320), 1.6);
+        assert!(scale_for_menu(640, 480, 32) < scale_for_surface(640, 480));
+        assert_eq!(scale_for_menu(7680, 4320, 32), 1.6);
     }
 }

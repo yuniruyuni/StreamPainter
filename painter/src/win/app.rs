@@ -1101,8 +1101,11 @@ impl App {
             (screen.0 - f64::from(self.monitor.x)) as f32,
             (screen.1 - f64::from(self.monitor.y)) as f32,
         );
-        let scale =
-            radial_menu::scale_for_surface(self.monitor.width as u32, self.monitor.height as u32);
+        let scale = radial_menu::scale_for_menu(
+            self.monitor.width as u32,
+            self.monitor.height as u32,
+            self.stamps.len(),
+        );
         self.radial_menu = Some(RadialMenu::new(
             pointer_id,
             screen,
