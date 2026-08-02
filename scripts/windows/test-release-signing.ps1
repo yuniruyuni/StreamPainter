@@ -224,6 +224,9 @@ try {
         Assert-Throws {
             Invoke-SignToolVerification -Path $inputPath -SignToolPath $signTool
         } 'signtool verification failed'
+        # The native failure is expected above, but pwsh otherwise propagates its stale exit code
+        # after this successful test script finishes. Unexpected errors never reach this reset.
+        $global:LASTEXITCODE = 0
     }
 } finally {
     if (Test-Path -LiteralPath $temporaryDirectory) {
