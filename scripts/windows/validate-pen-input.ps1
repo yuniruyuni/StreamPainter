@@ -55,6 +55,12 @@ function Receive-PenValidationText {
         }
         return [Text.Encoding]::UTF8.GetString($stream.ToArray())
     }
+    catch {
+        # Windows PowerShell wraps some async cancellations in MethodInvocationException.
+        # Only a typed OperationCanceledException cause is the deadline sentinel.
+        if (Test-PenValidationCancellationError -ErrorLike $_) { return $null }
+        throw
+    }
     finally {
         $cancel.Dispose()
         $stream.Dispose()
@@ -70,6 +76,7 @@ $verifiedDeviceBefore = Assert-PenValidationEnvironmentSummary `
     -ExpectedDeviceName $ExpectedDeviceName
 $failure = $null
 $result = $null
+$state = New-PenValidationState
 $client = $null
 try {
     $client = New-Object Net.WebSockets.ClientWebSocket
@@ -81,17 +88,34 @@ try {
         $connectCancel.CancelAfter(10000)
         [void]$client.ConnectAsync($uri, $connectCancel.Token).GetAwaiter().GetResult()
     }
+    catch {
+        if (Test-PenValidationCancellationError -ErrorLike $_) {
+            throw (New-PenValidationTimeoutException -State $state)
+        }
+        throw
+    }
     finally { $connectCancel.Dispose() }
 
     Write-Host "Connected. Use '$PublicDeviceLabel', select the marker, and draw at least two strokes; vary pressure and X/Y tilt in each stroke."
-    $state = New-PenValidationState
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $remaining = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-        if ($remaining -le 0) { throw 'pen validation timed out before all thresholds were met' }
-        Add-PenValidationMessage -State $state -Message (Receive-PenValidationText $client $remaining)
+        if ($remaining -le 0) { throw (New-PenValidationTimeoutException -State $state) }
+        $completedBefore = $state.CompletedStrokes
+        $message = Receive-PenValidationText $client $remaining
+        if ($null -eq $message) { throw (New-PenValidationTimeoutException -State $state) }
+        Add-PenValidationMessage -State $state -Message $message
         $result = Get-PenValidationResult $state
+        if ($state.CompletedStrokes -gt $completedBefore) {
+            Write-Host (Get-PenValidationProgressText -State $state)
+        }
     } while (-not $result.Passed)
+}
+catch [System.TimeoutException] {
+    # Emit the final sanitized state immediately as well as carrying it in the
+    # exception, so a later fail-closed config check cannot hide the progress.
+    Write-Host (Get-PenValidationProgressText -State $state)
+    $failure = $_
 }
 catch { $failure = $_ }
 finally {

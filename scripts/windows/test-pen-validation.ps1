@@ -30,6 +30,112 @@ function New-StartedState {
     return $state
 }
 
+$emptyProgressState = New-PenValidationState
+$emptyProgress = Get-PenValidationProgressText $emptyProgressState
+Assert-True ($emptyProgress -ceq ('Pen validation progress: completed=0; qualified=0/2; ' +
+    'last-stroke=none; missing=completed-marker-stroke,qualified-strokes=2')) `
+    'empty progress identifies missing input'
+$emptyTimeout = New-PenValidationTimeoutException $emptyProgressState
+Assert-True ($emptyTimeout -is [System.TimeoutException]) 'timeout helper returns TimeoutException'
+Assert-True ($emptyTimeout.Message.EndsWith($emptyProgress)) 'timeout includes empty final progress'
+$typedTimeoutCaught = $false
+try { throw $emptyTimeout }
+catch [System.TimeoutException] {
+    $typedTimeoutCaught = $_.Exception.Message.EndsWith($emptyProgress)
+}
+Assert-True $typedTimeoutCaught 'timeout remains typed when thrown and caught'
+
+$directCancellation = New-Object System.OperationCanceledException 'validation deadline'
+$wrappedCancellation = New-Object Management.Automation.MethodInvocationException `
+    -ArgumentList @('wrapped cancellation', $directCancellation)
+$unrelatedCause = New-Object System.InvalidOperationException 'not a timeout'
+$wrappedUnrelated = New-Object Management.Automation.MethodInvocationException `
+    -ArgumentList @('wrapped non-timeout', $unrelatedCause)
+Assert-True (Test-PenValidationCancellationError $directCancellation) `
+    'direct cancellation is a timeout cause'
+Assert-True (Test-PenValidationCancellationError $wrappedCancellation) `
+    'PowerShell method invocation wrapper is a timeout cause'
+Assert-False (Test-PenValidationCancellationError $wrappedUnrelated) `
+    'non-timeout wrapper is not swallowed'
+$wrappedCancellationRecord = $null
+try { throw $wrappedCancellation }
+catch { $wrappedCancellationRecord = $_ }
+$wrappedUnrelatedRecord = $null
+try { throw $wrappedUnrelated }
+catch { $wrappedUnrelatedRecord = $_ }
+Assert-True (Test-PenValidationCancellationError $wrappedCancellationRecord) `
+    'PowerShell ErrorRecord preserves the wrapped timeout cause'
+Assert-False (Test-PenValidationCancellationError $wrappedUnrelatedRecord) `
+    'PowerShell ErrorRecord preserves a non-timeout cause'
+Assert-False (Test-PenValidationCancellationError $null) 'null is not a timeout cause'
+
+$progressState = New-StartedState
+$privateStrokeId = 'private-progress-stroke-id'
+Add-TestStroke $progressState $privateStrokeId 21 @(
+    ,@(0.123456,0.234567,0.50,0,-0.04,-0.03),
+    ,@(0.876543,0.765432,0.52,1,0.04,0.03))
+$progressText = Get-PenValidationProgressText $progressState
+Assert-True ($progressText -ceq ('Pen validation progress: completed=1; qualified=0/2; ' +
+    'last-points=2; last-pressure-range=0.020000; last-tilt-x-range=0.080000; ' +
+    'last-tilt-y-range=0.060000; last-qualified=false; ' +
+    'missing=pressure-range>=0.050000,qualified-strokes=2')) `
+    'failed stroke progress identifies the missing pressure range'
+$lastProgressProperties = @($progressState.LastCompletedStroke.PSObject.Properties.Name) -join ','
+Assert-True ($lastProgressProperties -ceq `
+    'PointCount,Qualified,PressureRange,TiltXRange,TiltYRange') `
+    'last stroke state contains only sanitized aggregates'
+Assert-False ($progressText.Contains($privateStrokeId)) 'progress excludes stroke ID'
+Assert-False ($progressText.Contains('0.123456')) 'progress excludes X coordinate'
+Assert-False ($progressText.Contains('0.234567')) 'progress excludes Y coordinate'
+$progressTimeout = New-PenValidationTimeoutException $progressState
+Assert-True ($progressTimeout.Message.EndsWith($progressText)) `
+    'timeout includes final completed stroke progress'
+Assert-False ($progressTimeout.Message.Contains($privateStrokeId)) 'timeout excludes stroke ID'
+
+$exactThresholds = New-StartedState
+Add-TestStroke $exactThresholds 'exact-thresholds' 21 @(
+    ,@(0,0,0.10,0,0.01,0.01),,@(0,0,0.15,1,0.03,0.03))
+$exactThresholdProgress = Get-PenValidationProgressText $exactThresholds
+Assert-True $exactThresholds.LastCompletedStroke.Qualified `
+    'mathematically exact pressure and X/Y tilt thresholds qualify'
+Assert-True ($exactThresholdProgress.Contains('last-qualified=true')) `
+    'exact threshold progress agrees with qualification'
+Assert-True ($exactThresholdProgress.EndsWith('missing=qualified-strokes=2')) `
+    'exact threshold progress only needs another qualified stroke'
+
+$nearPressureThreshold = New-StartedState
+Add-TestStroke $nearPressureThreshold 'near-pressure-threshold' 21 @(
+    ,@(0,0,0.10,0,0.01,0.01),,@(0,0,0.1499996,1,0.03,0.03))
+$nearPressureProgress = Get-PenValidationProgressText $nearPressureThreshold
+Assert-True ($nearPressureProgress.Contains('missing=pressure-range>=0.050000,qualified-strokes=2')) `
+    'pressure below threshold remains missing after tolerance'
+$nearTiltXThreshold = New-StartedState
+Add-TestStroke $nearTiltXThreshold 'near-tilt-x-threshold' 21 @(
+    ,@(0,0,0.10,0,0.01,0.01),,@(0,0,0.15,1,0.0299996,0.03))
+$nearTiltXProgress = Get-PenValidationProgressText $nearTiltXThreshold
+Assert-True ($nearTiltXProgress.Contains('missing=tilt-x-range>=0.020000,qualified-strokes=2')) `
+    'tilt X below threshold remains missing after tolerance'
+$nearTiltYThreshold = New-StartedState
+Add-TestStroke $nearTiltYThreshold 'near-tilt-y-threshold' 21 @(
+    ,@(0,0,0.10,0,0.01,0.01),,@(0,0,0.15,1,0.03,0.0299996))
+$nearTiltYProgress = Get-PenValidationProgressText $nearTiltYThreshold
+Assert-True ($nearTiltYProgress.Contains('missing=tilt-y-range>=0.020000,qualified-strokes=2')) `
+    'tilt Y below threshold remains missing after tolerance'
+
+Add-TestStroke $progressState 'qualified-a' 24 @(
+    ,@(0,0,0.20,0,-0.04,-0.03),,@(0,0,0.80,1,0.04,0.03))
+$oneQualifiedProgress = Get-PenValidationProgressText $progressState
+Assert-True ($oneQualifiedProgress.Contains('completed=2; qualified=1/2')) `
+    'progress counts one qualified stroke'
+Assert-True ($oneQualifiedProgress.EndsWith('missing=qualified-strokes=2')) `
+    'progress asks for another qualified stroke'
+Add-TestStroke $progressState 'qualified-b' 27 @(
+    ,@(0,0,0.30,0,-0.03,0.04),,@(0,0,0.90,1,0.03,-0.04))
+$passedProgress = Get-PenValidationProgressText $progressState
+Assert-True ($passedProgress.Contains('completed=3; qualified=2/2')) `
+    'progress counts all completed and qualified strokes'
+Assert-True ($passedProgress.EndsWith('missing=none')) 'passed progress has no missing condition'
+
 $valid = New-StartedState
 Add-TestStroke $valid 'new-a' 21 @(,@(0.1,0.1,0.20,0,0.00,0.00),,@(0.2,0.2,0.50,5,0.04,-0.03))
 Add-TestStroke $valid 'new-b' 24 @(,@(0.3,0.3,0.30,0,-0.03,0.04),,@(0.4,0.4,0.90,5,0.03,-0.04))
@@ -198,6 +304,16 @@ Assert-True ($validatorText.Contains('[void]$client.ConnectAsync')) 'PS5.1 conne
 Assert-True ($validatorText.Contains('ExpectedDeviceName')) 'operator-confirmed device is mandatory'
 Assert-True ($validatorText.Contains('PublicDeviceLabel')) 'public device label is mandatory'
 Assert-True ($validatorText.Contains('67108864')) 'protocol-sized snapshot cap'
+Assert-True ($validatorText.Contains('Write-Host (Get-PenValidationProgressText -State $state)')) `
+    'completed marker strokes emit sanitized progress'
+Assert-True (([regex]::Matches(
+    $validatorText, 'New-PenValidationTimeoutException -State \$state')).Count -eq 3) `
+    'connect, deadline precheck, and receive cancellation include final progress'
+Assert-True (([regex]::Matches(
+    $validatorText, 'Test-PenValidationCancellationError -ErrorLike \$_')).Count -eq 2) `
+    'connect and receive inspect wrapped cancellation causes'
+Assert-True ($validatorText.Contains('catch [System.TimeoutException]')) `
+    'timeout progress is emitted before fail-closed post-validation checks'
 Assert-False ($validatorText -match '(?m)^\s*PresentPenDeviceCandidates\s*=') 'raw device candidates stay out of success JSON'
 Assert-False ($readOnlyText -match '(?i)\b(?:Start|Stop)-Process\b') 'validator does not control app process'
 Assert-False ($readOnlyText -match '(?i)\b(?:Set|Copy|Move|Remove)-(?:Item|Content)\b') 'validator does not write config or files'

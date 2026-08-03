@@ -39,6 +39,40 @@ function Test-PenValidationBoolean {
     return ($Value -is [bool] -and $Value -eq $Expected)
 }
 
+function Test-PenValidationMinimumThreshold {
+    param(
+        [Parameter(Mandatory = $true)][double]$Value,
+        [Parameter(Mandatory = $true)][double]$Minimum
+    )
+
+    # Decimal protocol values such as 0.15 - 0.10 may land a few ULP below the
+    # mathematical threshold. This tolerance accepts that representation error,
+    # while remaining far below a meaningful pen measurement difference.
+    return $Value -ge ($Minimum - 0.000000000001)
+}
+
+function Test-PenValidationCancellationError {
+    [CmdletBinding()]
+    param([AllowNull()][object]$ErrorLike)
+
+    if ($null -eq $ErrorLike) { return $false }
+    $candidate = if ($ErrorLike -is [Management.Automation.ErrorRecord]) {
+        $ErrorLike.Exception
+    } else {
+        $ErrorLike
+    }
+    # Windows PowerShell may wrap a method's OperationCanceledException in one or
+    # more MethodInvocationException/RuntimeException layers. Inspect types only;
+    # never classify an unrelated error from its message or FullyQualifiedErrorId.
+    for ($depth = 0; $depth -lt 16 -and $null -ne $candidate; $depth++) {
+        if ($candidate -is [System.OperationCanceledException]) { return $true }
+        $next = Get-PenValidationProperty $candidate 'InnerException'
+        if ($null -eq $next -or [object]::ReferenceEquals($candidate, $next)) { break }
+        $candidate = $next
+    }
+    return $false
+}
+
 function Assert-PenValidationMarkerBrush {
     param([Parameter(Mandatory = $true)][object]$Brush)
 
@@ -79,6 +113,7 @@ function New-PenValidationState {
         Pressures = New-Object System.Collections.ArrayList
         TiltXs = New-Object System.Collections.ArrayList
         TiltYs = New-Object System.Collections.ArrayList
+        LastCompletedStroke = $null
     }
 }
 
@@ -205,6 +240,13 @@ function Add-PenValidationMessage {
                 -Pressures $active.Pressures `
                 -TiltXs $active.TiltXs `
                 -TiltYs $active.TiltYs
+            $State.LastCompletedStroke = [pscustomobject][ordered]@{
+                PointCount = $active.PointCount
+                Qualified = [bool]$strokeResult.Passed
+                PressureRange = [double]$strokeResult.PressureRange
+                TiltXRange = [double]$strokeResult.TiltXRange
+                TiltYRange = [double]$strokeResult.TiltYRange
+            }
             if ($strokeResult.Passed) {
                 foreach ($value in $active.Pressures) { [void]$State.Pressures.Add($value) }
                 foreach ($value in $active.TiltXs) { [void]$State.TiltXs.Add($value) }
@@ -245,8 +287,10 @@ function Get-PenValidationDynamicsResult {
         foreach ($value in $TiltYs) { $tiltYMagnitude = [Math]::Max($tiltYMagnitude, [Math]::Abs($value)) }
     }
     return [pscustomobject]@{
-        Passed = $PointCount -ge 2 -and $pressureRange -ge 0.05 -and
-            $tiltXRange -ge 0.02 -and $tiltYRange -ge 0.02
+        Passed = $PointCount -ge 2 -and
+            (Test-PenValidationMinimumThreshold $pressureRange 0.05) -and
+            (Test-PenValidationMinimumThreshold $tiltXRange 0.02) -and
+            (Test-PenValidationMinimumThreshold $tiltYRange 0.02)
         PressureRange = $pressureRange
         TiltXRange = $tiltXRange
         TiltYRange = $tiltYRange
@@ -286,6 +330,62 @@ function Get-PenValidationResult {
         TiltXMagnitude = [Math]::Round($tiltXMagnitude, 6)
         TiltYMagnitude = [Math]::Round($tiltYMagnitude, 6)
     }
+}
+
+function ConvertTo-PenValidationProgressNumber {
+    param([Parameter(Mandatory = $true)][double]$Value)
+
+    return ([Math]::Round($Value, 6)).ToString(
+        '0.000000', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-PenValidationProgressText {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    $missing = New-Object System.Collections.Generic.List[string]
+    $last = $State.LastCompletedStroke
+    if ($null -eq $last) {
+        $lastText = 'last-stroke=none'
+        [void]$missing.Add('completed-marker-stroke')
+    }
+    else {
+        $pointCount = [int]$last.PointCount
+        $pressureRange = [double]$last.PressureRange
+        $tiltXRange = [double]$last.TiltXRange
+        $tiltYRange = [double]$last.TiltYRange
+        if ($pointCount -lt 2) { [void]$missing.Add('point-count>=2') }
+        if (-not (Test-PenValidationMinimumThreshold $pressureRange 0.05)) {
+            [void]$missing.Add('pressure-range>=0.050000')
+        }
+        if (-not (Test-PenValidationMinimumThreshold $tiltXRange 0.02)) {
+            [void]$missing.Add('tilt-x-range>=0.020000')
+        }
+        if (-not (Test-PenValidationMinimumThreshold $tiltYRange 0.02)) {
+            [void]$missing.Add('tilt-y-range>=0.020000')
+        }
+        $lastQualified = ([bool]$last.Qualified).ToString().ToLowerInvariant()
+        $lastText = 'last-points={0}; last-pressure-range={1}; last-tilt-x-range={2}; ' +
+            'last-tilt-y-range={3}; last-qualified={4}'
+        $lastText = $lastText -f $pointCount,
+            (ConvertTo-PenValidationProgressNumber $pressureRange),
+            (ConvertTo-PenValidationProgressNumber $tiltXRange),
+            (ConvertTo-PenValidationProgressNumber $tiltYRange),
+            $lastQualified
+    }
+    if ($State.QualifiedStrokes -lt 2) { [void]$missing.Add('qualified-strokes=2') }
+    $missingText = if ($missing.Count -eq 0) { 'none' } else { $missing -join ',' }
+    return 'Pen validation progress: completed={0}; qualified={1}/2; {2}; missing={3}' -f
+        $State.CompletedStrokes, $State.QualifiedStrokes, $lastText, $missingText
+}
+
+function New-PenValidationTimeoutException {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    $message = 'pen validation timed out before all thresholds were met. ' +
+        (Get-PenValidationProgressText -State $State)
+    return (New-Object System.TimeoutException -ArgumentList @(,$message))
 }
 
 function Get-PenValidationConfigState {
@@ -465,7 +565,8 @@ function Test-PenValidationDeviceUnchanged {
 }
 
 Export-ModuleMember -Function New-PenValidationState, Add-PenValidationMessage, `
-    Get-PenValidationResult, Get-PenValidationConfigState, `
+    Get-PenValidationResult, Get-PenValidationProgressText, `
+    New-PenValidationTimeoutException, Get-PenValidationConfigState, `
     Test-PenValidationConfigUnchanged, Get-PenValidationEnvironmentSummary, `
     Assert-PenValidationEnvironmentSummary, Test-PenValidationDeviceUnchanged, `
-    Test-PenValidationDeviceNameCandidate
+    Test-PenValidationDeviceNameCandidate, Test-PenValidationCancellationError
