@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-03
+
 ### Added
 
 - 物理ペンの筆圧・X/Y傾きを設定非変更で検証し、device/driver/app情報を秘匿化して記録する
@@ -188,7 +190,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.5.1...v0.6.0
