@@ -105,6 +105,47 @@ Browser Source側も同じ1-origin cursorと数式で一致することを検証
 ペン先からの入力、最小・最大筆圧、X/Y両方向の傾き、hoverから接触への遷移、mouse fallbackを
 確認し、機種名・driver version・Windows versionをこの節へ追記してください。
 
+### 物理ペン入力の手動検証
+
+この手順は実行中のStreamPainterへ読み取り専用で接続し、アプリの起動・停止や設定変更は行いません。
+あらかじめ通常どおりStreamPainterを起動し、設定画面に表示されるローカルサーバーのポートを確認して
+ください。次にPowerShell 5.1またはPowerShell 7でリポジトリ直下から次を実行します。
+
+```powershell
+Get-PnpDevice -PresentOnly |
+  Where-Object FriendlyName -Match '(?i)(\b(pen|stylus|tablet|digitizer|wacom)\b|pentablet|\u30da\u30f3|\u30bf\u30d6\u30ec\u30c3\u30c8|\u30c7\u30b8\u30bf\u30a4\u30b6)' |
+  Select-Object Status, Class, FriendlyName
+
+.\scripts\windows\validate-pen-input.ps1 `
+  -Port 16873 `
+  -ExpectedDeviceName 'Wacom Intuos Pro L' `
+  -PublicDeviceLabel 'Wacom Intuos Pro L'
+```
+
+`ExpectedDeviceName`には、その場で実際に使うWindowsのdevice名を正確に指定し、そのdeviceだけを
+使います。上の絞り込みに出ない言語や製品名でも、present deviceとのexact matchはvalidatorが確認します。
+`PublicDeviceLabel`にはserialや個人名を含まない、共有可能なmodel名を指定
+します。接続後にマーカーを選択して、筆圧を弱から強まで変えながらX/Y両方向へ傾けた線を2本以上
+描きます。
+validatorは接続直後のsnapshotを基準として除外し、その後の新しい`stroke_begin`、`stroke_points`、
+`stroke_end`だけを収集します。各線を独立に評価し、2本それぞれが6要素の有限なpoint、マーカー固有の
+brush設定、筆圧範囲0.05以上、X傾きの変化範囲0.02以上、Y傾きの変化範囲0.02以上を
+満たすと成功します。mouse fallbackとpen 1本の組合せ、不正値、変化量不足は成功として扱いません。
+途中で完全snapshotを受信した場合やrevisionに欠番がある場合は、異なる状態の証拠を混在させず
+検証を中断するため、もう一度実行してください。
+
+出力するJSON summaryは座標、初期snapshot、Windowsユーザー名・コンピューター名、device serial、
+PnP IDを含みません。OS、操作者が指定してWindows上でpresent/OKと確認できたdeviceの公開用model名・
+driver version・provider/service情報、候補件数、実行中exeのSHA-256（埋め込まれていればversion）
+と、座標を含まない集計値だけを記録できます。app listenerのhash、指定device、driver情報を取得できない
+場合や、それらが検証中に変化した場合は成功にしません。Windowsの入力event自体にはPnP IDを載せない
+ため、候補一覧だけから入力元を自動断定せず、操作者が指定したdeviceを実際に使用したことも記録します。
+raw device名と候補一覧は成功summaryへ出力しません。検証前後にはWindowsのcanonicalな
+`%APPDATA%\StreamPainter\config`にある`config.toml`と`config.toml.bak`のSHA-256を比較し、
+どちらかが変化した場合は失敗します。この対象directoryをcommand lineで迂回することはできません。
+共有前にsummaryを目視確認してください。この手順を追加した時点では、特定の物理deviceでの成功を
+確認済みとはしていません。
+
 ```console
 cargo test --locked --manifest-path painter/Cargo.toml ten_thousand_point -- --nocapture
 bun test client/src/Overlay/renderer/geometry.test.ts

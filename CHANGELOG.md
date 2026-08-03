@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- 物理ペンの筆圧・X/Y傾きを設定非変更で検証し、device/driver/app情報を秘匿化して記録する
+  Windows PowerShell 5.1／PowerShell 7対応の手動validator
+
 ### Changed
 
 - GitHubのrepository-level immutable releasesを有効化し、今後公開するReleaseのtag／asset保護と

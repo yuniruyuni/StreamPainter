@@ -50,6 +50,14 @@ jobs:
         shell: pwsh
         run: ./scripts/windows/test-release-signing.ps1
 
+      - name: Test pen validation helpers on PowerShell 7
+        shell: pwsh
+        run: ./scripts/windows/test-pen-validation.ps1
+
+      - name: Test pen validation helpers on Windows PowerShell 5.1
+        shell: powershell
+        run: ./scripts/windows/test-pen-validation.ps1
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
