@@ -48,6 +48,16 @@ StreamPainterはMITライセンスの公開repositoryで、既にWindows向け�
 buildし、別projectのproprietary binaryを同梱しません。脆弱性の探索・防御回避を目的とする製品でも
 ありません。そのためFoundation条件の基本部分には合致すると考えます。
 
+一方、[現行のFoundation申請フォーム](https://signpath.org/apply)は、検索でprojectを明確に識別できる
+名称と、利用実績・信頼を示すlink等を記入する必須の`Reputation`欄を設けています。StreamPainterは
+公開直後で、外部記事、community discussion、継続的なdownload実績等はまだ限定的です。申請する場合は、
+その時点で確認できる公開link、実数、GitHub insightsだけを誇張なく記載し、不足を推測値で埋めません。
+これはscaffoldの技術的完成とは別の審査条件であり、十分性と採否はFoundationが判断します。
+
+同じ申請フォームでは、作成されるSignPath accountの氏名・email、Code of Conductへの同意、個人情報の
+取扱いへの同意、reCAPTCHAも求められます。これらはrepository owner本人が内容を確認して入力し、botや
+CIから代理送信しません。
+
 ただし、適格性と証明書提供はSignPath Foundationだけが判断できます。次は承認前の未解決事項です。
 
 - Foundationへ申請し、projectの評判・repository支配・製品内容について承認を得る。
@@ -71,6 +81,11 @@ Windows VERSIONINFOはbuild時にCargo versionから生成し、`ProductName=Str
 - Signing approver: [@yuniruyuni](https://github.com/yuniruyuni)
 - CI submitter: SignPathの`release-signing` policyへsubmitだけできる専用CI user
 - GitHub `code-signing` environment reviewer: 未定（release tagをpushするactorとは別のtrusted user）
+
+Foundationの公開条件はAuthors、Reviewers、Approversの役割とreleaseごとのmanual approvalを要求しますが、
+tagをpushしたactorとApproverを必ず別人にするとは明記していません。上記の別GitHub environment reviewerは
+StreamPainterが追加するdefense-in-depthです。この強化を維持する現行policyでは、信頼できる別の
+collaboratorが参加するまで`code-signing` environmentを有効化しません。
 
 実行中のStreamPainterについてのprivacy statementは次のとおりです。
 
@@ -146,6 +161,12 @@ publishへ到達しません。公開後はRelease pageの`Immutable`表示と
 ## SignPath側の必須設定
 
 値はFoundation承認後にSignPath UIから取得し、repositoryへhard-codeしません。
+
+[SignPathのGitHub integration](https://docs.signpath.io/trusted-build-systems/github)は、source code / build
+policyを使う場合にSignPath GitHub Appを必要としていますが、同ページではrepository内のpolicy機能を
+Advanced Code Signing / Code Signing Gateway向けとしています。Open Source Code Signingの基本的な
+trusted build / origin verificationだけを理由に承認前からAppをinstallせず、Foundation担当者が追加の
+policyを求めた場合だけ、対象repositoryをStreamPainterへ限定して導入します。
 
 1. [Foundationへ申請](https://signpath.org/apply)し、承認を得る。
 2. SignPath organizationへpredefined trusted build system `GitHub.com`を追加し、StreamPainter projectへ

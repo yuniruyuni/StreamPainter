@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- SignPath Foundation申請のreputation・本人同意要件と、GitHub App／独立environment reviewerを
+  導入する条件をCode signing policyへ明記
+
 ## [0.7.1] - 2026-08-03
 
 ### Added
