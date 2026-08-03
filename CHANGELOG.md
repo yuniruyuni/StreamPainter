@@ -9,7 +9,9 @@
 ### Changed
 
 - 物理ペンvalidatorが各マーカーストローク終了時に座標／IDを含まない進捗と不足条件を表示し、
-  timeout時にも最後のpoint数・筆圧範囲・X/Y傾き範囲を報告
+  timeout時にも最後のpoint数・筆圧範囲・X/Y傾き範囲を報告。2026-08-03にWindows 11 Pro上の
+  StreamPainter 0.7.2とWacom Intuos Pro Lでprotocol 7の実機検証を行い、2本のストロークが
+  completed/qualified 2/2、合計155 pointsを満たし、configが変更されないことを確認
 
 ## [0.7.2] - 2026-08-03
 

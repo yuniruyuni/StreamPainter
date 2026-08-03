@@ -100,10 +100,50 @@ Browser Source側も同じ1-origin cursorと数式で一致することを検証
 
 筆圧・傾きについては、platform非依存テストでWindowsの0..1024の筆圧、±90度の傾き、mask欠落、
 範囲外値、mouse／touch fallbackを検証し、WindowsのWARP Direct2Dテストで筆圧・傾きに応じて
-実描画pixelの被覆面積が変わることを検証します。2026-08-03時点で、物理ペンと固有driverを使った
-確認済み構成はまだありません。Surface Pen、Windows Ink対応ペンタブレットなどでの実機確認では、
-ペン先からの入力、最小・最大筆圧、X/Y両方向の傾き、hoverから接触への遷移、mouse fallbackを
-確認し、機種名・driver version・Windows versionをこの節へ追記してください。
+実描画pixelの被覆面積が変わることを検証します。物理ペンと固有driverを使った確認済み構成は
+以下です。
+
+### 確認済み構成
+
+2026-08-03に、次の構成で物理ペンvalidatorの成功を確認しました。
+
+| 項目 | 確認値 |
+| --- | --- |
+| StreamPainter | `0.7.2` |
+| exe SHA-256 | `7967b266c70c9d22c19814a250e0a321d953b3f8924ab594b70b39a98e49109f` |
+| Windows | Windows 11 Pro `10.0.26200` (build `26200`) |
+| device | Wacom Intuos Pro L |
+| device状態 | class `USBDevice`、status `OK` |
+| driver | `1.0.0.2`、provider `Wacom Co Ltd.` |
+| service | `WTabletServicePro`: `Running` |
+| protocol | `7` |
+| 判定 | completed/qualified `2/2` |
+| stroke 1 | 121 points、筆圧範囲 `0.65`、X傾き範囲 `0.24`、Y傾き範囲 `0.30` |
+| stroke 2 | 34 points、筆圧範囲 `0.27`、X傾き範囲 `0.07`、Y傾き範囲 `0.41` |
+| 合格point合計 | `155` |
+| config | 検証前後で変更なし |
+
+validatorが自動記録した証拠範囲は、ペン接地中のマーカーストローク2本、筆圧と
+X/Y傾きの変化範囲、device/driver/app情報の検証中の一致、config不変です。
+この成功記録は、操作者が当該Wacom Intuos Pro Lを検証中に使用したという確認に
+基づきます。Windowsの入力event単独ではdevice provenanceを証明できないため、validatorは
+入力元deviceを自動断定しません。
+
+#### 操作者による目視・手動確認
+
+validatorの自動判定とは別に、操作者は次の振る舞いを確認しました。
+
+- ペンのhover中は線が表示されず、接地後だけ描画される
+- 検証した2本の線がStreamPainter overlayとOBS projectorの両方に表示される
+- mouseで従来どおり一定幅の線を描画できる
+
+mouse／touch fallbackは既存のplatform非依存テストで検証し、関連するWARP自動テストでは
+筆圧・傾きによる実描画の変化を検証します。この実機runではhoverから接触への遷移と
+mouse fallbackを追加で手動確認し、touch fallbackは手動確認に含めていません。
+他の構成を追記する場合も、
+ペン先からの入力、最小・最大筆圧、X/Y両方向の傾き、hoverから接触への遷移、mouse fallback、
+StreamPainter overlayとOBS projectorの表示を確認し、機種名・driver version・Windows versionを
+この節へ追記します。
 
 ### 物理ペン入力の手動検証
 
@@ -146,8 +186,7 @@ driver version・provider/service情報、候補件数、実行中exeのSHA-256�
 raw device名と候補一覧は成功summaryへ出力しません。検証前後にはWindowsのcanonicalな
 `%APPDATA%\StreamPainter\config`にある`config.toml`と`config.toml.bak`のSHA-256を比較し、
 どちらかが変化した場合は失敗します。この対象directoryをcommand lineで迂回することはできません。
-共有前にsummaryを目視確認してください。この手順を追加した時点では、特定の物理deviceでの成功を
-確認済みとはしていません。
+共有前にsummaryを目視確認してください。現在の確認済み成功は上記構成に限ります。
 
 ```console
 cargo test --locked --manifest-path painter/Cargo.toml ten_thousand_point -- --nocapture
