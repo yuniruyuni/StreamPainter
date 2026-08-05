@@ -23,6 +23,7 @@
           "done": true,
           "endedAt": 1700000000100.0,
           "kind": "stroke",
+          "layerId": "default",
           "pts": [
             [
               0.1,
@@ -44,6 +45,7 @@
           "endedAt": 1700000000000.0,
           "itemId": "fixture-snapshot-shape",
           "kind": "shape",
+          "layerId": "default",
           "shape": "ellipse",
           "start": [
             0.1,
@@ -74,13 +76,20 @@
           "heightN": 0.225,
           "itemId": "fixture-snapshot-stamp",
           "kind": "stamp",
+          "layerId": "default",
           "opacity": 0.875,
           "rotation": 0.375,
           "stampId": "fixture-stamp",
           "widthN": 0.125
         }
       ],
-      "protocolVersion": 7,
+      "layers": [
+        {
+          "layerId": "default",
+          "name": "レイヤー 1"
+        }
+      ],
+      "protocolVersion": 8,
       "rev": 40,
       "type": "snapshot"
     },
@@ -121,6 +130,7 @@
             "heightN": 0.2,
             "itemId": "fixture-preserved-stamp",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
@@ -140,8 +150,15 @@
             "done": false,
             "endedAt": null,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [],
             "strokeId": "fixture-stroke-begin"
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -159,13 +176,20 @@
             "heightN": 0.2,
             "itemId": "fixture-preserved-stamp",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -180,6 +204,7 @@
           "tool": "marker",
           "widthN": 0.0125
         },
+        "layerId": "default",
         "rev": 41,
         "strokeId": "fixture-stroke-begin",
         "type": "stroke_begin"
@@ -203,6 +228,7 @@
             "done": false,
             "endedAt": null,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -232,6 +258,12 @@
             "strokeId": "fixture-stroke-points"
           }
         ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -251,6 +283,7 @@
             "done": false,
             "endedAt": null,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -264,7 +297,13 @@
             "strokeId": "fixture-stroke-points"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -310,6 +349,7 @@
             "done": true,
             "endedAt": 1700000000123.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -329,6 +369,12 @@
               ]
             ],
             "strokeId": "fixture-stroke-end"
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -350,6 +396,7 @@
             "done": false,
             "endedAt": null,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -371,7 +418,13 @@
             "strokeId": "fixture-stroke-end"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -386,6 +439,12 @@
     {
       "expected": {
         "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -405,6 +464,7 @@
             "done": false,
             "endedAt": null,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -426,7 +486,13 @@
             "strokeId": "fixture-stroke-cancel"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -454,6 +520,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -475,6 +542,7 @@
             "endedAt": null,
             "itemId": "fixture-shape-begin",
             "kind": "shape",
+            "layerId": "default",
             "shape": "arrow",
             "start": [
               0.1,
@@ -485,6 +553,12 @@
               "opacity": 0.625,
               "widthN": 0.01
             }
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -506,6 +580,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -519,7 +594,13 @@
             "strokeId": "fixture-preserved-stroke"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -533,6 +614,7 @@
           ],
           "endedAt": null,
           "itemId": "fixture-shape-begin",
+          "layerId": "default",
           "shape": "arrow",
           "start": [
             0.1,
@@ -560,6 +642,7 @@
             "endedAt": null,
             "itemId": "fixture-shape-update",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -570,6 +653,12 @@
               "opacity": 0.7,
               "widthN": 0.01
             }
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -586,6 +675,7 @@
             "endedAt": null,
             "itemId": "fixture-shape-update",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -598,7 +688,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -625,6 +721,7 @@
             "endedAt": 1700000000456.0,
             "itemId": "fixture-shape-end",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -646,6 +743,12 @@
             }
           }
         ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -660,6 +763,7 @@
             "endedAt": null,
             "itemId": "fixture-shape-end",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -672,7 +776,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -696,6 +806,12 @@
     {
       "expected": {
         "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -710,6 +826,7 @@
             "endedAt": null,
             "itemId": "fixture-shape-cancel",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -722,7 +839,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -745,6 +868,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-preserved-shape",
             "kind": "shape",
+            "layerId": "default",
             "shape": "line",
             "start": [
               0.15,
@@ -766,10 +890,17 @@
             "heightN": 0.225,
             "itemId": "fixture-stamp-add",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.875,
             "rotation": 0.375,
             "stampId": "fixture-stamp",
             "widthN": 0.125
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -786,6 +917,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-preserved-shape",
             "kind": "shape",
+            "layerId": "default",
             "shape": "line",
             "start": [
               0.15,
@@ -798,7 +930,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -813,6 +951,7 @@
           "endedAt": 1700000000789.0,
           "heightN": 0.225,
           "itemId": "fixture-stamp-add",
+          "layerId": "default",
           "opacity": 0.875,
           "rotation": 0.375,
           "stampId": "fixture-stamp",
@@ -835,10 +974,17 @@
             "heightN": 0.2,
             "itemId": "fixture-stamp-preview",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -856,13 +1002,20 @@
             "heightN": 0.2,
             "itemId": "fixture-stamp-preview",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -890,10 +1043,17 @@
             "heightN": 0.2,
             "itemId": "fixture-stamp-move",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -911,13 +1071,20 @@
             "heightN": 0.2,
             "itemId": "fixture-stamp-move",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -944,6 +1111,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-transform-preview",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -965,6 +1133,12 @@
             }
           }
         ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -979,6 +1153,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-transform-preview",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -991,7 +1166,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1023,6 +1204,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-transform-commit",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -1044,6 +1226,12 @@
             }
           }
         ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -1058,6 +1246,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-transform-commit",
             "kind": "shape",
+            "layerId": "default",
             "shape": "rectangle",
             "start": [
               0.15,
@@ -1070,7 +1259,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1092,6 +1287,79 @@
     },
     {
       "expected": {
+        "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          },
+          {
+            "layerId": "fixture-layer",
+            "name": "レイヤー 2"
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "layer": {
+          "layerId": "fixture-layer",
+          "name": "レイヤー 2"
+        },
+        "rev": 41,
+        "type": "layer_add"
+      },
+      "name": "layer_add"
+    },
+    {
+      "expected": {
+        "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "rev": 41
+      },
+      "initial": {
+        "fadeAfterMs": null,
+        "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          },
+          {
+            "layerId": "fixture-layer",
+            "name": "レイヤー 2"
+          }
+        ],
+        "protocolVersion": 8,
+        "rev": 40,
+        "type": "snapshot"
+      },
+      "message": {
+        "layerId": "fixture-layer",
+        "rev": 41,
+        "type": "layer_delete"
+      },
+      "name": "layer_delete"
+    },
+    {
+      "expected": {
         "items": [
           {
             "done": false,
@@ -1102,6 +1370,7 @@
             "endedAt": null,
             "itemId": "fixture-undo-active",
             "kind": "shape",
+            "layerId": "default",
             "shape": "ellipse",
             "start": [
               0.15,
@@ -1112,6 +1381,12 @@
               "opacity": 0.7,
               "widthN": 0.01
             }
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -1133,6 +1408,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1162,6 +1438,7 @@
             "endedAt": null,
             "itemId": "fixture-undo-active",
             "kind": "shape",
+            "layerId": "default",
             "shape": "ellipse",
             "start": [
               0.15,
@@ -1174,7 +1451,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1196,6 +1479,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-redo-preserved",
             "kind": "shape",
+            "layerId": "default",
             "shape": "arrow",
             "start": [
               0.15,
@@ -1217,10 +1501,17 @@
             "heightN": 0.225,
             "itemId": "fixture-redo",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.875,
             "rotation": 0.375,
             "stampId": "fixture-stamp",
             "widthN": 0.125
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 41
@@ -1237,6 +1528,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-redo-preserved",
             "kind": "shape",
+            "layerId": "default",
             "shape": "arrow",
             "start": [
               0.15,
@@ -1249,7 +1541,13 @@
             }
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1264,6 +1562,7 @@
           "heightN": 0.225,
           "itemId": "fixture-redo",
           "kind": "stamp",
+          "layerId": "default",
           "opacity": 0.875,
           "rotation": 0.375,
           "stampId": "fixture-stamp",
@@ -1277,6 +1576,12 @@
     {
       "expected": {
         "items": [],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
         "rev": 41
       },
       "initial": {
@@ -1296,6 +1601,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1317,6 +1623,7 @@
             "endedAt": 1700000000200.0,
             "itemId": "fixture-clear-shape",
             "kind": "shape",
+            "layerId": "default",
             "shape": "ellipse",
             "start": [
               0.15,
@@ -1338,13 +1645,20 @@
             "heightN": 0.2,
             "itemId": "fixture-clear-stamp",
             "kind": "stamp",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
             "widthN": 0.1
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 40,
         "type": "snapshot"
       },
@@ -1358,6 +1672,7 @@
   "fixtureVersion": 1,
   "limits": {
     "maxItems": 500,
+    "maxLayers": 8,
     "maxPointsPerMessage": 512,
     "maxStrokePoints": 10000,
     "maxTotalPoints": 200000
@@ -1377,6 +1692,16 @@
       "itemId",
       "rev",
       "transform",
+      "type"
+    ],
+    "layer_add": [
+      "layer",
+      "rev",
+      "type"
+    ],
+    "layer_delete": [
+      "layerId",
+      "rev",
       "type"
     ],
     "pong": [
@@ -1414,6 +1739,7 @@
     "snapshot": [
       "fadeAfterMs",
       "items",
+      "layers",
       "protocolVersion",
       "rev",
       "type"
@@ -1437,6 +1763,7 @@
     ],
     "stroke_begin": [
       "brush",
+      "layerId",
       "rev",
       "strokeId",
       "type"
@@ -1474,6 +1801,10 @@
       "tool",
       "widthN"
     ],
+    "layer": [
+      "layerId",
+      "name"
+    ],
     "lineStyle": [
       "color",
       "opacity",
@@ -1485,6 +1816,7 @@
       "endedAt",
       "itemId",
       "kind",
+      "layerId",
       "shape",
       "start",
       "style",
@@ -1497,6 +1829,7 @@
       "heightN",
       "itemId",
       "kind",
+      "layerId",
       "opacity",
       "rotation",
       "stampId",
@@ -1507,11 +1840,12 @@
       "done",
       "endedAt",
       "kind",
+      "layerId",
       "pts",
       "strokeId"
     ]
   },
-  "protocolVersion": 7,
+  "protocolVersion": 8,
   "revisionCases": [
     {
       "expected": {
@@ -1530,6 +1864,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1541,6 +1876,12 @@
               ]
             ],
             "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 10
@@ -1563,6 +1904,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1576,7 +1918,13 @@
             "strokeId": "fixture-revision-preserved"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 10,
         "type": "snapshot"
       },
@@ -1603,6 +1951,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1614,6 +1963,12 @@
               ]
             ],
             "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 10
@@ -1636,6 +1991,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1649,7 +2005,13 @@
             "strokeId": "fixture-revision-preserved"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 10,
         "type": "snapshot"
       },
@@ -1676,6 +2038,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1687,6 +2050,12 @@
               ]
             ],
             "strokeId": "fixture-revision-preserved"
+          }
+        ],
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
           }
         ],
         "rev": 10
@@ -1709,6 +2078,7 @@
             "done": true,
             "endedAt": 1700000000100.0,
             "kind": "stroke",
+            "layerId": "default",
             "pts": [
               [
                 0.1,
@@ -1722,14 +2092,26 @@
             "strokeId": "fixture-revision-preserved"
           }
         ],
-        "protocolVersion": 7,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 8,
         "rev": 10,
         "type": "snapshot"
       },
       "message": {
         "fadeAfterMs": 1000.0,
         "items": [],
-        "protocolVersion": 8,
+        "layers": [
+          {
+            "layerId": "default",
+            "name": "レイヤー 1"
+          }
+        ],
+        "protocolVersion": 9,
         "rev": 99,
         "type": "snapshot"
       },
@@ -1752,6 +2134,8 @@
     "stamp_move",
     "item_transform_preview",
     "item_transform_commit",
+    "layer_add",
+    "layer_delete",
     "undo",
     "redo",
     "clear"
@@ -2784,6 +3168,7 @@
             "endedAt": 1700000000300.0,
             "heightN": 0.2,
             "itemId": "fixture-limit-item-new",
+            "layerId": "default",
             "opacity": 0.9,
             "rotation": 0.0,
             "stampId": "fixture-stamp",
@@ -2862,6 +3247,7 @@
             "tool": "pen",
             "widthN": 0.0075
           },
+          "layerId": "default",
           "rev": 41,
           "strokeId": "fixture-limit-stroke-new",
           "type": "stroke_begin"

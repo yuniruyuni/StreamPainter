@@ -42,13 +42,13 @@ use crate::net::obs::{self, ObsSettings, ProjectorView};
 use crate::net::obs_request::{
     PollDisposition, ProjectorRequestTracker, RequestGeneration, WorkerDisposition,
 };
-use crate::protocol::{Brush, CanvasItem, LineStyle, ShapeKind, Tool};
+use crate::protocol::{Brush, CanvasItem, CanvasLayer, LineStyle, ShapeKind, Tool};
 use crate::win::hotkey::{self, ChangeCommand, HotkeyManager};
 use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
 use crate::win::pointer;
 use crate::win::projector;
-use crate::win::radial_menu::{self, RadialMenu, RadialRelease};
+use crate::win::radial_menu::{self, RadialLayerEntry, RadialMenu, RadialRelease};
 use crate::win::render::Renderer;
 use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
@@ -233,6 +233,7 @@ pub fn run() -> Result<()> {
         config.local_server_port,
         &config.stamps,
         engine.shared_items(),
+        engine.shared_layers(),
     )?;
     debug_assert_eq!(web.overlay_url(), config.overlay_url());
 
@@ -288,8 +289,9 @@ pub fn run() -> Result<()> {
     {
         let t = std::time::Instant::now();
         let renderer = app.renderer.as_mut().expect("renderer was initialized");
-        renderer.rebuild_baked(&[])?;
-        renderer.draw_frame(&[], false, None, None)?;
+        let layers = [CanvasLayer::default()];
+        renderer.rebuild_layered_baked(&layers, &[])?;
+        renderer.draw_frame(&layers, &[], false, None, None)?;
         info!("renderer warmup: {:?}", t.elapsed());
     }
 
@@ -451,6 +453,10 @@ fn select_monitor(monitors: &[Monitor], configured: usize) -> Option<(usize, Mon
         .copied()
         .map(|monitor| (configured, monitor))
         .or_else(|| monitors.first().copied().map(|monitor| (0, monitor)))
+}
+
+fn layer_delete_requires_confirmation(item_count: usize, can_undo: bool, can_redo: bool) -> bool {
+    item_count > 0 || can_undo || can_redo
 }
 
 /// Freehand tool dynamics are serialized with each stroke so Direct2D and the
@@ -644,6 +650,54 @@ impl App {
                     }
                 }
             }
+            MenuAction::SelectLayer(layer_id) => {
+                let deselected = self.item_selection.take().is_some();
+                if self.engine.select_layer(&layer_id) {
+                    info!("active layer: {layer_id}");
+                }
+                if deselected {
+                    self.rebuild();
+                }
+                self.render();
+            }
+            MenuAction::AddLayer => {
+                let deselected = self.item_selection.take().is_some();
+                let messages = self.engine.add_layer();
+                if !messages.is_empty() {
+                    self.web.send_all(messages);
+                }
+                if deselected {
+                    self.rebuild();
+                }
+                self.render();
+            }
+            MenuAction::DeleteLayer(layer_id) => {
+                let count = self.engine.layer_item_count(&layer_id);
+                let can_undo = self.engine.can_undo();
+                let can_redo = self.engine.can_redo();
+                if layer_delete_requires_confirmation(count, can_undo, can_redo) {
+                    let name = self
+                        .engine
+                        .layers()
+                        .into_iter()
+                        .find(|layer| layer.layer_id == layer_id)
+                        .map_or_else(|| "現在のレイヤー".to_owned(), |layer| layer.name);
+                    let prompt = format!("{name} を削除しますか？\n\nこのレイヤーの描画 {count} 件と Undo/Redo 履歴が削除されます。\nこの操作は元に戻せません。");
+                    if !crate::win::confirm(hwnd, &prompt) {
+                        return false;
+                    }
+                }
+                let deselected = self.item_selection.take().is_some();
+                let messages = self.engine.delete_layer(&layer_id);
+                let changed = !messages.is_empty();
+                if changed {
+                    self.web.send_all(messages);
+                }
+                if deselected || changed {
+                    self.rebuild();
+                    self.render();
+                }
+            }
             MenuAction::Undo => {
                 let deselected = self.item_selection.take().is_some();
                 let msgs = self.engine.undo();
@@ -719,6 +773,8 @@ impl App {
         }
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
+        let layers = self.engine.shared_layers();
+        let layers = layers.lock().unwrap();
         let visible = if self.local_echo { &items[..] } else { &[] };
         let selected_item = self
             .item_selection
@@ -737,8 +793,9 @@ impl App {
             .as_mut()
             .ok_or_else(|| anyhow!("renderer is unavailable"))
             .and_then(|renderer| {
-                renderer.draw_frame(visible, self.draw_mode, selected_item, radial)
+                renderer.draw_frame(&layers, visible, self.draw_mode, selected_item, radial)
             });
+        drop(layers);
         drop(items);
         if let Err(error) = result {
             self.recover_renderer("draw_frame", error);
@@ -751,18 +808,40 @@ impl App {
         }
         let items = self.engine.shared_items();
         let items = items.lock().unwrap();
-        let excluded = self
-            .item_selection
-            .as_ref()
-            .map(|selection| selection.item.item_id());
+        let layers = self.engine.shared_layers();
+        let layers = layers.lock().unwrap();
         let result = self
             .renderer
             .as_mut()
             .ok_or_else(|| anyhow!("renderer is unavailable"))
-            .and_then(|renderer| renderer.rebuild_baked_prefix(&items, excluded));
+            .and_then(|renderer| renderer.rebuild_layered_baked(&layers, &items));
+        drop(layers);
         drop(items);
         if let Err(error) = result {
             self.recover_renderer("rebuild_baked", error);
+        }
+    }
+
+    /// 選択開始では対象レイヤーだけをprefix cacheへ切り替える。完成cacheを持つ
+    /// 他レイヤーは再生しないため、大きな別レイヤーがdrag frameへ影響しない。
+    fn prepare_item_transform(&mut self, item_id: &str) {
+        if !self.local_echo {
+            return;
+        }
+        let items = self.engine.shared_items();
+        let items = items.lock().unwrap();
+        let layers = self.engine.shared_layers();
+        let layers = layers.lock().unwrap();
+        let result = self
+            .renderer
+            .as_mut()
+            .ok_or_else(|| anyhow!("renderer is unavailable"))
+            .and_then(|renderer| renderer.prepare_layer_transform(&layers, &items, item_id))
+            .map(|_| ());
+        drop(layers);
+        drop(items);
+        if let Err(error) = result {
+            self.recover_renderer("prepare_item_transform", error);
         }
     }
 
@@ -775,11 +854,14 @@ impl App {
         let Some(item) = items.iter().rfind(|item| item.is_done()) else {
             return;
         };
+        let layers = self.engine.shared_layers();
+        let layers = layers.lock().unwrap();
         let result = self
             .renderer
             .as_mut()
             .ok_or_else(|| anyhow!("renderer is unavailable"))
-            .and_then(|renderer| renderer.bake_item(item));
+            .and_then(|renderer| renderer.bake_layer_item(&layers, item));
+        drop(layers);
         drop(items);
         if let Err(error) = result {
             self.recover_renderer("bake_item", error);
@@ -817,6 +899,7 @@ impl App {
             let snapshot = shared.lock().unwrap().clone();
             snapshot
         };
+        let layers = self.engine.layers();
         let mut renderer = Renderer::new(
             self.overlay_hwnd,
             self.monitor.width as u32,
@@ -825,13 +908,13 @@ impl App {
             &self.stamps,
         )?;
         if self.local_echo {
-            let excluded = self
-                .item_selection
-                .as_ref()
-                .map(|selection| selection.item.item_id());
-            renderer.rebuild_baked_prefix(&items, excluded)?;
+            renderer.rebuild_layered_baked(&layers, &items)?;
+            if let Some(selected) = self.item_selection.as_ref() {
+                let _ =
+                    renderer.prepare_layer_transform(&layers, &items, selected.item.item_id())?;
+            }
         } else {
-            renderer.rebuild_baked(&[])?;
+            renderer.rebuild_layered_baked(&layers, &[])?;
         }
         if self.draw_mode {
             let visible = if self.local_echo { &items[..] } else { &[] };
@@ -847,7 +930,7 @@ impl App {
                     self.stamps.as_slice(),
                 )
             });
-            renderer.draw_frame(visible, true, selected_item, radial)?;
+            renderer.draw_frame(&layers, visible, true, selected_item, radial)?;
         } else {
             renderer.clear_frame()?;
         }
@@ -1193,6 +1276,7 @@ impl App {
         let Some(interaction) = TransformInteraction::begin(&item, handle, (u, v), aspect) else {
             return;
         };
+        let selected_item_id = item.item_id().to_owned();
         if !self.engine.begin_item_transform(item.item_id(), aspect) {
             return;
         }
@@ -1208,7 +1292,7 @@ impl App {
             }),
         });
         if changed_selection {
-            self.rebuild();
+            self.prepare_item_transform(&selected_item_id);
         }
         if let Err(error) = hotkey::register_transform_escape(hwnd) {
             warn!("failed to register transform Escape hotkey: {error:#}");
@@ -1355,14 +1439,21 @@ impl App {
             self.monitor.height as u32,
             self.stamps.len(),
         );
-        self.radial_menu = Some(RadialMenu::new(
+        let layers = self.radial_layer_entries();
+        self.radial_menu = Some(RadialMenu::new_with_layers(
             pointer_id,
             screen,
             local,
             (self.monitor.width as u32, self.monitor.height as u32),
             scale,
             self.stamps.len(),
-            (self.engine.can_undo(), self.engine.can_redo()),
+            (
+                self.engine.can_undo(),
+                self.engine.can_redo(),
+                self.engine.has_items(),
+            ),
+            layers,
+            self.engine.active_layer_id().to_owned(),
         ));
         self.render();
     }
@@ -1450,13 +1541,34 @@ impl App {
     fn sync_radial_history(&mut self) {
         let can_undo = self.engine.can_undo();
         let can_redo = self.engine.can_redo();
-        if self
-            .radial_menu
-            .as_mut()
-            .is_some_and(|menu| menu.set_history_availability(can_undo, can_redo))
-        {
+        let can_clear = self.engine.has_items();
+        let layers = self.radial_layer_entries();
+        let active_layer_id = self.engine.active_layer_id().to_owned();
+        let changed = self.radial_menu.as_mut().is_some_and(|menu| {
+            let commands = menu.set_command_availability(can_undo, can_redo, can_clear);
+            let layers = menu.set_layers(layers, active_layer_id);
+            commands || layers
+        });
+        if changed {
             self.render();
         }
+    }
+
+    fn radial_layer_entries(&self) -> Vec<RadialLayerEntry> {
+        let layers = self.engine.layers();
+        let items = self.engine.shared_items();
+        let items = items.lock().unwrap();
+        layers
+            .into_iter()
+            .map(|layer| RadialLayerEntry {
+                item_count: items
+                    .iter()
+                    .filter(|item| item.layer_id() == layer.layer_id)
+                    .count(),
+                layer_id: layer.layer_id,
+                name: layer.name,
+            })
+            .collect()
     }
 
     fn on_pointer_down(&mut self, hwnd: HWND, pointer_id: u32, lparam: LPARAM) {
@@ -1651,13 +1763,33 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
                 app.stamps.clone(),
                 app.engine.can_undo(),
                 app.engine.can_redo(),
+                app.engine.layers(),
+                app.radial_layer_entries()
+                    .into_iter()
+                    .map(|layer| layer.item_count)
+                    .collect::<Vec<_>>(),
+                app.engine.active_layer_id().to_owned(),
             )
         })
     };
-    let Some((tool, color, stamps, can_undo, can_redo)) = menu_input else {
+    let Some((tool, color, stamps, can_undo, can_redo, layers, layer_counts, active_layer_id)) =
+        menu_input
+    else {
         return;
     };
-    let action = menu::show(hwnd, &tool, &color, &stamps, can_undo, can_redo);
+    let action = menu::show(
+        hwnd,
+        &tool,
+        &color,
+        &stamps,
+        menu::LayerMenuState {
+            layers: &layers,
+            item_counts: &layer_counts,
+            active_layer_id: &active_layer_id,
+        },
+        can_undo,
+        can_redo,
+    );
     apply_menu_result(hwnd, app_ptr, action);
 }
 
@@ -1983,6 +2115,14 @@ mod tests {
             height: 1080,
             primary,
         }
+    }
+
+    #[test]
+    fn layer_delete_confirms_for_items_or_any_history() {
+        assert!(!layer_delete_requires_confirmation(0, false, false));
+        assert!(layer_delete_requires_confirmation(1, false, false));
+        assert!(layer_delete_requires_confirmation(0, true, false));
+        assert!(layer_delete_requires_confirmation(0, false, true));
     }
 
     #[test]

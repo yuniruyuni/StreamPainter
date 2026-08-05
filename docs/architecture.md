@@ -21,8 +21,8 @@ OBS Browser Source / Canvas 2D
 
 UIスレッドからハブへの送信は上限1,024件のchannelへの短いenqueueだけです。HTTP、JSON送信、
 遅いBrowser Sourceを待つ処理はUIスレッドで行いません。万一入力上限へ達した場合は、
-個別イベントを欠落させたままにせず、UI側の完全なCanvas状態へ世代付きで置換して全接続を
-snapshot再同期します。完全履歴の複製はこの異常復旧時だけ発生します。
+個別イベントを欠落させたままにせず、UI側のレイヤーカタログと完全なCanvasItem状態を1つの
+documentとして世代付きで置換し、全接続をsnapshot再同期します。完全履歴の複製はこの異常復旧時だけ発生します。
 
 OBSプロジェクターを開く単発のobs-websocket処理もworker threadで実行します。各要求は世代IDと
 UI／worker共通の5秒絶対deadlineを持ち、接続・認証・モニター取得・起動要求の各段階でtimeoutを
@@ -35,9 +35,9 @@ UI／worker共通の5秒絶対deadlineを持ち、接続・認証・モニター
 ハブは専用ランタイム上で全コマンドを直列処理します。これにより、接続処理と描画イベント
 の順序が一意になり、snapshotと増分イベントの競合を避けます。
 
-- 新規接続: 現在の全CanvasItemをsnapshotとして最初に送信
+- 新規接続: 現在の1〜8枚のレイヤーカタログと全CanvasItemをsnapshotとして最初に送信
 - 通常描画: `stroke_*`、`shape_*`、`stamp_add`、legacy互換の`stamp_move_*`、
-  `item_transform_*`、`undo`、`redo`、`clear` を増分配信
+  `item_transform_*`、`layer_add`、`layer_delete`、`undo`、`redo`、`clear` を増分配信
 - 再接続: 古いクライアント状態をsnapshotで全置換
 - backpressure: 各接続は256メッセージの上限を持つ
 - 遅延時: 接続をハブから除外し、Browser Source側の再接続に任せる
@@ -51,12 +51,13 @@ CanvasItemは合計500個、ストローク点は合計200,000点・1本10,000�
 アイテムを削除する必要が生じた場合は増分ではなくsnapshotを送り、全クライアントを再同期
 します。増分イベントにはrevisionを付け、欠落を検出したoverlayは再接続snapshotで復旧します。
 
-ローカルDirect2DとBrowser SourceのCanvas 2Dは、通常の確定操作では新しい1項目だけを
-bakedレイヤーへ追記します。全履歴の再構築はUndo、item transform、Clear、上限トリム、
-再接続snapshot、キャンバスのリサイズ時に限定します。図形／スタンプのtransform中はネイティブ側の
-対象より前の履歴をprefixとしてcacheし、対象と後続履歴を元の順序で即時再合成します。最新状態だけを
+ローカルDirect2DとBrowser SourceのCanvas 2Dは、レイヤーごとの完成cacheを持ち、通常の確定操作では
+新しい1項目を所属レイヤーだけへ追記して最大8枚のbitmapを再合成します。全履歴の再構築はUndo、
+レイヤー削除、Clear、上限トリム、再接続snapshot、キャンバスのリサイズ時に限定します。
+図形／スタンプのtransform中はネイティブ側の対象レイヤーだけで対象より前の履歴をprefixとしてcacheし、
+対象と同じレイヤーの後続履歴だけを元の順序で即時再合成します。他レイヤーは完成bitmapのままです。最新状態だけを
 16ms間隔（約60fps）の`item_transform_preview`として送り、Browser Source側も開始時に同じprefixを
-offscreen cacheへ構築して、対象以降だけを同一canvasへ履歴順に再合成します。後続eraserがprefixにも
+offscreen cacheへ構築して、同じレイヤーの対象以降だけを同一canvasへ履歴順に再合成します。後続eraserがprefixにも
 作用するため、previewと確定後の前後関係・alpha合成は一致します。同一描画フレーム内の更新は最新状態へ
 畳み込み、確定状態は`item_transform_commit`としてポインタを離した時点で即時送信します。
 

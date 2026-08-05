@@ -10,6 +10,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::StampConfig;
+use crate::protocol::{CanvasLayer, MAX_LAYERS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrawTool {
@@ -42,6 +43,9 @@ pub const COLORS: [(&str, &str); 10] = [
 pub enum MenuAction {
     SelectTool(DrawTool),
     SelectColor(&'static str),
+    SelectLayer(String),
+    AddLayer,
+    DeleteLayer(String),
     Undo,
     Redo,
     Clear,
@@ -62,6 +66,9 @@ const ID_CLEAR: usize = 22;
 const ID_EXIT: usize = 30;
 const ID_COLOR_BASE: usize = 100;
 const ID_STAMP_BASE: usize = 1000;
+const ID_LAYER_ADD: usize = 2000;
+const ID_LAYER_DELETE: usize = 2001;
+const ID_LAYER_BASE: usize = 2100;
 
 fn checked(flag: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
     if flag {
@@ -90,15 +97,27 @@ fn append(
     }
 }
 
+pub struct LayerMenuState<'a> {
+    pub layers: &'a [CanvasLayer],
+    pub item_counts: &'a [usize],
+    pub active_layer_id: &'a str,
+}
+
 /// メニューを表示し、選択されたアクションを返す (選択なしは None)
 pub fn show(
     hwnd: HWND,
     tool: &DrawTool,
     color: &str,
     stamps: &[StampConfig],
+    layer_state: LayerMenuState<'_>,
     can_undo: bool,
     can_redo: bool,
 ) -> Option<MenuAction> {
+    let LayerMenuState {
+        layers,
+        item_counts: layer_item_counts,
+        active_layer_id,
+    } = layer_state;
     // TrackPopupMenu の内部メッセージループ中に通常の projector timer が動いても、
     // overlay をこの popup より前へ移動させない。
     let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();
@@ -170,6 +189,36 @@ pub fn show(
                 &HSTRING::from("スタンプ"),
             );
         }
+        let layer_menu = CreatePopupMenu().ok()?;
+        for (index, layer) in layers.iter().enumerate().rev() {
+            let count = layer_item_counts.get(index).copied().unwrap_or_default();
+            let label = format!("{} ({count})", layer.name.replace('&', "&&"));
+            append(
+                layer_menu,
+                checked(layer.layer_id == active_layer_id),
+                ID_LAYER_BASE + index,
+                &label,
+            );
+        }
+        let _ = AppendMenuW(layer_menu, MF_SEPARATOR, 0, None);
+        append(
+            layer_menu,
+            enabled(layers.len() < MAX_LAYERS),
+            ID_LAYER_ADD,
+            "新規レイヤー",
+        );
+        append(
+            layer_menu,
+            enabled(layers.len() > 1),
+            ID_LAYER_DELETE,
+            "現在のレイヤーを削除...",
+        );
+        let _ = AppendMenuW(
+            root,
+            MF_POPUP,
+            layer_menu.0 as usize,
+            &HSTRING::from("レイヤー"),
+        );
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
 
         let palette = CreatePopupMenu().ok()?;
@@ -216,12 +265,19 @@ pub fn show(
             ID_UNDO => Some(MenuAction::Undo),
             ID_REDO => Some(MenuAction::Redo),
             ID_CLEAR => Some(MenuAction::Clear),
+            ID_LAYER_ADD if layers.len() < MAX_LAYERS => Some(MenuAction::AddLayer),
+            ID_LAYER_DELETE if layers.len() > 1 => {
+                Some(MenuAction::DeleteLayer(active_layer_id.to_owned()))
+            }
             ID_EXIT => Some(MenuAction::Exit),
             id if (ID_COLOR_BASE..ID_COLOR_BASE + COLORS.len()).contains(&id) => {
                 Some(MenuAction::SelectColor(COLORS[id - ID_COLOR_BASE].1))
             }
             id if (ID_STAMP_BASE..ID_STAMP_BASE + stamps.len()).contains(&id) => Some(
                 MenuAction::SelectTool(DrawTool::Stamp(stamps[id - ID_STAMP_BASE].id.clone())),
+            ),
+            id if (ID_LAYER_BASE..ID_LAYER_BASE + layers.len()).contains(&id) => Some(
+                MenuAction::SelectLayer(layers[id - ID_LAYER_BASE].layer_id.clone()),
             ),
             _ => None,
         }

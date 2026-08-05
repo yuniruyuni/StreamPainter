@@ -16,6 +16,7 @@ const brush: Brush = {
 function stroke(id: string, pointCount: number): Stroke {
   return {
     strokeId: id,
+    layerId: "default",
     brush,
     pts: Array.from({ length: pointCount }, (_, index) => [
       index / 100,
@@ -34,6 +35,7 @@ function stamp(index: number): CanvasItem {
   return {
     kind: "stamp",
     itemId: `item-${index}`,
+    layerId: "default",
     stampId: "stamp-1",
     center: [0.5, 0.5],
     widthN: 0.1,

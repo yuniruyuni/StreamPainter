@@ -165,6 +165,7 @@ function snapshot(
     protocolVersion,
     rev: 0,
     fadeAfterMs: null,
+    layers: [{ layerId: "default", name: "レイヤー 1" }],
     items,
   });
 }
@@ -175,6 +176,7 @@ function stampItem(itemId: string): CanvasItem {
   return {
     kind: "stamp",
     itemId,
+    layerId: "default",
     stampId: "stamp-1",
     center: [0.5, 0.5],
     widthN: 0.1,

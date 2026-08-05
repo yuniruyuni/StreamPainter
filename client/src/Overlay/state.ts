@@ -3,6 +3,7 @@
 
 import type {
   CanvasItem,
+  CanvasLayer,
   ItemTransform,
   ServerToOverlayMessage,
   ShapeItem,
@@ -10,7 +11,10 @@ import type {
   Stroke,
 } from "~/protocol";
 import {
+  DEFAULT_LAYER,
+  DEFAULT_LAYER_ID,
   MAX_ITEMS,
+  MAX_LAYERS,
   MAX_STROKE_POINTS,
   MAX_TOTAL_POINTS,
   MIN_COMPATIBLE_PROTOCOL_VERSION,
@@ -35,10 +39,12 @@ export type RenderEffect =
   | { kind: "resync" };
 
 export class OverlayState {
+  layers: CanvasLayer[] = [{ ...DEFAULT_LAYER }];
   items: CanvasItem[] = [];
   fadeAfterMs: number | null = null;
   rev = 0;
   private synchronized = false;
+  private sessionProtocolVersion: number | null = null;
   private movingStampId: string | null = null;
   private transformingItemId: string | null = null;
 
@@ -54,10 +60,12 @@ export class OverlayState {
 
   /** 長期切断時に古い履歴を捨て、次のsnapshot受理まで増分を拒否する。 */
   reset(): void {
+    this.layers = [{ ...DEFAULT_LAYER }];
     this.items = [];
     this.fadeAfterMs = null;
     this.rev = 0;
     this.synchronized = false;
+    this.sessionProtocolVersion = null;
     this.movingStampId = null;
     this.transformingItemId = null;
   }
@@ -75,14 +83,25 @@ export class OverlayState {
         protocolVersion > PROTOCOL_VERSION
       ) {
         this.synchronized = false;
+        this.sessionProtocolVersion = null;
         this.movingStampId = null;
         this.transformingItemId = null;
         return { kind: "resync" };
       }
-      this.items = msg.items;
+      const document = migrateSnapshot(protocolVersion, msg.layers, msg.items);
+      if (!document) {
+        this.synchronized = false;
+        this.sessionProtocolVersion = null;
+        this.movingStampId = null;
+        this.transformingItemId = null;
+        return { kind: "resync" };
+      }
+      this.layers = document.layers;
+      this.items = document.items;
       this.fadeAfterMs = msg.fadeAfterMs;
       this.rev = msg.rev;
       this.synchronized = true;
+      this.sessionProtocolVersion = protocolVersion;
       this.movingStampId = null;
       this.transformingItemId = null;
       return { kind: "rebuild" };
@@ -90,6 +109,7 @@ export class OverlayState {
 
     if (!this.synchronized || msg.rev !== this.rev + 1) {
       this.synchronized = false;
+      this.sessionProtocolVersion = null;
       this.movingStampId = null;
       this.transformingItemId = null;
       return { kind: "resync" };
@@ -98,12 +118,17 @@ export class OverlayState {
 
     switch (msg.type) {
       case "stroke_begin": {
+        const layerId = this.compatibleLayerId(
+          (msg as { layerId?: unknown }).layerId,
+        );
+        if (!layerId) return this.resync();
         if (this.items.some((item) => canvasItemId(item) === msg.strokeId)) {
           return { kind: "none" };
         }
         const item: Extract<CanvasItem, { kind: "stroke" }> = {
           kind: "stroke",
           strokeId: msg.strokeId,
+          layerId,
           brush: msg.brush,
           pts: [],
           done: false,
@@ -142,12 +167,16 @@ export class OverlayState {
           : { kind: "cancel", strokeId: msg.strokeId };
       }
       case "shape_begin": {
+        const layerId = this.compatibleLayerId(
+          (msg.shape as ShapeItem & { layerId?: unknown }).layerId,
+        );
+        if (!layerId) return this.resync();
         if (
           this.items.some((item) => canvasItemId(item) === msg.shape.itemId)
         ) {
           return { kind: "none" };
         }
-        this.items.push({ kind: "shape", ...msg.shape });
+        this.items.push({ kind: "shape", ...msg.shape, layerId });
         return this.trim() ? { kind: "rebuild" } : { kind: "preview" };
       }
       case "shape_update": {
@@ -174,12 +203,16 @@ export class OverlayState {
         return { kind: "preview" };
       }
       case "stamp_add": {
+        const layerId = this.compatibleLayerId(
+          (msg.stamp as StampItem & { layerId?: unknown }).layerId,
+        );
+        if (!layerId) return this.resync();
         if (
           this.items.some((item) => canvasItemId(item) === msg.stamp.itemId)
         ) {
           return { kind: "none" };
         }
-        const stamp: StampItem = { ...msg.stamp, done: true };
+        const stamp: StampItem = { ...msg.stamp, layerId, done: true };
         const item: CanvasItem = { kind: "stamp", ...stamp };
         this.items.push(item);
         return this.trim() ? { kind: "rebuild" } : { kind: "bake_item", item };
@@ -224,6 +257,35 @@ export class OverlayState {
         this.movingStampId = null;
         return { kind: "rebuild" };
       }
+      case "layer_add": {
+        if (this.sessionProtocolVersion !== PROTOCOL_VERSION) {
+          return this.resync();
+        }
+        if (
+          this.layers.length >= MAX_LAYERS ||
+          !validLayer(msg.layer) ||
+          this.hasLayer(msg.layer.layerId)
+        ) {
+          return this.resync();
+        }
+        this.layers.push(msg.layer);
+        return { kind: "none" };
+      }
+      case "layer_delete": {
+        if (this.sessionProtocolVersion !== PROTOCOL_VERSION) {
+          return this.resync();
+        }
+        if (this.layers.length <= 1 || !this.hasLayer(msg.layerId)) {
+          return this.resync();
+        }
+        this.layers = this.layers.filter(
+          (layer) => layer.layerId !== msg.layerId,
+        );
+        this.items = this.items.filter((item) => item.layerId !== msg.layerId);
+        this.movingStampId = null;
+        this.transformingItemId = null;
+        return { kind: "rebuild" };
+      }
       case "undo": {
         this.movingStampId = null;
         this.transformingItemId = null;
@@ -241,6 +303,10 @@ export class OverlayState {
       case "redo": {
         this.movingStampId = null;
         this.transformingItemId = null;
+        const layerId = this.compatibleLayerId(
+          (msg.item as CanvasItem & { layerId?: unknown }).layerId,
+        );
+        if (!layerId) return this.resync();
         if (
           !msg.item.done ||
           this.items.some(
@@ -249,10 +315,9 @@ export class OverlayState {
         ) {
           return { kind: "none" };
         }
-        this.items.push(msg.item);
-        return this.trim()
-          ? { kind: "rebuild" }
-          : { kind: "bake_item", item: msg.item };
+        const item = { ...msg.item, layerId } as CanvasItem;
+        this.items.push(item);
+        return this.trim() ? { kind: "rebuild" } : { kind: "bake_item", item };
       }
       case "clear": {
         this.movingStampId = null;
@@ -315,6 +380,30 @@ export class OverlayState {
     );
   }
 
+  private hasLayer(layerId: string): boolean {
+    return this.layers.some((layer) => layer.layerId === layerId);
+  }
+
+  private compatibleLayerId(layerId: unknown): string | null {
+    const compatible =
+      layerId === undefined &&
+      this.sessionProtocolVersion !== null &&
+      this.sessionProtocolVersion < 8
+        ? DEFAULT_LAYER_ID
+        : layerId;
+    return typeof compatible === "string" && this.hasLayer(compatible)
+      ? compatible
+      : null;
+  }
+
+  private resync(): RenderEffect {
+    this.synchronized = false;
+    this.sessionProtocolVersion = null;
+    this.movingStampId = null;
+    this.transformingItemId = null;
+    return { kind: "resync" };
+  }
+
   // ローカルハブと同じトリム規則。確定項目を捨てたら true (要 rebuild)。
   private trim(): boolean {
     let dropped = false;
@@ -340,6 +429,47 @@ export class OverlayState {
     if (index === -1) return null;
     return this.items.splice(index, 1)[0] ?? null;
   }
+}
+
+function validLayer(layer: CanvasLayer): boolean {
+  return (
+    typeof layer.layerId === "string" &&
+    layer.layerId.length > 0 &&
+    typeof layer.name === "string" &&
+    layer.name.trim().length > 0
+  );
+}
+
+function migrateSnapshot(
+  protocolVersion: number,
+  incomingLayers: CanvasLayer[] | undefined,
+  incomingItems: CanvasItem[],
+): { layers: CanvasLayer[]; items: CanvasItem[] } | null {
+  const layers =
+    protocolVersion < 8 && incomingLayers === undefined
+      ? [{ ...DEFAULT_LAYER }]
+      : incomingLayers;
+  if (
+    !layers ||
+    layers.length === 0 ||
+    layers.length > MAX_LAYERS ||
+    layers.some((layer) => !validLayer(layer)) ||
+    new Set(layers.map((layer) => layer.layerId)).size !== layers.length
+  ) {
+    return null;
+  }
+  const validIds = new Set(layers.map((layer) => layer.layerId));
+  const items: CanvasItem[] = [];
+  for (const item of incomingItems) {
+    const rawLayerId = (item as CanvasItem & { layerId?: unknown }).layerId;
+    const layerId =
+      rawLayerId === undefined && protocolVersion < 8
+        ? DEFAULT_LAYER_ID
+        : rawLayerId;
+    if (typeof layerId !== "string" || !validIds.has(layerId)) return null;
+    items.push({ ...item, layerId } as CanvasItem);
+  }
+  return { layers: layers.map((layer) => ({ ...layer })), items };
 }
 
 function applyTransform(item: CanvasItem, transform: ItemTransform): void {

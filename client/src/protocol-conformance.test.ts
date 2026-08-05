@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type {
   Brush,
   CanvasItem,
+  CanvasLayer,
   LineStyle,
   ServerToOverlayMessage,
   ShapeKind,
@@ -11,6 +12,7 @@ import type {
 } from "~/protocol";
 import {
   MAX_ITEMS,
+  MAX_LAYERS,
   MAX_POINTS_PER_MESSAGE,
   MAX_STROKE_POINTS,
   MAX_TOTAL_POINTS,
@@ -46,15 +48,24 @@ const SERVER_MESSAGE_TYPES = [
   "stamp_move",
   "item_transform_preview",
   "item_transform_commit",
+  "layer_add",
+  "layer_delete",
   "undo",
   "redo",
   "clear",
 ] as const satisfies readonly MessageType[];
 
 const MESSAGE_FIELDS = {
-  snapshot: ["fadeAfterMs", "items", "protocolVersion", "rev", "type"],
+  snapshot: [
+    "fadeAfterMs",
+    "items",
+    "layers",
+    "protocolVersion",
+    "rev",
+    "type",
+  ],
   pong: ["t", "type"],
-  stroke_begin: ["brush", "rev", "strokeId", "type"],
+  stroke_begin: ["brush", "layerId", "rev", "strokeId", "type"],
   stroke_points: ["pts", "rev", "strokeId", "type"],
   stroke_end: ["endedAt", "rev", "strokeId", "type"],
   stroke_cancel: ["rev", "strokeId", "type"],
@@ -67,6 +78,8 @@ const MESSAGE_FIELDS = {
   stamp_move: ["center", "itemId", "rev", "type"],
   item_transform_preview: ["itemId", "rev", "transform", "type"],
   item_transform_commit: ["itemId", "rev", "transform", "type"],
+  layer_add: ["layer", "rev", "type"],
+  layer_delete: ["layerId", "rev", "type"],
   undo: ["rev", "type"],
   redo: ["item", "rev", "type"],
   clear: ["rev", "type"],
@@ -83,7 +96,16 @@ const OBJECT_FIELDS = {
     "tool",
     "widthN",
   ],
-  strokeItem: ["brush", "done", "endedAt", "kind", "pts", "strokeId"],
+  strokeItem: [
+    "brush",
+    "done",
+    "endedAt",
+    "kind",
+    "layerId",
+    "pts",
+    "strokeId",
+  ],
+  layer: ["layerId", "name"],
   lineStyle: ["color", "opacity", "widthN"],
   shapeItem: [
     "done",
@@ -91,6 +113,7 @@ const OBJECT_FIELDS = {
     "endedAt",
     "itemId",
     "kind",
+    "layerId",
     "shape",
     "start",
     "style",
@@ -103,6 +126,7 @@ const OBJECT_FIELDS = {
     "heightN",
     "itemId",
     "kind",
+    "layerId",
     "opacity",
     "rotation",
     "stampId",
@@ -137,6 +161,7 @@ type ExtraMessageField = {
 }[MessageType];
 type ObjectTypes = {
   brush: Brush;
+  layer: CanvasLayer;
   strokeItem: Extract<CanvasItem, { kind: "stroke" }>;
   lineStyle: LineStyle;
   shapeItem: Extract<CanvasItem, { kind: "shape" }>;
@@ -174,6 +199,7 @@ const canvasKindCoverage: Assert<
 
 interface ExpectedState {
   rev: number;
+  layers: CanvasLayer[];
   items: CanvasItem[];
 }
 
@@ -220,6 +246,7 @@ interface ProtocolFixture {
     maxTotalPoints: number;
     maxStrokePoints: number;
     maxPointsPerMessage: number;
+    maxLayers: number;
   };
   serverMessageTypes: string[];
   messageFields: Record<string, string[]>;
@@ -375,12 +402,20 @@ function validateStrokeItem(value: unknown, label: string): void {
   expectExactFields(stroke, OBJECT_FIELDS.strokeItem, label);
   expectEnum(stroke.kind, ["stroke"], `${label}.kind`);
   expectString(stroke.strokeId, `${label}.strokeId`);
+  expectString(stroke.layerId, `${label}.layerId`);
   validateBrush(stroke.brush, `${label}.brush`);
   expectArray(stroke.pts, `${label}.pts`).forEach((point, index) => {
     expectNumberTuple(point, 6, `${label}.pts[${index}]`);
   });
   expectBoolean(stroke.done, `${label}.done`);
   expectNullableNumber(stroke.endedAt, `${label}.endedAt`);
+}
+
+function validateLayer(value: unknown, label: string): void {
+  const layer = expectObject(value, label);
+  expectExactFields(layer, OBJECT_FIELDS.layer, label);
+  expectString(layer.layerId, `${label}.layerId`);
+  expectString(layer.name, `${label}.name`);
 }
 
 function validateShapeItem(
@@ -398,6 +433,7 @@ function validateShapeItem(
   expectExactFields(shape, fields, label);
   if (canvasItem) expectEnum(shape.kind, ["shape"], `${label}.kind`);
   expectString(shape.itemId, `${label}.itemId`);
+  expectString(shape.layerId, `${label}.layerId`);
   expectEnum(shape.shape, SHAPE_KINDS, `${label}.shape`);
   validateLineStyle(shape.style, `${label}.style`);
   expectNumberTuple(shape.start, 2, `${label}.start`);
@@ -424,6 +460,7 @@ function validateStampItem(
   expectExactFields(stamp, fields, label);
   if (canvasItem) expectEnum(stamp.kind, ["stamp"], `${label}.kind`);
   expectString(stamp.itemId, `${label}.itemId`);
+  expectString(stamp.layerId, `${label}.layerId`);
   expectString(stamp.stampId, `${label}.stampId`);
   expectNumberTuple(stamp.center, 2, `${label}.center`);
   expectFiniteNumber(stamp.widthN, `${label}.widthN`);
@@ -475,6 +512,9 @@ function decodeServerMessage(value: unknown): ServerToOverlayMessage {
       );
       expectUnsignedInteger(message.rev, "snapshot.rev");
       expectNullableNumber(message.fadeAfterMs, "snapshot.fadeAfterMs");
+      expectArray(message.layers, "snapshot.layers").forEach((layer, index) => {
+        validateLayer(layer, `snapshot.layers[${index}]`);
+      });
       expectArray(message.items, "snapshot.items").forEach((item, index) => {
         validateCanvasItem(item, `snapshot.items[${index}]`);
       });
@@ -484,6 +524,7 @@ function decodeServerMessage(value: unknown): ServerToOverlayMessage {
       break;
     case "stroke_begin":
       expectString(message.strokeId, "stroke_begin.strokeId");
+      expectString(message.layerId, "stroke_begin.layerId");
       validateBrush(message.brush, "stroke_begin.brush");
       break;
     case "stroke_points":
@@ -530,6 +571,12 @@ function decodeServerMessage(value: unknown): ServerToOverlayMessage {
       expectString(message.itemId, `${type}.itemId`);
       validateItemTransform(message.transform, `${type}.transform`);
       break;
+    case "layer_add":
+      validateLayer(message.layer, "layer_add.layer");
+      break;
+    case "layer_delete":
+      expectString(message.layerId, "layer_delete.layerId");
+      break;
     case "undo":
     case "clear":
       break;
@@ -575,6 +622,7 @@ const fixtureBrush: Brush = {
 };
 const fixtureStamp = (id: string): StampItem => ({
   itemId: id,
+  layerId: "default",
   stampId: "fixture-stamp",
   center: [0.45, 0.55],
   widthN: 0.1,
@@ -617,6 +665,7 @@ function buildTrimItems(initial: TrimInitial): CanvasItem[] {
       return Array.from({ length: initial.count }, (_, index) => ({
         kind: "stroke" as const,
         strokeId: paddedId(initial.idPrefix as string, index),
+        layerId: "default",
         brush: fixtureBrush,
         pts: fixturePoints(initial.pointsPerItem as number),
         done: true,
@@ -631,6 +680,7 @@ function buildTrimItems(initial: TrimInitial): CanvasItem[] {
         {
           kind: "stroke",
           strokeId: initial.id,
+          layerId: "default",
           brush: { ...fixtureBrush, tool: "marker" },
           pts: fixturePoints(initial.points),
           done: false,
@@ -662,6 +712,7 @@ describe("Rust / TypeScript protocol conformance", () => {
     expect(fixture.protocolVersion).toBe(PROTOCOL_VERSION);
     expect(fixture.limits).toEqual({
       maxItems: MAX_ITEMS,
+      maxLayers: MAX_LAYERS,
       maxPointsPerMessage: MAX_POINTS_PER_MESSAGE,
       maxStrokePoints: MAX_STROKE_POINTS,
       maxTotalPoints: MAX_TOTAL_POINTS,
@@ -687,6 +738,7 @@ describe("Rust / TypeScript protocol conformance", () => {
         type: "stroke_begin",
         rev: 41,
         strokeId: "invalid-brush",
+        layerId: "default",
         brush: {
           tool: "pen",
           color: "#4455aa",
@@ -739,9 +791,11 @@ describe("Rust / TypeScript protocol conformance", () => {
       expect(state.apply(decodeServerMessage(eventCase.message)).kind).not.toBe(
         "resync",
       );
-      expect({ rev: state.rev, items: state.items }).toEqual(
-        eventCase.expected,
-      );
+      expect({
+        rev: state.rev,
+        layers: state.layers,
+        items: state.items,
+      }).toEqual(eventCase.expected);
     });
   }
 
@@ -754,9 +808,11 @@ describe("Rust / TypeScript protocol conformance", () => {
       expect(state.apply(decodeServerMessage(revisionCase.message)).kind).toBe(
         revisionCase.expectedEffect,
       );
-      expect({ rev: state.rev, items: state.items }).toEqual(
-        revisionCase.expected,
-      );
+      expect({
+        rev: state.rev,
+        layers: state.layers,
+        items: state.items,
+      }).toEqual(revisionCase.expected);
     });
   }
 
@@ -770,6 +826,7 @@ describe("Rust / TypeScript protocol conformance", () => {
           protocolVersion: fixture.protocolVersion,
           rev: trimCase.initial.revision,
           fadeAfterMs: null,
+          layers: [{ layerId: "default", name: "レイヤー 1" }],
           items: initialItems,
         }).kind,
       ).toBe("rebuild");

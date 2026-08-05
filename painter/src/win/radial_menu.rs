@@ -2,6 +2,7 @@
 
 use std::f64::consts::{PI, TAU};
 
+use crate::protocol::MAX_LAYERS;
 use crate::win::menu::{DrawTool, MenuAction, COLORS};
 
 pub const DRAW_TOOL_COUNT: usize = 8;
@@ -23,6 +24,11 @@ const VIEWPORT_MARGIN: f32 = 8.0;
 const PIN_ANCHOR_TOLERANCE: f32 = 8.0;
 const COMMAND_TOTAL_WIDTH: f32 = COMMAND_WIDTH * 3.0 + COMMAND_GAP * 2.0;
 const LAYOUT_EPSILON: f32 = 0.01;
+const LAYER_PANEL_WIDTH: f32 = 184.0;
+const LAYER_PANEL_GAP: f32 = 14.0;
+const LAYER_HEADER_HEIGHT: f32 = 40.0;
+const LAYER_ROW_HEIGHT: f32 = 34.0;
+const LAYER_ACTION_SIZE: f32 = 30.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RadialCommand {
@@ -71,6 +77,9 @@ pub enum RadialSelection {
     Stamp(usize),
     Color(usize),
     Command(RadialCommand),
+    Layer(usize),
+    LayerAdd,
+    LayerDelete,
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,11 +121,23 @@ pub struct RadialMenu {
     stamp_mode: bool,
     can_undo: bool,
     can_redo: bool,
+    can_clear: bool,
+    layers: Vec<RadialLayerEntry>,
+    active_layer_id: String,
+    panel_on_right: bool,
     highlighted: Option<RadialSelection>,
     max_distance: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RadialLayerEntry {
+    pub layer_id: String,
+    pub name: String,
+    pub item_count: usize,
+}
+
 impl RadialMenu {
+    #[cfg(test)]
     pub fn new(
         pointer_id: u32,
         anchor_screen: (f64, f64),
@@ -126,13 +147,64 @@ impl RadialMenu {
         stamp_count: usize,
         history_available: (bool, bool),
     ) -> Self {
+        Self::new_with_layers(
+            pointer_id,
+            anchor_screen,
+            anchor_local,
+            surface_size,
+            scale,
+            stamp_count,
+            (
+                history_available.0,
+                history_available.1,
+                history_available.0,
+            ),
+            vec![RadialLayerEntry {
+                layer_id: "default".into(),
+                name: "レイヤー 1".into(),
+                item_count: 0,
+            }],
+            "default".into(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_layers(
+        pointer_id: u32,
+        anchor_screen: (f64, f64),
+        anchor_local: (f32, f32),
+        surface_size: (u32, u32),
+        scale: f32,
+        stamp_count: usize,
+        history_available: (bool, bool, bool),
+        layers: Vec<RadialLayerEntry>,
+        active_layer_id: String,
+    ) -> Self {
         let surface_size = (surface_size.0 as f32, surface_size.1 as f32);
-        let scale = fit_scale_for_layout(surface_size, scale, stamp_count);
+        let scale = fit_scale_for_layer_layout(surface_size, scale, stamp_count);
         let outer_radius = outer_radius_for_stamp_count(stamp_count, scale);
         let margin = VIEWPORT_MARGIN * scale;
+        let panel_width = LAYER_PANEL_WIDTH * scale;
+        let panel_gap = LAYER_PANEL_GAP * scale;
+        let panel_extent = outer_radius + panel_gap + panel_width;
+        let right_space = surface_size.0 - anchor_local.0 - margin;
+        let left_space = anchor_local.0 - margin;
+        let panel_on_right = right_space >= panel_extent || right_space >= left_space;
+        let (left_extent, right_extent) = if panel_on_right {
+            (outer_radius, panel_extent)
+        } else {
+            (panel_extent, outer_radius)
+        };
+        let vertical_extent = outer_radius.max(layer_panel_height(MAX_LAYERS, scale) / 2.0);
         let fitted_center_local = (
-            clamp_center(anchor_local.0, outer_radius, surface_size.0, margin),
-            clamp_center(anchor_local.1, outer_radius, surface_size.1, margin),
+            clamp_asymmetric(
+                anchor_local.0,
+                left_extent,
+                right_extent,
+                surface_size.0,
+                margin,
+            ),
+            clamp_center(anchor_local.1, vertical_extent, surface_size.1, margin),
         );
         let center_screen = (
             anchor_screen.0 + f64::from(fitted_center_local.0 - anchor_local.0),
@@ -150,6 +222,10 @@ impl RadialMenu {
             stamp_mode: false,
             can_undo: history_available.0,
             can_redo: history_available.1,
+            can_clear: history_available.2,
+            layers,
+            active_layer_id,
+            panel_on_right,
             highlighted: Some(RadialSelection::StandardMenu),
             max_distance: 0.0,
         }
@@ -207,13 +283,27 @@ impl RadialMenu {
             .highlighted
             .and_then(|item| self.selection_action(item))
         {
-            let keep_open = was_pinned && matches!(&action, MenuAction::Undo | MenuAction::Redo);
+            let keep_open = was_pinned
+                && matches!(
+                    &action,
+                    MenuAction::Undo
+                        | MenuAction::Redo
+                        | MenuAction::SelectLayer(_)
+                        | MenuAction::AddLayer
+                        | MenuAction::DeleteLayer(_)
+                );
             return RadialRelease::Action { action, keep_open };
         }
         if was_pinned
             && matches!(
                 self.highlighted,
-                Some(RadialSelection::StampCategory | RadialSelection::Command(_))
+                Some(
+                    RadialSelection::StampCategory
+                        | RadialSelection::Command(_)
+                        | RadialSelection::Layer(_)
+                        | RadialSelection::LayerAdd
+                        | RadialSelection::LayerDelete
+                )
             )
         {
             return RadialRelease::StayOpen;
@@ -261,6 +351,86 @@ impl RadialMenu {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    pub fn layers(&self) -> &[RadialLayerEntry] {
+        &self.layers
+    }
+
+    pub fn active_layer_id(&self) -> &str {
+        &self.active_layer_id
+    }
+
+    #[cfg(test)]
+    pub fn panel_on_right(&self) -> bool {
+        self.panel_on_right
+    }
+
+    pub fn layer_panel_rect(&self) -> RadialRect {
+        let width = LAYER_PANEL_WIDTH * self.scale;
+        let height = layer_panel_height(self.layers.len(), self.scale);
+        let gap = LAYER_PANEL_GAP * self.scale;
+        let (left, right) = if self.panel_on_right {
+            let left = self.center_local.0 + self.outer_radius() + gap;
+            (left, left + width)
+        } else {
+            let right = self.center_local.0 - self.outer_radius() - gap;
+            (right - width, right)
+        };
+        RadialRect {
+            left,
+            top: self.center_local.1 - height / 2.0,
+            right,
+            bottom: self.center_local.1 + height / 2.0,
+        }
+    }
+
+    pub fn layer_add_button(&self) -> RadialRect {
+        let panel = self.layer_panel_rect();
+        let size = LAYER_ACTION_SIZE * self.scale;
+        RadialRect {
+            left: panel.right - size - 5.0 * self.scale,
+            top: panel.top + 5.0 * self.scale,
+            right: panel.right - 5.0 * self.scale,
+            bottom: panel.top + 5.0 * self.scale + size,
+        }
+    }
+
+    /// 表示順（上レイヤーから）とmodel indexの対応。
+    pub fn layer_rows(&self) -> Vec<(usize, RadialRect)> {
+        let panel = self.layer_panel_rect();
+        (0..self.layers.len())
+            .map(|display_index| {
+                let index = self.layers.len() - 1 - display_index;
+                let top = panel.top
+                    + LAYER_HEADER_HEIGHT * self.scale
+                    + display_index as f32 * LAYER_ROW_HEIGHT * self.scale;
+                (
+                    index,
+                    RadialRect {
+                        left: panel.left,
+                        top,
+                        right: panel.right,
+                        bottom: top + LAYER_ROW_HEIGHT * self.scale,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    pub fn layer_delete_button(&self) -> Option<RadialRect> {
+        let (_, row) = self
+            .layer_rows()
+            .into_iter()
+            .find(|(index, _)| self.layers[*index].layer_id == self.active_layer_id)?;
+        let inset = 2.0 * self.scale;
+        let size = LAYER_ACTION_SIZE * self.scale;
+        Some(RadialRect {
+            left: row.right - size - inset,
+            top: row.top + inset,
+            right: row.right - inset,
+            bottom: row.top + inset + size,
+        })
     }
 
     pub fn tool_inner_radius(&self) -> f32 {
@@ -321,6 +491,13 @@ impl RadialMenu {
             && self.center_local.1 + outer <= maximum_y;
         let color_outer = self.color_outer_radius();
         circle_fits
+            && {
+                let panel = self.layer_panel_rect();
+                panel.left >= minimum
+                    && panel.top >= minimum
+                    && panel.right <= maximum_x
+                    && panel.bottom <= maximum_y
+            }
             && self.command_buttons().into_iter().all(|(_, rect)| {
                 rect.left >= minimum
                     && rect.top >= minimum
@@ -380,17 +557,33 @@ impl RadialMenu {
 
     pub fn command_enabled(&self, command: RadialCommand) -> bool {
         match command {
-            RadialCommand::Undo | RadialCommand::Clear => self.can_undo,
+            RadialCommand::Undo => self.can_undo,
             RadialCommand::Redo => self.can_redo,
+            RadialCommand::Clear => self.can_clear,
         }
     }
 
-    pub fn set_history_availability(&mut self, can_undo: bool, can_redo: bool) -> bool {
-        if self.can_undo == can_undo && self.can_redo == can_redo {
+    pub fn set_command_availability(
+        &mut self,
+        can_undo: bool,
+        can_redo: bool,
+        can_clear: bool,
+    ) -> bool {
+        if self.can_undo == can_undo && self.can_redo == can_redo && self.can_clear == can_clear {
             return false;
         }
         self.can_undo = can_undo;
         self.can_redo = can_redo;
+        self.can_clear = can_clear;
+        true
+    }
+
+    pub fn set_layers(&mut self, layers: Vec<RadialLayerEntry>, active_layer_id: String) -> bool {
+        if self.layers == layers && self.active_layer_id == active_layer_id {
+            return false;
+        }
+        self.layers = layers;
+        self.active_layer_id = active_layer_id;
         true
     }
 
@@ -399,6 +592,22 @@ impl RadialMenu {
             self.center_local.0 + dx as f32,
             self.center_local.1 + dy as f32,
         );
+        let add_button = self.layer_add_button();
+        if add_button.contains(local) {
+            return Some(RadialSelection::LayerAdd);
+        }
+        if self.layers.len() > 1
+            && self
+                .layer_delete_button()
+                .is_some_and(|rect| rect.contains(local))
+        {
+            return Some(RadialSelection::LayerDelete);
+        }
+        for (index, rect) in self.layer_rows() {
+            if rect.contains(local) {
+                return Some(RadialSelection::Layer(index));
+            }
+        }
         if !self.stamp_mode {
             for (command, rect) in self.command_buttons() {
                 if rect.contains(local) {
@@ -471,10 +680,22 @@ impl RadialMenu {
                     RadialCommand::Clear => MenuAction::Clear,
                 })
             }
+            RadialSelection::Layer(index) => self
+                .layers
+                .get(index)
+                .map(|layer| MenuAction::SelectLayer(layer.layer_id.clone())),
+            RadialSelection::LayerAdd if self.layers.len() < MAX_LAYERS => {
+                Some(MenuAction::AddLayer)
+            }
+            RadialSelection::LayerDelete if self.layers.len() > 1 => {
+                Some(MenuAction::DeleteLayer(self.active_layer_id.clone()))
+            }
             RadialSelection::StandardMenu
             | RadialSelection::StampCategory
             | RadialSelection::Stamp(_)
-            | RadialSelection::Command(_) => None,
+            | RadialSelection::Command(_)
+            | RadialSelection::LayerAdd
+            | RadialSelection::LayerDelete => None,
         }
     }
 }
@@ -549,6 +770,20 @@ fn clamp_center(value: f32, half_size: f32, limit: f32, margin: f32) -> f32 {
     }
 }
 
+fn clamp_asymmetric(value: f32, before: f32, after: f32, limit: f32, margin: f32) -> f32 {
+    let min = margin + before;
+    let max = limit - margin - after;
+    if min <= max {
+        value.clamp(min, max)
+    } else {
+        (limit + before - after) / 2.0
+    }
+}
+
+fn layer_panel_height(layer_count: usize, scale: f32) -> f32 {
+    (LAYER_HEADER_HEIGHT + layer_count as f32 * LAYER_ROW_HEIGHT) * scale
+}
+
 fn outer_radius_for_stamp_count(stamp_count: usize, scale: f32) -> f32 {
     let ring_count = stamp_count.div_ceil(STAMPS_PER_RING);
     if ring_count == 0 {
@@ -566,6 +801,22 @@ fn fit_scale_for_layout(surface_size: (f32, f32), requested_scale: f32, stamp_co
     let color_and_dock_height = COLOR_OUTER_RADIUS * 2.0 + COMMAND_DOCK_GAP + COMMAND_HEIGHT;
     let required_width = radial_width.max(COMMAND_TOTAL_WIDTH) + VIEWPORT_MARGIN * 2.0;
     let required_height = radial_height.max(color_and_dock_height) + VIEWPORT_MARGIN * 2.0;
+    let fit = (surface_size.0 / required_width).min(surface_size.1 / required_height);
+    requested_scale.min(fit).max(f32::EPSILON)
+}
+
+fn fit_scale_for_layer_layout(
+    surface_size: (f32, f32),
+    requested_scale: f32,
+    stamp_count: usize,
+) -> f32 {
+    let outer = outer_radius_for_stamp_count(stamp_count, 1.0);
+    let required_width = outer * 2.0 + LAYER_PANEL_GAP + LAYER_PANEL_WIDTH + VIEWPORT_MARGIN * 2.0;
+    let radial_height = outer * 2.0;
+    let panel_height = layer_panel_height(MAX_LAYERS, 1.0);
+    let color_and_dock_height = COLOR_OUTER_RADIUS * 2.0 + COMMAND_DOCK_GAP + COMMAND_HEIGHT;
+    let required_height =
+        radial_height.max(panel_height).max(color_and_dock_height) + VIEWPORT_MARGIN * 2.0;
     let fit = (surface_size.0 / required_width).min(surface_size.1 / required_height);
     requested_scale.min(fit).max(f32::EPSILON)
 }
@@ -599,6 +850,40 @@ mod tests {
 
     fn menu(stamp_count: usize) -> RadialMenu {
         menu_with_history(stamp_count, false, false)
+    }
+
+    fn layer_entries(count: usize) -> Vec<RadialLayerEntry> {
+        (0..count)
+            .map(|index| RadialLayerEntry {
+                layer_id: format!("layer-{index}"),
+                name: format!("Layer {}", index + 1),
+                item_count: index * 3,
+            })
+            .collect()
+    }
+
+    fn layer_menu(anchor_local: (f32, f32), count: usize, active: usize) -> RadialMenu {
+        let anchor_screen = (
+            10_000.0 + f64::from(anchor_local.0),
+            -5_000.0 + f64::from(anchor_local.1),
+        );
+        RadialMenu::new_with_layers(
+            1,
+            anchor_screen,
+            anchor_local,
+            (1000, 800),
+            1.0,
+            0,
+            (true, true, true),
+            layer_entries(count),
+            format!("layer-{active}"),
+        )
+    }
+
+    fn pin_at_anchor(mut menu: RadialMenu) -> RadialMenu {
+        let anchor = menu.anchor_screen;
+        assert_eq!(menu.release(anchor), RadialRelease::Pin);
+        menu
     }
 
     fn pin(mut menu: RadialMenu) -> RadialMenu {
@@ -805,9 +1090,13 @@ mod tests {
             let ring = index / STAMPS_PER_RING;
             let slot = index % STAMPS_PER_RING;
             let mut menu = menu(32);
-            menu.update(point(STAMP_TOOL_INDEX, TOOL_COUNT, 72.0));
+            let category = screen_point(&menu, point(STAMP_TOOL_INDEX, TOOL_COUNT, 72.0));
+            menu.update(category);
             let (inner, outer) = menu.stamp_ring_radii(ring).unwrap();
-            let target = point(slot, STAMPS_PER_RING, f64::from((inner + outer) / 2.0));
+            let target = screen_point(
+                &menu,
+                point(slot, STAMPS_PER_RING, f64::from((inner + outer) / 2.0)),
+            );
             menu.update(target);
             assert_eq!(menu.highlighted(), Some(RadialSelection::Stamp(index)));
             assert_eq!(menu.release(target), RadialRelease::Stamp(index));
@@ -996,6 +1285,171 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn layer_panel_prefers_right_and_falls_back_left_near_the_right_edge() {
+        let right = layer_menu((300.0, 400.0), 3, 1);
+        assert!(right.panel_on_right());
+        assert!(right.layer_panel_rect().left > right.center_local().0);
+        assert!(right.layout_within_surface());
+
+        let left = layer_menu((999.0, 400.0), 3, 1);
+        assert!(!left.panel_on_right());
+        assert!(left.layer_panel_rect().right < left.center_local().0);
+        assert!(left.layout_within_surface());
+    }
+
+    #[test]
+    fn eight_layer_panel_with_four_stamp_rings_fits_640_by_480() {
+        for anchor in viewport_anchors(640, 480) {
+            let menu = RadialMenu::new_with_layers(
+                1,
+                (f64::from(anchor.0), f64::from(anchor.1)),
+                anchor,
+                (640, 480),
+                1.6,
+                32,
+                (true, true, true),
+                layer_entries(MAX_LAYERS),
+                "layer-7".into(),
+            );
+            assert!(menu.layout_within_surface(), "anchor={anchor:?}: {menu:?}");
+            assert_eq!(menu.layer_rows().len(), MAX_LAYERS);
+        }
+    }
+
+    #[test]
+    fn pinned_layer_rows_add_and_delete_are_directly_hittable() {
+        let mut menu = pin_at_anchor(layer_menu((500.0, 400.0), 3, 1));
+        assert_eq!(
+            menu.layer_rows()
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        for (index, row) in menu.layer_rows() {
+            assert!(menu.begin_click(10 + index as u32));
+            let target = screen_for_local(&menu, row.center());
+            menu.update(target);
+            assert_eq!(menu.highlighted(), Some(RadialSelection::Layer(index)));
+            assert_eq!(
+                menu.release(target),
+                RadialRelease::Action {
+                    action: MenuAction::SelectLayer(format!("layer-{index}")),
+                    keep_open: true,
+                }
+            );
+        }
+
+        assert!(menu.begin_click(20));
+        let add = screen_for_local(&menu, menu.layer_add_button().center());
+        menu.update(add);
+        assert_eq!(menu.highlighted(), Some(RadialSelection::LayerAdd));
+        assert_eq!(
+            menu.release(add),
+            RadialRelease::Action {
+                action: MenuAction::AddLayer,
+                keep_open: true,
+            }
+        );
+
+        assert!(menu.begin_click(21));
+        let delete = screen_for_local(&menu, menu.layer_delete_button().unwrap().center());
+        menu.update(delete);
+        assert_eq!(menu.highlighted(), Some(RadialSelection::LayerDelete));
+        assert_eq!(
+            menu.release(delete),
+            RadialRelease::Action {
+                action: MenuAction::DeleteLayer("layer-1".into()),
+                keep_open: true,
+            },
+            "confirmation No/Yes can keep the pinned layer panel open"
+        );
+    }
+
+    #[test]
+    fn layer_row_works_for_hold_and_pinned_left_or_right_clicks() {
+        let mut hold = layer_menu((500.0, 400.0), 2, 0);
+        let row = hold
+            .layer_rows()
+            .into_iter()
+            .find(|(index, _)| *index == 1)
+            .unwrap()
+            .1;
+        let target = screen_for_local(&hold, row.center());
+        hold.update(target);
+        assert_eq!(
+            hold.release(target),
+            RadialRelease::Action {
+                action: MenuAction::SelectLayer("layer-1".into()),
+                keep_open: false,
+            }
+        );
+
+        for pointer_id in [2, 3] {
+            let mut pinned = pin_at_anchor(layer_menu((500.0, 400.0), 2, 0));
+            assert!(pinned.begin_click(pointer_id));
+            let target = screen_for_local(&pinned, row.center());
+            pinned.update(target);
+            assert_eq!(
+                pinned.release(target),
+                RadialRelease::Action {
+                    action: MenuAction::SelectLayer("layer-1".into()),
+                    keep_open: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn layer_limits_disable_add_and_last_layer_delete() {
+        let mut maximum = pin_at_anchor(layer_menu((500.0, 400.0), MAX_LAYERS, 7));
+        assert!(maximum.begin_click(2));
+        let add = screen_for_local(&maximum, maximum.layer_add_button().center());
+        maximum.update(add);
+        assert_eq!(maximum.highlighted(), Some(RadialSelection::LayerAdd));
+        assert_eq!(maximum.release(add), RadialRelease::StayOpen);
+
+        let mut last = pin_at_anchor(layer_menu((500.0, 400.0), 1, 0));
+        assert!(last.begin_click(2));
+        let delete = screen_for_local(&last, last.layer_delete_button().unwrap().center());
+        last.update(delete);
+        assert_eq!(last.highlighted(), Some(RadialSelection::Layer(0)));
+        assert_eq!(
+            last.release(delete),
+            RadialRelease::Action {
+                action: MenuAction::SelectLayer("layer-0".into()),
+                keep_open: true,
+            }
+        );
+    }
+
+    #[test]
+    fn set_layers_refreshes_active_layer_names_and_counts() {
+        let mut menu = layer_menu((500.0, 400.0), 2, 0);
+        let refreshed = vec![
+            RadialLayerEntry {
+                layer_id: "layer-0".into(),
+                name: "Background".into(),
+                item_count: 42,
+            },
+            RadialLayerEntry {
+                layer_id: "layer-1".into(),
+                name: "Foreground".into(),
+                item_count: 7,
+            },
+            RadialLayerEntry {
+                layer_id: "layer-2".into(),
+                name: "Notes".into(),
+                item_count: 1,
+            },
+        ];
+        assert!(menu.set_layers(refreshed.clone(), "layer-2".into()));
+        assert_eq!(menu.layers(), refreshed);
+        assert_eq!(menu.active_layer_id(), "layer-2");
+        assert!(!menu.set_layers(refreshed, "layer-2".into()));
     }
 
     #[test]

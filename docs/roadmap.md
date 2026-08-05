@@ -10,6 +10,7 @@
 - Wacom Intuos Pro L／driver 1.0.0.2での筆圧・X/Y傾きの実機確認
 - 設定画面で管理する固定サイズPNGスタンプ
 - 配置済み図形／スタンプの選択、移動・縦横比固定の拡大縮小・回転、約60fps同期、Undo／Redo
+- 最大8枚の描画レイヤー、現在レイヤー限定の消しゴム／選択、全レイヤー共通の時系列Undo／Redo
 - OBS全画面プロジェクター追従、Z-order維持、obs-websocket連携
 - Rust内蔵loopback HTTP/WebSocketサーバー
 - OBS Browser Source用assetsのexe埋め込み

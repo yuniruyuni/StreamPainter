@@ -12,8 +12,9 @@ use super::item_transform::{
 };
 use crate::engine::pointer_input::PointerDynamics;
 use crate::protocol::{
-    Brush, CanvasItem, ItemTransform, LineStyle, PainterMessage, Point, ShapeItem, ShapeKind,
-    StampItem, Stroke, MAX_ITEMS, MAX_POINTS_PER_MESSAGE, MAX_STROKE_POINTS, MAX_TOTAL_POINTS,
+    default_layer_id, Brush, CanvasItem, CanvasLayer, ItemTransform, LineStyle, PainterMessage,
+    Point, ShapeItem, ShapeKind, StampItem, Stroke, MAX_ITEMS, MAX_LAYERS, MAX_POINTS_PER_MESSAGE,
+    MAX_STROKE_POINTS, MAX_TOTAL_POINTS,
 };
 
 /// 間引き閾値: 距離 (正規化)・筆圧・傾きの変化がすべて小さい点は捨てる。
@@ -22,6 +23,7 @@ const MIN_PRESSURE_DELTA: f64 = 0.05;
 const MIN_TILT_DELTA: f64 = 0.02;
 
 pub type SharedItems = Arc<Mutex<Vec<CanvasItem>>>;
+pub type SharedLayers = Arc<Mutex<Vec<CanvasLayer>>>;
 
 struct ActiveStroke {
     pointer_id: u32,
@@ -119,6 +121,9 @@ impl RedoAction {
 
 pub struct CanvasEngine {
     items: SharedItems,
+    layers: SharedLayers,
+    active_layer_id: String,
+    next_layer_number: usize,
     active: Option<ActiveItem>,
     undo_actions: Vec<UndoAction>,
     redo_actions: Vec<RedoAction>,
@@ -130,6 +135,9 @@ impl CanvasEngine {
     pub fn new() -> Self {
         Self {
             items: Arc::new(Mutex::new(Vec::new())),
+            layers: Arc::new(Mutex::new(vec![CanvasLayer::default()])),
+            active_layer_id: default_layer_id(),
+            next_layer_number: 2,
             active: None,
             undo_actions: Vec::new(),
             redo_actions: Vec::new(),
@@ -141,6 +149,102 @@ impl CanvasEngine {
     /// Win32 レンダラーと共有する、描画順を保った履歴のハンドル。
     pub fn shared_items(&self) -> SharedItems {
         Arc::clone(&self.items)
+    }
+
+    /// ローカルハブとレンダラーへ共有する、下から上へのレイヤー順。
+    pub fn shared_layers(&self) -> SharedLayers {
+        Arc::clone(&self.layers)
+    }
+
+    pub fn layers(&self) -> Vec<CanvasLayer> {
+        self.layers.lock().unwrap().clone()
+    }
+
+    pub fn active_layer_id(&self) -> &str {
+        &self.active_layer_id
+    }
+
+    pub fn layer_item_count(&self, layer_id: &str) -> usize {
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|item| item.layer_id() == layer_id)
+            .count()
+    }
+
+    pub fn has_items(&self) -> bool {
+        !self.items.lock().unwrap().is_empty()
+    }
+
+    /// 描画中はレイヤーを変更しない。選択変更は描画内容・revisionを変更しない。
+    pub fn select_layer(&mut self, layer_id: &str) -> bool {
+        if self.active.is_some()
+            || !self
+                .layers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|layer| layer.layer_id == layer_id)
+        {
+            return false;
+        }
+        self.active_layer_id = layer_id.to_owned();
+        true
+    }
+
+    /// 最前面へレイヤーを追加して選択する。
+    pub fn add_layer(&mut self) -> Vec<PainterMessage> {
+        if self.active.is_some() || self.layers.lock().unwrap().len() >= MAX_LAYERS {
+            return Vec::new();
+        }
+        let layer = CanvasLayer {
+            layer_id: uuid::Uuid::now_v7().to_string(),
+            name: format!("レイヤー {}", self.next_layer_number),
+        };
+        self.next_layer_number += 1;
+        self.active_layer_id.clone_from(&layer.layer_id);
+        self.layers.lock().unwrap().push(layer.clone());
+        vec![PainterMessage::LayerAdd { layer }]
+    }
+
+    /// 指定レイヤーとその項目を破棄する。最低1枚を維持し、履歴参照を安全に破棄する。
+    pub fn delete_layer(&mut self, layer_id: &str) -> Vec<PainterMessage> {
+        if self.active.is_some() {
+            return Vec::new();
+        }
+        let fallback_id = {
+            let mut layers = self.layers.lock().unwrap();
+            if layers.len() <= 1 {
+                return Vec::new();
+            }
+            let Some(index) = layers.iter().position(|layer| layer.layer_id == layer_id) else {
+                return Vec::new();
+            };
+            layers.remove(index);
+            let fallback_index = index.saturating_sub(1).min(layers.len() - 1);
+            layers[fallback_index].layer_id.clone()
+        };
+        let mut items = self.items.lock().unwrap();
+        let mut removed_points = 0;
+        items.retain(|item| {
+            let keep = item.layer_id() != layer_id;
+            if !keep {
+                removed_points += item.point_count();
+            }
+            keep
+        });
+        drop(items);
+        self.total_points = self.total_points.saturating_sub(removed_points);
+        self.undo_actions.clear();
+        self.redo_actions.clear();
+        if self.active_layer_id == layer_id {
+            self.active_layer_id = fallback_id;
+        }
+        self.rebuild_required = true;
+        vec![PainterMessage::LayerDelete {
+            layer_id: layer_id.to_owned(),
+        }]
     }
 
     pub fn is_drawing(&self) -> bool {
@@ -209,6 +313,7 @@ impl CanvasEngine {
         let first = point(u, v, dynamics, 0.0);
         let stroke = Stroke {
             stroke_id: stroke_id.clone(),
+            layer_id: self.active_layer_id.clone(),
             brush: brush.clone(),
             pts: vec![first],
             done: false,
@@ -230,7 +335,11 @@ impl CanvasEngine {
             next_point_offset: 0,
             last: Some(first),
         }));
-        vec![PainterMessage::StrokeBegin { stroke_id, brush }]
+        vec![PainterMessage::StrokeBegin {
+            stroke_id,
+            layer_id: self.active_layer_id.clone(),
+            brush,
+        }]
     }
 
     /// 図形のドラッグ開始。
@@ -251,6 +360,7 @@ impl CanvasEngine {
         let position = (round5(u), round5(v));
         let shape = ShapeItem {
             item_id: item_id.clone(),
+            layer_id: self.active_layer_id.clone(),
             shape: shape_kind,
             style,
             start: position,
@@ -289,6 +399,7 @@ impl CanvasEngine {
         self.redo_actions.clear();
         let stamp = StampItem {
             item_id: uuid::Uuid::now_v7().to_string(),
+            layer_id: self.active_layer_id.clone(),
             stamp_id,
             center: (round5(center.0), round5(center.1)),
             width_n,
@@ -320,7 +431,10 @@ impl CanvasEngine {
             .unwrap()
             .iter()
             .rev()
-            .find(|item| item_hit_test(item, (u, v), canvas_aspect, tolerance_n))
+            .find(|item| {
+                item.layer_id() == self.active_layer_id
+                    && item_hit_test(item, (u, v), canvas_aspect, tolerance_n)
+            })
             .cloned()
     }
 
@@ -332,6 +446,7 @@ impl CanvasEngine {
             .iter()
             .find(|item| {
                 item.is_done()
+                    && item.layer_id() == self.active_layer_id
                     && item.item_id() == item_id
                     && matches!(item, CanvasItem::Shape { .. } | CanvasItem::Stamp { .. })
             })
@@ -351,7 +466,9 @@ impl CanvasEngine {
             .rev()
             .find_map(|item| match item {
                 CanvasItem::Stamp { stamp }
-                    if stamp.done && item_hit_test(item, (u, v), 1.0, 0.0) =>
+                    if stamp.done
+                        && stamp.layer_id == self.active_layer_id
+                        && item_hit_test(item, (u, v), 1.0, 0.0) =>
                 {
                     Some(stamp.clone())
                 }
@@ -367,7 +484,11 @@ impl CanvasEngine {
             .unwrap()
             .iter()
             .find_map(|item| match item {
-                CanvasItem::Stamp { stamp } if stamp.done && stamp.item_id == item_id => {
+                CanvasItem::Stamp { stamp }
+                    if stamp.done
+                        && stamp.layer_id == self.active_layer_id
+                        && stamp.item_id == item_id =>
+                {
                     Some(stamp.clone())
                 }
                 _ => None,
@@ -1065,6 +1186,8 @@ mod tests {
                 PainterMessage::StampMove { .. } => "stamp_move",
                 PainterMessage::ItemTransformPreview { .. } => "item_transform_preview",
                 PainterMessage::ItemTransformCommit { .. } => "item_transform_commit",
+                PainterMessage::LayerAdd { .. } => "layer_add",
+                PainterMessage::LayerDelete { .. } => "layer_delete",
                 PainterMessage::Undo {} => "undo",
                 PainterMessage::Redo { .. } => "redo",
                 PainterMessage::Clear {} => "clear",
@@ -1717,5 +1840,102 @@ mod tests {
         assert_eq!(engine.shared_items().lock().unwrap().len(), MAX_ITEMS);
         assert!(engine.take_rebuild_required());
         assert!(!engine.take_rebuild_required());
+    }
+
+    #[test]
+    fn layers_assign_new_items_and_preserve_global_undo_order() {
+        let mut engine = CanvasEngine::new();
+        assert_eq!(engine.layers(), vec![CanvasLayer::default()]);
+        engine.add_stamp("bottom".into(), (0.5, 0.5), 0.1, 0.1, 1.0, 1.0);
+
+        assert_eq!(drain_types(&engine.add_layer()), ["layer_add"]);
+        let top = engine.active_layer_id().to_owned();
+        engine.add_stamp("top".into(), (0.5, 0.5), 0.1, 0.1, 1.0, 2.0);
+        let items = engine.shared_items();
+        let items = items.lock().unwrap();
+        assert_eq!(items[0].layer_id(), crate::protocol::DEFAULT_LAYER_ID);
+        assert_eq!(items[1].layer_id(), top);
+        drop(items);
+
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert_eq!(engine.layer_item_count(&top), 0);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert_eq!(
+            engine.layer_item_count(crate::protocol::DEFAULT_LAYER_ID),
+            0
+        );
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+        assert_eq!(
+            engine.layer_item_count(crate::protocol::DEFAULT_LAYER_ID),
+            1
+        );
+    }
+
+    #[test]
+    fn selection_and_hit_testing_are_scoped_to_the_active_layer() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("bottom".into(), (0.5, 0.5), 0.2, 0.2, 1.0, 1.0);
+        let bottom_id = engine
+            .transformable_at(0.5, 0.5, 1.0, 0.0)
+            .unwrap()
+            .item_id()
+            .to_owned();
+        engine.add_layer();
+        let top_layer = engine.active_layer_id().to_owned();
+        engine.add_stamp("top".into(), (0.5, 0.5), 0.2, 0.2, 1.0, 2.0);
+        let top_id = engine
+            .transformable_at(0.5, 0.5, 1.0, 0.0)
+            .unwrap()
+            .item_id()
+            .to_owned();
+        assert_ne!(bottom_id, top_id);
+        assert!(engine.transformable_by_id(&bottom_id).is_none());
+        assert!(engine.select_layer(crate::protocol::DEFAULT_LAYER_ID));
+        assert_eq!(
+            engine
+                .transformable_at(0.5, 0.5, 1.0, 0.0)
+                .unwrap()
+                .item_id(),
+            bottom_id
+        );
+        assert!(engine.transformable_by_id(&top_id).is_none());
+        assert!(engine.select_layer(&top_layer));
+    }
+
+    #[test]
+    fn deleting_a_layer_only_removes_its_items_and_clears_history_references() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("bottom".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 1.0);
+        engine.add_layer();
+        let top = engine.active_layer_id().to_owned();
+        engine.add_stamp("top".into(), (0.8, 0.8), 0.1, 0.1, 1.0, 2.0);
+        assert!(engine.can_undo());
+
+        assert_eq!(drain_types(&engine.delete_layer(&top)), ["layer_delete"]);
+        assert_eq!(engine.layers().len(), 1);
+        assert_eq!(engine.active_layer_id(), crate::protocol::DEFAULT_LAYER_ID);
+        assert_eq!(
+            engine.layer_item_count(crate::protocol::DEFAULT_LAYER_ID),
+            1
+        );
+        assert!(!engine.can_undo());
+        assert!(!engine.can_redo());
+        assert!(engine
+            .delete_layer(crate::protocol::DEFAULT_LAYER_ID)
+            .is_empty());
+    }
+
+    #[test]
+    fn layer_cap_and_clear_preserve_at_least_one_layer() {
+        let mut engine = CanvasEngine::new();
+        for _ in 1..MAX_LAYERS {
+            assert!(!engine.add_layer().is_empty());
+        }
+        assert_eq!(engine.layers().len(), MAX_LAYERS);
+        assert!(engine.add_layer().is_empty());
+        engine.add_stamp("top".into(), (0.5, 0.5), 0.1, 0.1, 1.0, 1.0);
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+        assert_eq!(engine.layers().len(), MAX_LAYERS);
+        assert!(engine.shared_items().lock().unwrap().is_empty());
     }
 }

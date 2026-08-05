@@ -135,8 +135,8 @@ function Add-PenValidationMessage {
         }
         $protocol = ConvertTo-PenValidationFiniteDouble `
             (Get-PenValidationProperty $Message 'protocolVersion') 'snapshot.protocolVersion'
-        if ($protocol -ne 6 -and $protocol -ne 7) {
-            throw 'snapshot protocolVersion must be 6 or 7'
+        if ($protocol -ne 6 -and $protocol -ne 7 -and $protocol -ne 8) {
+            throw 'snapshot protocolVersion must be 6, 7, or 8'
         }
         $revision = ConvertTo-PenValidationFiniteDouble `
             (Get-PenValidationProperty $Message 'rev') 'snapshot.rev'

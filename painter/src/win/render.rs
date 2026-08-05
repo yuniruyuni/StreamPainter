@@ -6,7 +6,7 @@
 //!   baked + 描画中ストロークのみを描く (client の layers.ts と同じ構造)
 //! - 幾何は engine::geometry (docs/protocol.md) に従う
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use tracing::warn;
@@ -58,7 +58,7 @@ use crate::engine::item_transform::{
     item_transform, selection_half_extents, ROTATE_HANDLE_OFFSET_N,
 };
 use crate::protocol::{
-    Brush, CanvasItem, LineStyle, ShapeItem, ShapeKind, StampItem, Stroke, Tool,
+    Brush, CanvasItem, CanvasLayer, LineStyle, ShapeItem, ShapeKind, StampItem, Stroke, Tool,
 };
 use crate::win::menu::{DrawTool, COLORS};
 use crate::win::radial_menu::{
@@ -158,8 +158,15 @@ fn with_content_clip<T>(
 #[derive(Debug)]
 struct ActiveStrokeState {
     stroke_id: String,
+    layer_id: String,
     brush: Brush,
     next_segment: usize,
+}
+
+#[derive(Debug)]
+struct SelectionLayerCache {
+    item_id: String,
+    layer_id: String,
 }
 
 pub struct Renderer {
@@ -168,15 +175,23 @@ pub struct Renderer {
     swapchain: IDXGISwapChain1,
     target: ID2D1Bitmap1,
     baked: ID2D1Bitmap1,
+    /// レイヤーごとの完成履歴cache。通常frameはpathを再生せず最大8枚を合成する。
+    layer_bitmaps: HashMap<String, ID2D1Bitmap1>,
+    /// ユーザーレイヤーを1枚ずつ再生する再利用bitmap。eraserを他レイヤーへ波及させない。
+    layer_scratch: ID2D1Bitmap1,
     /// 描画中ストローク専用の再利用 bitmap。pen/marker は透明 scratch、eraser は
-    /// stroke 開始時点の baked 複製として使う。
+    /// stroke 開始時点の所属レイヤーbitmap複製として使う。
     active: ID2D1Bitmap1,
     active_stroke: Option<ActiveStrokeState>,
+    /// 選択対象より前だけをcacheしたレイヤー。対象とsuffixだけをframeごとに再生する。
+    selection_layer_cache: Option<SelectionLayerCache>,
     stamp_bitmaps: HashMap<String, ID2D1Bitmap1>,
     stroke_style: ID2D1StrokeStyle1,
     radial_text: IDWriteTextFormat,
     /// content rect (ウィンドウローカル座標)。正規化座標をこの矩形に展開する
     content: Rect,
+    #[cfg(test)]
+    replayed_item_count: std::cell::Cell<usize>,
     // DComp オブジェクトは drop されると合成が消えるため保持し続ける
     _dcomp_device: IDCompositionDevice,
     _dcomp_target: IDCompositionTarget,
@@ -279,6 +294,8 @@ impl Renderer {
                 colorContext: core::mem::ManuallyDrop::new(None),
             };
             let baked = dc.CreateBitmap(D2D_SIZE_U { width, height }, None, 0, &baked_props)?;
+            let layer_scratch =
+                dc.CreateBitmap(D2D_SIZE_U { width, height }, None, 0, &baked_props)?;
             let active = dc.CreateBitmap(D2D_SIZE_U { width, height }, None, 0, &baked_props)?;
             let stamp_bitmaps = load_stamp_bitmaps(&dc, stamps);
 
@@ -323,12 +340,17 @@ impl Renderer {
                 swapchain,
                 target,
                 baked,
+                layer_bitmaps: HashMap::new(),
+                layer_scratch,
                 active,
                 active_stroke: None,
+                selection_layer_cache: None,
                 stamp_bitmaps,
                 stroke_style,
                 radial_text,
                 content,
+                #[cfg(test)]
+                replayed_item_count: std::cell::Cell::new(0),
                 _dcomp_device: dcomp_device,
                 _dcomp_target: dcomp_target,
                 _dcomp_visual: dcomp_visual,
@@ -337,12 +359,160 @@ impl Renderer {
     }
 
     /// 確定 CanvasItem 一覧から baked を再構築する。
+    #[cfg(test)]
     pub fn rebuild_baked(&mut self, items: &[CanvasItem]) -> Result<()> {
         self.rebuild_baked_prefix(items, None)
     }
 
+    /// 各ユーザーレイヤーの完成履歴cacheを再構築し、最大8枚のbitmapだけを
+    /// 下から上へbakedへ合成する。eraserは所属レイヤーのbitmapだけを消す。
+    pub fn rebuild_layered_baked(
+        &mut self,
+        layers: &[CanvasLayer],
+        items: &[CanvasItem],
+    ) -> Result<()> {
+        self.active_stroke = None;
+        self.selection_layer_cache = None;
+        let live_ids = layers
+            .iter()
+            .map(|layer| layer.layer_id.as_str())
+            .collect::<HashSet<_>>();
+        self.layer_bitmaps
+            .retain(|layer_id, _| live_ids.contains(layer_id.as_str()));
+        for layer in layers {
+            self.rebuild_one_layer(&layer.layer_id, items, None)?;
+        }
+        self.recompose_layer_bitmaps(layers)
+    }
+
+    /// 選択開始時に対象レイヤーだけをprefix cacheへ切り替える。別レイヤーの
+    /// 大きな履歴は触らず、対象変更時だけ以前の対象レイヤーを完成状態へ戻す。
+    pub fn prepare_layer_transform(
+        &mut self,
+        layers: &[CanvasLayer],
+        items: &[CanvasItem],
+        selected_item_id: &str,
+    ) -> Result<bool> {
+        let Some(selected) = items
+            .iter()
+            .find(|item| item.is_done() && item.item_id() == selected_item_id)
+        else {
+            self.selection_layer_cache = None;
+            return Ok(false);
+        };
+        let selected_layer_id = selected.layer_id().to_owned();
+        if !layers
+            .iter()
+            .any(|layer| layer.layer_id == selected_layer_id)
+        {
+            self.selection_layer_cache = None;
+            return Ok(false);
+        }
+
+        self.active_stroke = None;
+        if let Some(previous) = self.selection_layer_cache.take() {
+            if previous.layer_id != selected_layer_id {
+                self.rebuild_one_layer(&previous.layer_id, items, None)?;
+            }
+        }
+        self.rebuild_one_layer(&selected_layer_id, items, Some(selected_item_id))?;
+        self.selection_layer_cache = Some(SelectionLayerCache {
+            item_id: selected_item_id.to_owned(),
+            layer_id: selected_layer_id,
+        });
+        Ok(true)
+    }
+
+    fn rebuild_one_layer(
+        &mut self,
+        layer_id: &str,
+        items: &[CanvasItem],
+        stop_before_item_id: Option<&str>,
+    ) -> Result<()> {
+        let bitmap = self.ensure_layer_bitmap(layer_id)?;
+        self.clear_bitmap(&bitmap)?;
+        let visible = items
+            .iter()
+            .filter(|item| item.is_done() && item.layer_id() == layer_id)
+            .take_while(|item| stop_before_item_id.is_none_or(|item_id| item.item_id() != item_id))
+            .collect::<Vec<_>>();
+        self.append_composited_items(&bitmap, &visible)
+    }
+
+    fn ensure_layer_bitmap(&mut self, layer_id: &str) -> Result<ID2D1Bitmap1> {
+        if let Some(bitmap) = self.layer_bitmaps.get(layer_id) {
+            return Ok(bitmap.clone());
+        }
+        let size = unsafe { self.baked.GetPixelSize() };
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+            colorContext: core::mem::ManuallyDrop::new(None),
+        };
+        let bitmap = unsafe { self.dc.CreateBitmap(size, None, 0, &props)? };
+        self.layer_bitmaps
+            .insert(layer_id.to_owned(), bitmap.clone());
+        Ok(bitmap)
+    }
+
+    fn recompose_layer_bitmaps(&self, layers: &[CanvasLayer]) -> Result<()> {
+        self.clear_bitmap(&self.baked)?;
+        for layer in layers {
+            if let Some(bitmap) = self.layer_bitmaps.get(&layer.layer_id) {
+                self.draw_bitmap_to(&self.baked, bitmap, 1.0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_bitmap(&self, bitmap: &ID2D1Bitmap1) -> Result<()> {
+        unsafe {
+            self.dc.SetTarget(bitmap);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+            }
+            Ok(())
+        })
+    }
+
+    fn draw_bitmap_to(
+        &self,
+        target: &ID2D1Bitmap1,
+        bitmap: &ID2D1Bitmap1,
+        opacity: f32,
+    ) -> Result<()> {
+        unsafe {
+            self.dc.SetTarget(target);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || {
+                unsafe {
+                    self.dc.DrawBitmap(
+                        bitmap,
+                        None,
+                        opacity,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+                Ok(())
+            })
+        })
+    }
+
     /// transform対象より前の確定履歴だけをbakedへcacheする。対象とsuffixは
     /// frame target上へ元の順序で再合成し、後続eraserの意味を維持する。
+    #[cfg(test)]
     pub fn rebuild_baked_prefix(
         &mut self,
         items: &[CanvasItem],
@@ -383,6 +553,7 @@ impl Renderer {
         self.append_bitmap_items(target, &visible[direct_start..])
     }
 
+    #[cfg(test)]
     fn clear_baked_bitmap(&self) -> Result<()> {
         unsafe {
             self.dc.SetTarget(&self.baked);
@@ -415,6 +586,7 @@ impl Renderer {
     }
 
     /// 新しく確定した1項目だけをbakedへ追記する。
+    #[cfg(test)]
     pub fn bake_item(&mut self, item: &CanvasItem) -> Result<()> {
         if let CanvasItem::Stroke { stroke } = item {
             if self
@@ -438,8 +610,38 @@ impl Renderer {
         })
     }
 
+    /// 新しく確定した1項目を所属レイヤーcacheだけへ追記する。完成後のbaked更新は
+    /// path再生ではなく最大8枚のbitmap合成だけで済む。
+    pub fn bake_layer_item(&mut self, layers: &[CanvasLayer], item: &CanvasItem) -> Result<()> {
+        let layer_id = item.layer_id();
+        let layer_bitmap = self.ensure_layer_bitmap(layer_id)?;
+        self.selection_layer_cache = None;
+        if let CanvasItem::Stroke { stroke } = item {
+            if self.active_stroke.as_ref().is_some_and(|active| {
+                active.stroke_id == stroke.stroke_id && active.layer_id == stroke.layer_id
+            }) {
+                self.bake_active_stroke_to(stroke, &layer_bitmap)?;
+                return self.recompose_layer_bitmaps(layers);
+            }
+            if stroke_uses_opacity_scratch(stroke) {
+                self.active_stroke = None;
+                self.composite_translucent_stroke_to(&layer_bitmap, stroke)?;
+                return self.recompose_layer_bitmaps(layers);
+            }
+        }
+        unsafe {
+            self.dc.SetTarget(&layer_bitmap);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            with_content_clip(&self.dc, self.content, || self.draw_item(item))
+        })?;
+        self.recompose_layer_bitmaps(layers)
+    }
+
     /// Browser Sourceと同じく、半透明strokeは不透明scratchへ全体を描いてから
     /// opacityを1回だけ掛ける。rebuild後もactive確定時と同じ見た目を保つ。
+    #[cfg(test)]
     fn composite_translucent_stroke(&self, stroke: &Stroke) -> Result<()> {
         self.composite_translucent_stroke_to(&self.baked, stroke)
     }
@@ -507,20 +709,26 @@ impl Renderer {
     /// 1 フレーム描画: baked + 描画中項目 + 描画UI。
     pub fn draw_frame(
         &mut self,
+        layers: &[CanvasLayer],
         items: &[CanvasItem],
         draw_mode: bool,
         selected_item: Option<&CanvasItem>,
         radial: Option<(&RadialMenu, &DrawTool, &str, &[StampConfig])>,
     ) -> Result<()> {
-        self.sync_active_stroke(items)?;
+        self.sync_layered_active_stroke(items)?;
         if let Some(item) = selected_item {
-            if self.draw_transform_history_preview(items, item)? {
+            let cache_matches = self.selection_layer_cache.as_ref().is_some_and(|cached| {
+                cached.item_id == item.item_id() && cached.layer_id == item.layer_id()
+            });
+            if !cache_matches {
+                self.prepare_layer_transform(layers, items, item.item_id())?;
+            }
+            if self.draw_layered_transform_history_preview(layers, items, item)? {
                 unsafe {
                     self.dc.SetTarget(&self.target);
                 }
                 let dc = self.dc.clone();
                 draw_transaction(&dc, || {
-                    // 選択枠・枠・ラジアルメニューは履歴合成後の操作UIとして描く。
                     self.draw_item_selection(item)?;
                     if draw_mode {
                         self.draw_mode_border()?;
@@ -546,25 +754,24 @@ impl Renderer {
                 self.dc.Clear(Some(&transparent()));
             }
             with_content_clip(&self.dc, self.content, || {
-                // Browser overlay の canvas と同じく、コンテンツだけを canvas 境界で切る。
-                self.draw_cached_canvas_layers();
-                for item in items.iter().filter(|item| !item.is_done()) {
-                    // Stroke は active bitmap へ増分描画済み。Shape の終点だけは
-                    // 最新値からフレーム単位で描き直す。
-                    if !matches!(item, CanvasItem::Stroke { .. }) {
-                        self.draw_item(item)?;
+                if items.iter().any(|item| !item.is_done()) {
+                    self.draw_layer_bitmaps_with_active(layers, items)
+                } else {
+                    unsafe {
+                        self.dc.DrawBitmap(
+                            &self.baked,
+                            None,
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                            None,
+                            None,
+                        );
                     }
+                    Ok(())
                 }
-                if let Some(item) = selected_item {
-                    self.draw_item(item)?;
-                }
-                Ok(())
             })?;
             // 選択枠・枠・ラジアルメニューは操作 UI なので、端でも欠けないよう
             // content clip の後に描く。
-            if let Some(item) = selected_item {
-                self.draw_item_selection(item)?;
-            }
             if draw_mode {
                 self.draw_mode_border()?;
             }
@@ -579,8 +786,139 @@ impl Renderer {
         Ok(())
     }
 
+    /// 通常のactive frameは完成レイヤーbitmapと新規segmentだけを合成する。
+    /// 別レイヤーのCanvasItem pathは一切再生しない。
+    fn draw_layer_bitmaps_with_active(
+        &self,
+        layers: &[CanvasLayer],
+        items: &[CanvasItem],
+    ) -> Result<()> {
+        let active_item = items.iter().find(|item| !item.is_done());
+        for layer in layers {
+            let active_stroke = self
+                .active_stroke
+                .as_ref()
+                .filter(|active| active.layer_id == layer.layer_id);
+            let eraser = active_stroke.is_some_and(|active| active.brush.tool == Tool::Eraser);
+            if !eraser {
+                if let Some(bitmap) = self.layer_bitmaps.get(&layer.layer_id) {
+                    unsafe {
+                        self.dc.DrawBitmap(
+                            bitmap,
+                            None,
+                            1.0,
+                            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
+            if let Some(active) = active_stroke {
+                unsafe {
+                    self.dc.DrawBitmap(
+                        &self.active,
+                        None,
+                        if eraser {
+                            1.0
+                        } else {
+                            active.brush.opacity as f32
+                        },
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
+            } else if let Some(item) = active_item.filter(|item| {
+                item.layer_id() == layer.layer_id && !matches!(item, CanvasItem::Stroke { .. })
+            }) {
+                self.draw_item(item)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 選択レイヤーだけをprefix cache + transformed item + suffixへ再生する。
+    /// 他レイヤーは完成bitmapを1回ずつ転写するだけなので履歴量へ比例しない。
+    fn draw_layered_transform_history_preview(
+        &mut self,
+        layers: &[CanvasLayer],
+        items: &[CanvasItem],
+        selected_item: &CanvasItem,
+    ) -> Result<bool> {
+        let Some(cache) = self.selection_layer_cache.as_ref() else {
+            return Ok(false);
+        };
+        if cache.item_id != selected_item.item_id()
+            || cache.layer_id != selected_item.layer_id()
+            || self.active_stroke.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(transformed_index) = items.iter().position(|item| {
+            item.is_done()
+                && item.item_id() == selected_item.item_id()
+                && item.layer_id() == selected_item.layer_id()
+        }) else {
+            return Ok(false);
+        };
+        let selected_layer_id = cache.layer_id.clone();
+        let Some(prefix) = self.layer_bitmaps.get(&selected_layer_id).cloned() else {
+            return Ok(false);
+        };
+
+        self.clear_bitmap(&self.layer_scratch)?;
+        self.draw_bitmap_to(&self.layer_scratch, &prefix, 1.0)?;
+        let suffix = items[transformed_index..]
+            .iter()
+            .filter(|item| item.is_done() && item.layer_id() == selected_layer_id)
+            .map(|item| {
+                if item.item_id() == selected_item.item_id() {
+                    selected_item
+                } else {
+                    item
+                }
+            })
+            .collect::<Vec<_>>();
+        self.append_composited_items(&self.layer_scratch, &suffix)?;
+
+        unsafe {
+            self.dc.SetTarget(&self.target);
+        }
+        let dc = self.dc.clone();
+        draw_transaction(&dc, || {
+            unsafe {
+                self.dc.Clear(Some(&transparent()));
+            }
+            with_content_clip(&self.dc, self.content, || {
+                for layer in layers {
+                    let bitmap = if layer.layer_id == selected_layer_id {
+                        Some(&self.layer_scratch)
+                    } else {
+                        self.layer_bitmaps.get(&layer.layer_id)
+                    };
+                    if let Some(bitmap) = bitmap {
+                        unsafe {
+                            self.dc.DrawBitmap(
+                                bitmap,
+                                None,
+                                1.0,
+                                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })
+        })?;
+        Ok(true)
+    }
+
     /// cached prefixをtargetへ転写し、transform対象と後続履歴を元の順序で再合成する。
     /// targetより後のeraserや半透明strokeも、commit後の完全rebuildと同じ意味になる。
+    #[cfg(test)]
     fn draw_transform_history_preview(
         &mut self,
         items: &[CanvasItem],
@@ -638,6 +976,7 @@ impl Renderer {
 
     /// 最新の active stroke と GPU scratch を同期する。1-origin の cursor より前の
     /// 点には触れないため、通常の pointer update は新規点数にだけ比例する。
+    #[cfg(test)]
     fn sync_active_stroke(&mut self, items: &[CanvasItem]) -> Result<()> {
         let active = items.iter().find_map(|item| match item {
             CanvasItem::Stroke { stroke } if !stroke.done => Some(stroke),
@@ -657,7 +996,38 @@ impl Renderer {
         self.append_active_stroke(stroke)
     }
 
+    fn sync_layered_active_stroke(&mut self, items: &[CanvasItem]) -> Result<()> {
+        let active = items.iter().find_map(|item| match item {
+            CanvasItem::Stroke { stroke } if !stroke.done => Some(stroke),
+            _ => None,
+        });
+        let Some(stroke) = active else {
+            self.active_stroke = None;
+            return Ok(());
+        };
+        let needs_reset = self.active_stroke.as_ref().is_none_or(|cached| {
+            cached.stroke_id != stroke.stroke_id
+                || cached.layer_id != stroke.layer_id
+                || cached.brush != stroke.brush
+        });
+        if needs_reset {
+            let base = self.ensure_layer_bitmap(&stroke.layer_id)?;
+            self.begin_active_stroke_with_base(stroke, &base)?;
+        }
+        self.append_active_stroke(stroke)
+    }
+
+    #[cfg(test)]
     fn begin_active_stroke(&mut self, stroke: &Stroke) -> Result<()> {
+        let baked = self.baked.clone();
+        self.begin_active_stroke_with_base(stroke, &baked)
+    }
+
+    fn begin_active_stroke_with_base(
+        &mut self,
+        stroke: &Stroke,
+        eraser_base: &ID2D1Bitmap1,
+    ) -> Result<()> {
         self.active_stroke = None;
         unsafe {
             self.dc.SetTarget(&self.active);
@@ -670,7 +1040,7 @@ impl Renderer {
                 // cancel 時は state を捨てるだけで元表示へ戻せる。
                 if stroke.brush.tool == Tool::Eraser {
                     self.dc.DrawBitmap(
-                        &self.baked,
+                        eraser_base,
                         None,
                         1.0,
                         D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
@@ -683,6 +1053,7 @@ impl Renderer {
         })?;
         self.active_stroke = Some(ActiveStrokeState {
             stroke_id: stroke.stroke_id.clone(),
+            layer_id: stroke.layer_id.clone(),
             brush: stroke.brush.clone(),
             next_segment: 1,
         });
@@ -742,15 +1113,23 @@ impl Renderer {
 
     /// 確定時は未描画の stable segment と tail/dot だけを scratch へ足し、全点から
     /// geometry を作り直さず baked へ1回合成する。
+    #[cfg(test)]
     fn bake_active_stroke(&mut self, stroke: &Stroke) -> Result<()> {
-        let result = self.bake_active_stroke_inner(stroke);
+        let baked = self.baked.clone();
+        let result = self.bake_active_stroke_inner(stroke, &baked);
         // 成否にかかわらず、このscratchへtailを重ねることはできない。失敗時は
         // App側のdevice recoveryが完全履歴からbakedを再構築する。
         self.active_stroke = None;
         result
     }
 
-    fn bake_active_stroke_inner(&mut self, stroke: &Stroke) -> Result<()> {
+    fn bake_active_stroke_to(&mut self, stroke: &Stroke, target: &ID2D1Bitmap1) -> Result<()> {
+        let result = self.bake_active_stroke_inner(stroke, target);
+        self.active_stroke = None;
+        result
+    }
+
+    fn bake_active_stroke_inner(&mut self, stroke: &Stroke, target: &ID2D1Bitmap1) -> Result<()> {
         self.append_active_stroke(stroke)?;
         unsafe {
             self.dc.SetTarget(&self.active);
@@ -793,13 +1172,16 @@ impl Renderer {
             })
         })?;
 
+        let eraser = stroke.brush.tool == Tool::Eraser;
+        if eraser {
+            self.clear_bitmap(target)?;
+        }
         unsafe {
-            self.dc.SetTarget(&self.baked);
+            self.dc.SetTarget(target);
         }
         let dc = self.dc.clone();
         draw_transaction(&dc, || {
             with_content_clip(&self.dc, self.content, || {
-                let eraser = stroke.brush.tool == Tool::Eraser;
                 let _copy = eraser.then(|| CopyBlendGuard::set(&self.dc));
                 unsafe {
                     self.dc.DrawBitmap(
@@ -821,41 +1203,10 @@ impl Renderer {
         Ok(())
     }
 
-    fn draw_cached_canvas_layers(&self) {
-        let eraser = self
-            .active_stroke
-            .as_ref()
-            .is_some_and(|active| active.brush.tool == Tool::Eraser);
-        unsafe {
-            // Eraser scratch は baked の複製を含むので二重描画しない。
-            if !eraser {
-                self.dc.DrawBitmap(
-                    &self.baked,
-                    None,
-                    1.0,
-                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                    None,
-                    None,
-                );
-            }
-            if let Some(active) = &self.active_stroke {
-                self.dc.DrawBitmap(
-                    &self.active,
-                    None,
-                    if eraser {
-                        1.0
-                    } else {
-                        active.brush.opacity as f32
-                    },
-                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                    None,
-                    None,
-                );
-            }
-        }
-    }
-
     fn draw_item(&self, item: &CanvasItem) -> Result<()> {
+        #[cfg(test)]
+        self.replayed_item_count
+            .set(self.replayed_item_count.get() + 1);
         match item {
             CanvasItem::Stroke { stroke } => self.draw_stroke(stroke),
             CanvasItem::Shape { shape } => self.draw_shape(shape),
@@ -1365,6 +1716,7 @@ impl Renderer {
             self.draw_radial_color_ring(menu, current_color, &outline)?;
             self.draw_radial_commands(menu, &text)?;
         }
+        self.draw_radial_layers(menu, &outline, &text)?;
 
         let center_radius = menu.tool_inner_radius() - 5.0 * menu.scale();
         let center_highlighted = menu.highlighted() == Some(RadialSelection::StandardMenu);
@@ -1422,6 +1774,12 @@ impl Renderer {
             Some(RadialSelection::Command(RadialCommand::Undo)) => "元に\n戻す",
             Some(RadialSelection::Command(RadialCommand::Redo)) => "やり\n直す",
             Some(RadialSelection::Command(RadialCommand::Clear)) => "全消去",
+            Some(RadialSelection::Layer(index)) => menu
+                .layers()
+                .get(index)
+                .map_or("レイヤー", |layer| layer.name.as_str()),
+            Some(RadialSelection::LayerAdd) => "レイヤー\n追加",
+            Some(RadialSelection::LayerDelete) => "レイヤー\n削除",
             None if menu.stamp_mode() => "スタンプ\n選択",
             None => "標準\nメニュー",
         };
@@ -1432,6 +1790,181 @@ impl Renderer {
             center_radius * 1.8,
             &text,
         );
+        Ok(())
+    }
+
+    fn draw_radial_layers(
+        &self,
+        menu: &RadialMenu,
+        outline: &ID2D1SolidColorBrush,
+        text: &ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let panel = menu.layer_panel_rect();
+        let panel_fill = unsafe {
+            self.dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.035,
+                    g: 0.045,
+                    b: 0.065,
+                    a: 0.97,
+                },
+                None,
+            )?
+        };
+        let panel_shape = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: panel.left,
+                top: panel.top,
+                right: panel.right,
+                bottom: panel.bottom,
+            },
+            radiusX: 9.0 * menu.scale(),
+            radiusY: 9.0 * menu.scale(),
+        };
+        unsafe {
+            self.dc.FillRoundedRectangle(&panel_shape, &panel_fill);
+            self.dc
+                .DrawRoundedRectangle(&panel_shape, outline, 1.5, &self.stroke_style);
+        }
+
+        self.draw_centered_text(
+            "レイヤー",
+            (
+                panel.left + 56.0 * menu.scale(),
+                panel.top + 20.0 * menu.scale(),
+            ),
+            104.0 * menu.scale(),
+            34.0 * menu.scale(),
+            text,
+        );
+
+        let add = menu.layer_add_button();
+        let add_enabled = menu.layers().len() < crate::protocol::MAX_LAYERS;
+        let add_highlighted = add_enabled && menu.highlighted() == Some(RadialSelection::LayerAdd);
+        self.draw_layer_button(add, add_highlighted, add_enabled, "+", menu.scale(), text)?;
+
+        for (index, row) in menu.layer_rows() {
+            let Some(layer) = menu.layers().get(index) else {
+                continue;
+            };
+            let active = layer.layer_id == menu.active_layer_id();
+            let highlighted = menu.highlighted() == Some(RadialSelection::Layer(index));
+            let color = if highlighted {
+                D2D1_COLOR_F {
+                    r: 0.11,
+                    g: 0.43,
+                    b: 0.64,
+                    a: 0.98,
+                }
+            } else if active {
+                D2D1_COLOR_F {
+                    r: 0.07,
+                    g: 0.24,
+                    b: 0.34,
+                    a: 0.98,
+                }
+            } else {
+                D2D1_COLOR_F {
+                    r: 0.055,
+                    g: 0.065,
+                    b: 0.085,
+                    a: 0.96,
+                }
+            };
+            let fill = unsafe { self.dc.CreateSolidColorBrush(&color, None)? };
+            unsafe {
+                self.dc.FillRectangle(
+                    &D2D_RECT_F {
+                        left: row.left + 4.0 * menu.scale(),
+                        top: row.top + 2.0 * menu.scale(),
+                        right: row.right - 4.0 * menu.scale(),
+                        bottom: row.bottom - 2.0 * menu.scale(),
+                    },
+                    &fill,
+                );
+            }
+            let label = format!("{}  ({})", layer.name, layer.item_count);
+            self.draw_centered_text(
+                &label,
+                (
+                    (row.left + row.right) / 2.0 - if active { 14.0 * menu.scale() } else { 0.0 },
+                    (row.top + row.bottom) / 2.0,
+                ),
+                row.width()
+                    - if active {
+                        42.0 * menu.scale()
+                    } else {
+                        12.0 * menu.scale()
+                    },
+                row.height(),
+                text,
+            );
+            if active {
+                self.draw_centered_text(
+                    "✓",
+                    (
+                        row.right - 43.0 * menu.scale(),
+                        (row.top + row.bottom) / 2.0,
+                    ),
+                    18.0 * menu.scale(),
+                    row.height(),
+                    text,
+                );
+            }
+        }
+
+        if let Some(delete) = menu.layer_delete_button() {
+            let enabled = menu.layers().len() > 1;
+            let highlighted = enabled && menu.highlighted() == Some(RadialSelection::LayerDelete);
+            self.draw_layer_button(delete, highlighted, enabled, "×", menu.scale(), text)?;
+        }
+        Ok(())
+    }
+
+    fn draw_layer_button(
+        &self,
+        rect: radial_menu::RadialRect,
+        highlighted: bool,
+        enabled: bool,
+        label: &str,
+        scale: f32,
+        text: &ID2D1SolidColorBrush,
+    ) -> Result<()> {
+        let color = if highlighted {
+            D2D1_COLOR_F {
+                r: 0.72,
+                g: 0.12,
+                b: 0.17,
+                a: 0.98,
+            }
+        } else if enabled {
+            D2D1_COLOR_F {
+                r: 0.12,
+                g: 0.18,
+                b: 0.24,
+                a: 0.98,
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 0.06,
+                g: 0.065,
+                b: 0.075,
+                a: 0.72,
+            }
+        };
+        let fill = unsafe { self.dc.CreateSolidColorBrush(&color, None)? };
+        unsafe {
+            self.dc.FillRectangle(
+                &D2D_RECT_F {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                },
+                &fill,
+            );
+        }
+        self.draw_centered_text(label, rect.center(), rect.width(), 26.0 * scale, text);
         Ok(())
     }
 
@@ -2061,6 +2594,7 @@ mod tests {
     fn test_stroke(id: &str, tool: Tool, opacity: f64, pts: Vec<crate::protocol::Point>) -> Stroke {
         Stroke {
             stroke_id: id.into(),
+            layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
             brush: Brush {
                 tool,
                 color: "#ff0000".into(),
@@ -2087,6 +2621,7 @@ mod tests {
         CanvasItem::Shape {
             shape: ShapeItem {
                 item_id: id.into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 shape: ShapeKind::Line,
                 style: LineStyle {
                     color: color.into(),
@@ -2105,6 +2640,28 @@ mod tests {
                 ended_at: Some(1.0),
             },
         }
+    }
+
+    fn item_on_layer(mut item: CanvasItem, layer_id: &str) -> CanvasItem {
+        match &mut item {
+            CanvasItem::Stroke { stroke } => stroke.layer_id = layer_id.into(),
+            CanvasItem::Shape { shape } => shape.layer_id = layer_id.into(),
+            CanvasItem::Stamp { stamp } => stamp.layer_id = layer_id.into(),
+        }
+        item
+    }
+
+    fn test_layers() -> Vec<CanvasLayer> {
+        vec![
+            CanvasLayer {
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                name: "L1".into(),
+            },
+            CanvasLayer {
+                layer_id: "top".into(),
+                name: "L2".into(),
+            },
+        ]
     }
 
     fn fill(dc: &ID2D1DeviceContext, rect: D2D_RECT_F, color: D2D1_COLOR_F) -> Result<()> {
@@ -2324,6 +2881,83 @@ mod tests {
             read_pixels(&renderer.dc, &renderer.baked)?.bgra(32, 24),
             [0, 0, 0, 0]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn layered_active_frame_does_not_replay_large_other_layer_or_history() -> Result<()> {
+        let (mut renderer, _window) = test_renderer()?;
+        let layers = test_layers();
+        let mut items = (0..200)
+            .map(|index| {
+                item_on_layer(
+                    transformed_line_item(&format!("top-{index}"), "#0000ff", 0.3),
+                    "top",
+                )
+            })
+            .collect::<Vec<_>>();
+        let drawing = test_stroke(
+            "active-layered",
+            Tool::Pen,
+            1.0,
+            vec![
+                (0.1, 0.5, 1.0, 0.0, 0.0, 0.0),
+                (0.3, 0.5, 1.0, 1.0, 0.0, 0.0),
+                (0.5, 0.5, 1.0, 2.0, 0.0, 0.0),
+                (0.7, 0.5, 1.0, 3.0, 0.0, 0.0),
+            ],
+        );
+        items.push(stroke_item(&drawing));
+        renderer.rebuild_layered_baked(&layers, &items)?;
+        renderer.replayed_item_count.set(0);
+        renderer.draw_frame(&layers, &items, false, None, None)?;
+        assert_eq!(renderer.replayed_item_count.get(), 0);
+
+        let CanvasItem::Stroke { stroke } = items.last_mut().unwrap() else {
+            unreachable!()
+        };
+        stroke.pts.push((0.9, 0.5, 1.0, 4.0, 0.0, 0.0));
+        renderer.replayed_item_count.set(0);
+        renderer.draw_frame(&layers, &items, false, None, None)?;
+        assert_eq!(renderer.replayed_item_count.get(), 0);
+        assert_eq!(
+            renderer
+                .active_stroke
+                .as_ref()
+                .map(|active| active.next_segment),
+            Some(4)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn layered_transform_frame_replays_only_selected_and_same_layer_suffix() -> Result<()> {
+        let (mut renderer, _window) = test_renderer()?;
+        let layers = test_layers();
+        let mut items = (0..200)
+            .map(|index| transformed_line_item(&format!("prefix-{index}"), "#ff0000", 0.2))
+            .collect::<Vec<_>>();
+        let selected = transformed_line_item("selected-layered", "#00ff00", 0.5);
+        items.push(selected.clone());
+        items.push(transformed_line_item("suffix-layered", "#ff00ff", 0.7));
+        items.extend((0..200).map(|index| {
+            item_on_layer(
+                transformed_line_item(&format!("other-{index}"), "#0000ff", 0.8),
+                "top",
+            )
+        }));
+
+        renderer.rebuild_layered_baked(&layers, &items)?;
+        assert!(renderer.prepare_layer_transform(&layers, &items, selected.item_id())?);
+        for _ in 0..2 {
+            renderer.replayed_item_count.set(0);
+            renderer.draw_frame(&layers, &items, false, Some(&selected), None)?;
+            assert_eq!(
+                renderer.replayed_item_count.get(),
+                2,
+                "only selected + same-layer suffix may be replayed per frame"
+            );
+        }
         Ok(())
     }
 

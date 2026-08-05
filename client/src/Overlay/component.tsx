@@ -37,6 +37,7 @@ export const OverlayApp: React.FC = () => {
         Math.round(window.innerWidth * dpr),
         Math.round(window.innerHeight * dpr),
         state.items,
+        state.layers,
       );
     }
     size();
@@ -73,7 +74,7 @@ export const OverlayApp: React.FC = () => {
               layers.previewItem(queued.item, queued.rebuildBaked);
               break;
             case "rebuild":
-              layers.rebuild(state.items);
+              layers.rebuild(state.items, state.layers);
               break;
           }
         }
@@ -90,7 +91,7 @@ export const OverlayApp: React.FC = () => {
       `ws://${location.host}/ws`,
       (msg) => {
         const effect = state.apply(msg);
-        layers.setItems(state.items);
+        layers.setDocument(state.items, state.layers);
         switch (effect.kind) {
           case "none":
             return true;

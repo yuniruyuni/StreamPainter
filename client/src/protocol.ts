@@ -1,12 +1,24 @@
 // Rust 側 `painter/src/protocol.rs` と JSON 表現を揃えるローカル WS 型。
 
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 export const MIN_COMPATIBLE_PROTOCOL_VERSION = 6;
 export const MAX_ITEMS = 500;
 export const MAX_STROKES = MAX_ITEMS;
 export const MAX_TOTAL_POINTS = 200_000;
 export const MAX_STROKE_POINTS = 10_000;
 export const MAX_POINTS_PER_MESSAGE = 512;
+export const MAX_LAYERS = 8;
+export const DEFAULT_LAYER_ID = "default";
+
+export interface CanvasLayer {
+  layerId: string;
+  name: string;
+}
+
+export const DEFAULT_LAYER: CanvasLayer = {
+  layerId: DEFAULT_LAYER_ID,
+  name: "レイヤー 1",
+};
 
 // v6 appends normalized Windows tilt to the complete v5 tuple prefix.
 export type StrokePoint = [
@@ -32,6 +44,7 @@ export interface Brush {
 
 export interface Stroke {
   strokeId: string;
+  layerId: string;
   brush: Brush;
   pts: StrokePoint[];
   done: boolean;
@@ -57,6 +70,7 @@ export interface LineStyle {
 
 export interface ShapeItem {
   itemId: string;
+  layerId: string;
   shape: ShapeKind;
   style: LineStyle;
   start: Position;
@@ -69,6 +83,7 @@ export interface ShapeItem {
 
 export interface StampItem {
   itemId: string;
+  layerId: string;
   stampId: string;
   center: Position;
   widthN: number;
@@ -86,7 +101,7 @@ export type CanvasItem =
   | ({ kind: "stamp" } & StampItem);
 
 export type PaintEvent =
-  | { type: "stroke_begin"; strokeId: string; brush: Brush }
+  | { type: "stroke_begin"; strokeId: string; layerId: string; brush: Brush }
   | { type: "stroke_points"; strokeId: string; pts: StrokePoint[] }
   | { type: "stroke_end"; strokeId: string; endedAt: number }
   | { type: "stroke_cancel"; strokeId: string }
@@ -112,6 +127,8 @@ export type PaintEvent =
       itemId: string;
       transform: ItemTransform;
     }
+  | { type: "layer_add"; layer: CanvasLayer }
+  | { type: "layer_delete"; layerId: string }
   | { type: "undo" }
   | { type: "redo"; item: CanvasItem }
   | { type: "clear" };
@@ -125,6 +142,8 @@ export type ServerToOverlayMessage =
       protocolVersion: number;
       rev: number;
       fadeAfterMs: number | null;
+      /** v6/v7 snapshotでは未定義で、既定レイヤーへ移行する。 */
+      layers?: CanvasLayer[];
       items: CanvasItem[];
     }
   | { type: "pong"; t: number };

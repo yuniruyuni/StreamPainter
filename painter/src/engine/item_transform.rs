@@ -570,6 +570,7 @@ mod tests {
         CanvasItem::Shape {
             shape: ShapeItem {
                 item_id: format!("{kind:?}"),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 shape: kind,
                 style: LineStyle {
                     color: "#fff".into(),
@@ -589,6 +590,7 @@ mod tests {
         CanvasItem::Stamp {
             stamp: StampItem {
                 item_id: "stamp".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 stamp_id: "asset".into(),
                 center: transform.center,
                 width_n: transform.width_n,

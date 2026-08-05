@@ -29,11 +29,12 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::config::{StampConfig, MAX_STAMP_FILE_BYTES};
-use crate::engine::canvas_engine::SharedItems;
+use crate::engine::canvas_engine::{SharedItems, SharedLayers};
 use crate::engine::item_transform::apply_item_transform;
 use crate::protocol::{
-    CanvasItem, OverlayClientMessage, OverlayControlMessage, OverlayEvent, PainterMessage, Stroke,
-    MAX_ITEMS, MAX_STROKE_POINTS, MAX_TOTAL_POINTS, PROTOCOL_VERSION,
+    default_layers, CanvasItem, CanvasLayer, OverlayClientMessage, OverlayControlMessage,
+    OverlayEvent, PainterMessage, Stroke, MAX_ITEMS, MAX_LAYERS, MAX_STROKE_POINTS,
+    MAX_TOTAL_POINTS, PROTOCOL_VERSION,
 };
 
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
@@ -188,6 +189,7 @@ struct OverlayAssets;
 pub struct LocalServerHandle {
     hub: HubHandle,
     source_items: SharedItems,
+    source_layers: SharedLayers,
     recovery: Arc<HubRecovery>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
@@ -214,7 +216,12 @@ impl LocalServerHandle {
                 // ハブ側で古い世代の待機イベントを無視してsnapshotへ置換する。
                 let generation = self.recovery.generation.fetch_add(1, Ordering::AcqRel) + 1;
                 let items = self.source_items.lock().unwrap().clone();
-                *self.recovery.snapshot.lock().unwrap() = Some((generation, items));
+                let layers = self.source_layers.lock().unwrap().clone();
+                *self.recovery.snapshot.lock().unwrap() = Some(RecoverySnapshot {
+                    generation,
+                    layers,
+                    items,
+                });
                 warn!(
                     "local overlay hub input queue was full; scheduled snapshot recovery generation {generation}"
                 );
@@ -260,6 +267,7 @@ pub fn spawn(
     port: u16,
     stamps: &[StampConfig],
     source_items: SharedItems,
+    source_layers: SharedLayers,
 ) -> Result<LocalServerHandle> {
     if port == 0 {
         bail!("local_server_port に 0 は指定できません");
@@ -363,6 +371,7 @@ pub fn spawn(
     Ok(LocalServerHandle {
         hub,
         source_items,
+        source_layers,
         recovery,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
@@ -568,7 +577,13 @@ enum HubCommand {
 #[derive(Default)]
 struct HubRecovery {
     generation: AtomicU64,
-    snapshot: Mutex<Option<(u64, Vec<CanvasItem>)>>,
+    snapshot: Mutex<Option<RecoverySnapshot>>,
+}
+
+struct RecoverySnapshot {
+    generation: u64,
+    layers: Vec<CanvasLayer>,
+    items: Vec<CanvasItem>,
 }
 
 struct Subscriber {
@@ -576,30 +591,56 @@ struct Subscriber {
     tx: mpsc::Sender<String>,
 }
 
-#[derive(Default)]
 struct HubState {
+    layers: Vec<CanvasLayer>,
     items: Vec<CanvasItem>,
     revision: u64,
     total_points: usize,
 }
 
+impl Default for HubState {
+    fn default() -> Self {
+        Self {
+            layers: default_layers(),
+            items: Vec::new(),
+            revision: 0,
+            total_points: 0,
+        }
+    }
+}
+
 impl HubState {
     fn apply(&mut self, message: PainterMessage) -> Option<String> {
         let (outbound, force_snapshot) = match message {
-            PainterMessage::StrokeBegin { stroke_id, brush } => {
+            PainterMessage::StrokeBegin {
+                stroke_id,
+                layer_id,
+                brush,
+            } => {
+                if !self.has_layer(&layer_id) {
+                    return None;
+                }
                 if self.items.iter().any(|item| item.item_id() == stroke_id) {
                     return None;
                 }
                 self.items.push(CanvasItem::Stroke {
                     stroke: Stroke {
                         stroke_id: stroke_id.clone(),
+                        layer_id: layer_id.clone(),
                         brush: brush.clone(),
                         pts: Vec::new(),
                         done: false,
                         ended_at: None,
                     },
                 });
-                (PainterMessage::StrokeBegin { stroke_id, brush }, false)
+                (
+                    PainterMessage::StrokeBegin {
+                        stroke_id,
+                        layer_id,
+                        brush,
+                    },
+                    false,
+                )
             }
             PainterMessage::StrokePoints {
                 stroke_id,
@@ -675,6 +716,9 @@ impl HubState {
                 (PainterMessage::StrokeCancel { stroke_id }, false)
             }
             PainterMessage::ShapeBegin { mut shape } => {
+                if !self.has_layer(&shape.layer_id) {
+                    return None;
+                }
                 if self
                     .items
                     .iter()
@@ -736,6 +780,9 @@ impl HubState {
                 (PainterMessage::ShapeCancel { item_id }, false)
             }
             PainterMessage::StampAdd { mut stamp } => {
+                if !self.has_layer(&stamp.layer_id) {
+                    return None;
+                }
                 if self
                     .items
                     .iter()
@@ -796,6 +843,40 @@ impl HubState {
                     false,
                 )
             }
+            PainterMessage::LayerAdd { layer } => {
+                if self.layers.len() >= MAX_LAYERS
+                    || layer.layer_id.is_empty()
+                    || layer.name.trim().is_empty()
+                    || self
+                        .layers
+                        .iter()
+                        .any(|existing| existing.layer_id == layer.layer_id)
+                {
+                    return None;
+                }
+                self.layers.push(layer.clone());
+                (PainterMessage::LayerAdd { layer }, false)
+            }
+            PainterMessage::LayerDelete { layer_id } => {
+                if self.layers.len() <= 1 {
+                    return None;
+                }
+                let index = self
+                    .layers
+                    .iter()
+                    .position(|layer| layer.layer_id == layer_id)?;
+                self.layers.remove(index);
+                let mut removed_points = 0;
+                self.items.retain(|item| {
+                    let keep = item.layer_id() != layer_id;
+                    if !keep {
+                        removed_points += item.point_count();
+                    }
+                    keep
+                });
+                self.total_points = self.total_points.saturating_sub(removed_points);
+                (PainterMessage::LayerDelete { layer_id }, false)
+            }
             PainterMessage::Undo {} => {
                 let index = self.items.iter().rposition(CanvasItem::is_done)?;
                 let removed = self.items.remove(index);
@@ -806,6 +887,7 @@ impl HubState {
             }
             PainterMessage::Redo { item } => {
                 if !item.is_done()
+                    || !self.has_layer(item.layer_id())
                     || self
                         .items
                         .iter()
@@ -845,17 +927,32 @@ impl HubState {
             protocol_version: PROTOCOL_VERSION,
             rev: self.revision,
             fade_after_ms: None,
+            layers: self.layers.clone(),
             items: self.items.clone(),
         })
         .ok()
     }
 
-    fn replace_items(&mut self, items: Vec<CanvasItem>) -> Option<String> {
+    fn replace_document(
+        &mut self,
+        mut layers: Vec<CanvasLayer>,
+        mut items: Vec<CanvasItem>,
+    ) -> Option<String> {
+        if layers.is_empty() {
+            layers = default_layers();
+        }
+        layers.truncate(MAX_LAYERS);
+        items.retain(|item| layers.iter().any(|layer| layer.layer_id == item.layer_id()));
         self.total_points = items.iter().map(CanvasItem::point_count).sum();
+        self.layers = layers;
         self.items = items;
         self.trim();
         self.revision = self.revision.saturating_add(1);
         self.snapshot()
+    }
+
+    fn has_layer(&self, layer_id: &str) -> bool {
+        self.layers.iter().any(|layer| layer.layer_id == layer_id)
     }
 
     fn trim(&mut self) -> bool {
@@ -888,10 +985,10 @@ async fn run_hub(mut commands: mpsc::Receiver<HubCommand>, recovery: Arc<HubReco
 
     while let Some(command) = commands.recv().await {
         let pending_recovery = recovery.snapshot.lock().unwrap().take();
-        if let Some((recovery_generation, items)) = pending_recovery {
-            if recovery_generation >= generation {
-                generation = recovery_generation;
-                if let Some(snapshot) = state.replace_items(items) {
+        if let Some(recovery) = pending_recovery {
+            if recovery.generation >= generation {
+                generation = recovery.generation;
+                if let Some(snapshot) = state.replace_document(recovery.layers, recovery.items) {
                     subscribers
                         .retain(|subscriber| subscriber.tx.try_send(snapshot.clone()).is_ok());
                 }
@@ -1008,6 +1105,7 @@ mod protocol_conformance {
         CanvasItem::Stroke {
             stroke: Stroke {
                 stroke_id: id.into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 brush: brush(tool),
                 pts: (0..point_count)
                     .map(|index| (0.1, 0.2, 0.5, index as f64, 0.0, 0.0))
@@ -1022,6 +1120,7 @@ mod protocol_conformance {
         CanvasItem::Shape {
             shape: ShapeItem {
                 item_id: id.into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 shape: kind,
                 style: LineStyle {
                     color: "#aabbcc".into(),
@@ -1041,6 +1140,7 @@ mod protocol_conformance {
         CanvasItem::Stamp {
             stamp: StampItem {
                 item_id: id.into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 stamp_id: "fixture-stamp".into(),
                 center: (0.45, 0.55),
                 width_n: 0.1,
@@ -1056,6 +1156,7 @@ mod protocol_conformance {
     fn hub_state(items: Vec<CanvasItem>) -> HubState {
         let total_points = items.iter().map(CanvasItem::point_count).sum();
         HubState {
+            layers: default_layers(),
             items,
             revision: FIXTURE_REVISION,
             total_points,
@@ -1097,6 +1198,7 @@ mod protocol_conformance {
             | PainterMessage::ItemTransformCommit { item_id, .. } => {
                 vec![shape_item(item_id, ShapeKind::Rectangle, true)]
             }
+            PainterMessage::LayerAdd { .. } | PainterMessage::LayerDelete { .. } => Vec::new(),
             PainterMessage::Undo {} => vec![
                 stroke_item("fixture-undo-target", Tool::Pen, true, 2),
                 shape_item("fixture-undo-active", ShapeKind::Ellipse, false),
@@ -1138,6 +1240,12 @@ mod protocol_conformance {
         let raw = serde_json::to_value(&message).expect("event fixture must serialize");
         let name = message_type(&raw).to_owned();
         let mut state = hub_state(initial_items(&message));
+        if let PainterMessage::LayerDelete { layer_id } = &message {
+            state.layers.push(CanvasLayer {
+                layer_id: layer_id.clone(),
+                name: "レイヤー 2".into(),
+            });
+        }
         let initial = parse_json(&state.snapshot().expect("initial snapshot must serialize"));
         let outbound = parse_json(
             &state
@@ -1151,6 +1259,7 @@ mod protocol_conformance {
             "message": outbound,
             "expected": {
                 "rev": state.revision,
+                "layers": state.layers,
                 "items": state.items,
             },
         })
@@ -1221,6 +1330,7 @@ mod protocol_conformance {
             vec![
                 PainterMessage::StrokeBegin {
                     stroke_id: "fixture-limit-stroke-new".into(),
+                    layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                     brush: brush(Tool::Pen),
                 },
                 PainterMessage::StrokePoints {
@@ -1297,12 +1407,13 @@ mod protocol_conformance {
             1,
         )];
         let state = HubState {
+            layers: default_layers(),
             items: initial_items.clone(),
             revision: 10,
             total_points: 1,
         };
         let initial = parse_json(&state.snapshot().expect("revision snapshot must serialize"));
-        let expected = json!({ "rev": 10, "items": initial_items });
+        let expected = json!({ "rev": 10, "layers": default_layers(), "items": initial_items });
 
         vec![
             json!({
@@ -1326,6 +1437,7 @@ mod protocol_conformance {
                     protocol_version: PROTOCOL_VERSION + 1,
                     rev: 99,
                     fade_after_ms: Some(1_000.0),
+                    layers: default_layers(),
                     items: Vec::new(),
                 })
                 .expect("unknown-version snapshot must serialize"),
@@ -1395,6 +1507,7 @@ mod protocol_conformance {
             "protocolVersion": PROTOCOL_VERSION,
             "limits": {
                 "maxItems": MAX_ITEMS,
+                "maxLayers": MAX_LAYERS,
                 "maxTotalPoints": MAX_TOTAL_POINTS,
                 "maxStrokePoints": MAX_STROKE_POINTS,
                 "maxPointsPerMessage": MAX_POINTS_PER_MESSAGE,
@@ -1403,6 +1516,7 @@ mod protocol_conformance {
             "messageFields": message_fields,
             "objectFields": {
                 "brush": top_level_fields(&snapshot_items[0]["brush"]),
+                "layer": top_level_fields(&snapshot["layers"][0]),
                 "strokeItem": top_level_fields(&snapshot_items[0]),
                 "lineStyle": top_level_fields(&snapshot_items[1]["style"]),
                 "shapeItem": top_level_fields(&snapshot_items[1]),
@@ -1494,6 +1608,7 @@ mod tests {
         let server = LocalServerHandle {
             hub: hub.clone(),
             source_items,
+            source_layers: Arc::new(Mutex::new(default_layers())),
             recovery: Arc::clone(&recovery),
             shutdown: None,
             thread: None,
@@ -1601,6 +1716,7 @@ mod tests {
             &hub,
             PainterMessage::StrokeBegin {
                 stroke_id: "s1".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 brush: brush(),
             },
         )
@@ -1654,6 +1770,7 @@ mod tests {
             &hub,
             PainterMessage::StrokeBegin {
                 stroke_id: "s1".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 brush: brush(),
             },
         )
@@ -1669,15 +1786,19 @@ mod tests {
         let p1 = (0.2, 0.3, 0.5, 16.0, 0.0, 0.0);
         let p2 = (0.3, 0.4, 0.5, 32.0, 0.0, 0.0);
         let mut state = HubState::default();
-        state.replace_items(vec![CanvasItem::Stroke {
-            stroke: Stroke {
-                stroke_id: "s1".into(),
-                brush: brush(),
-                pts: vec![p0, p1],
-                done: false,
-                ended_at: None,
-            },
-        }]);
+        state.replace_document(
+            default_layers(),
+            vec![CanvasItem::Stroke {
+                stroke: Stroke {
+                    stroke_id: "s1".into(),
+                    layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                    brush: brush(),
+                    pts: vec![p0, p1],
+                    done: false,
+                    ended_at: None,
+                },
+            }],
+        );
 
         let event = state
             .apply(PainterMessage::StrokePoints {
@@ -1840,6 +1961,7 @@ mod tests {
         let source_items = Arc::new(Mutex::new(vec![CanvasItem::Stamp {
             stamp: StampItem {
                 item_id: "latest".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 stamp_id: "stamp-1".into(),
                 center: (0.5, 0.5),
                 width_n: 0.1,
@@ -1856,6 +1978,7 @@ mod tests {
         let server = LocalServerHandle {
             hub: hub.clone(),
             source_items,
+            source_layers: Arc::new(Mutex::new(default_layers())),
             recovery: Arc::clone(&recovery),
             shutdown: None,
             thread: None,
@@ -1867,6 +1990,7 @@ mod tests {
         // 1件目で容量を使い切り、2件目は完全状態による復旧へ切り替わる。
         server.send_all(vec![PainterMessage::StrokeBegin {
             stroke_id: "stale".into(),
+            layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
             brush: brush(),
         }]);
         server.send_all(vec![PainterMessage::Clear {}]);
@@ -1889,6 +2013,7 @@ mod tests {
         let hub = test_hub();
         let shape = ShapeItem {
             item_id: "shape-1".into(),
+            layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
             shape: ShapeKind::Rectangle,
             style: LineStyle {
                 color: "#ffffff".into(),
@@ -1924,6 +2049,7 @@ mod tests {
             PainterMessage::StampAdd {
                 stamp: StampItem {
                     item_id: "stamp-item-1".into(),
+                    layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                     stamp_id: "stamp-1".into(),
                     center: (0.5, 0.5),
                     width_n: 0.1,
@@ -1961,6 +2087,7 @@ mod tests {
             PainterMessage::StampAdd {
                 stamp: StampItem {
                     item_id: "stamp-item-1".into(),
+                    layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                     stamp_id: "stamp-1".into(),
                     center: (0.2, 0.3),
                     width_n: 0.1,
@@ -2020,6 +2147,7 @@ mod tests {
         let item = CanvasItem::Stamp {
             stamp: StampItem {
                 item_id: "stamp-item-1".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 stamp_id: "stamp-1".into(),
                 center: (0.5, 0.5),
                 width_n: 0.1,
@@ -2110,7 +2238,14 @@ mod tests {
     async fn running_server_streams_events_and_rejects_foreign_origins() {
         let port = available_port();
         let source_items = Arc::new(Mutex::new(Vec::new()));
-        let server = spawn(port, &[], Arc::clone(&source_items)).unwrap();
+        let source_layers = Arc::new(Mutex::new(default_layers()));
+        let server = spawn(
+            port,
+            &[],
+            Arc::clone(&source_items),
+            Arc::clone(&source_layers),
+        )
+        .unwrap();
         let diagnostics = server.diagnostics();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let _diagnostics_subscription = diagnostics.subscribe(move || {
@@ -2176,11 +2311,13 @@ mod tests {
 
         let begin = PainterMessage::StrokeBegin {
             stroke_id: "integration".into(),
+            layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
             brush: brush(),
         };
         source_items.lock().unwrap().push(CanvasItem::Stroke {
             stroke: Stroke {
                 stroke_id: "integration".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
                 brush: brush(),
                 pts: Vec::new(),
                 done: false,
@@ -2217,5 +2354,113 @@ mod tests {
                 browser_subscribers: 0,
             }
         );
+    }
+
+    #[test]
+    fn hub_validates_layer_references_and_deletes_only_the_target_layer() {
+        let mut state = HubState::default();
+        let layer = CanvasLayer {
+            layer_id: "top".into(),
+            name: "レイヤー 2".into(),
+        };
+        assert!(state
+            .apply(PainterMessage::LayerAdd {
+                layer: layer.clone(),
+            })
+            .is_some());
+        assert!(state
+            .apply(PainterMessage::StrokeBegin {
+                stroke_id: "unknown".into(),
+                layer_id: "missing".into(),
+                brush: brush(),
+            })
+            .is_none());
+        state.items.push(CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: "bottom".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                brush: brush(),
+                pts: vec![(0.1, 0.1, 1.0, 0.0, 0.0, 0.0)],
+                done: true,
+                ended_at: Some(1.0),
+            },
+        });
+        let mut top = CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: "top-item".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                brush: brush(),
+                pts: vec![
+                    (0.2, 0.2, 1.0, 0.0, 0.0, 0.0),
+                    (0.3, 0.3, 1.0, 1.0, 0.0, 0.0),
+                ],
+                done: true,
+                ended_at: Some(2.0),
+            },
+        };
+        if let CanvasItem::Stroke { stroke } = &mut top {
+            stroke.layer_id = layer.layer_id.clone();
+        }
+        state.total_points = 3;
+        state.items.push(top);
+
+        assert!(state
+            .apply(PainterMessage::LayerDelete {
+                layer_id: layer.layer_id,
+            })
+            .is_some());
+        assert_eq!(state.layers, default_layers());
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].item_id(), "bottom");
+        assert_eq!(state.total_points, 1);
+        assert!(state
+            .apply(PainterMessage::LayerDelete {
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_replaces_layers_and_items_as_one_document() {
+        let mut state = HubState::default();
+        let layers = vec![
+            CanvasLayer::default(),
+            CanvasLayer {
+                layer_id: "top".into(),
+                name: "レイヤー 2".into(),
+            },
+        ];
+        let mut item = CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: "top-item".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                stamp_id: "stamp".into(),
+                center: (0.5, 0.5),
+                width_n: 0.1,
+                height_n: 0.1,
+                rotation: 0.0,
+                opacity: 1.0,
+                done: true,
+                ended_at: Some(1.0),
+            },
+        };
+        if let CanvasItem::Stamp { stamp } = &mut item {
+            stamp.layer_id = "top".into();
+        }
+        let snapshot = state
+            .replace_document(layers.clone(), vec![item.clone()])
+            .unwrap();
+        let decoded: OverlayControlMessage = serde_json::from_str(&snapshot).unwrap();
+        match decoded {
+            OverlayControlMessage::Snapshot {
+                layers: actual_layers,
+                items,
+                ..
+            } => {
+                assert_eq!(actual_layers, layers);
+                assert_eq!(items, vec![item]);
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
     }
 }

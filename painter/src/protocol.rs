@@ -12,14 +12,40 @@ use serde::{Deserialize, Serialize};
 pub type Point = (f64, f64, f64, f64, f64, f64);
 
 /// painter / local hub / overlay が同じ値で適用する上限。
-pub const PROTOCOL_VERSION: u32 = 7;
-/// v6は筆圧・傾き対応済みで、transform field/eventだけが存在しない。
+pub const PROTOCOL_VERSION: u32 = 8;
+/// v6は筆圧・傾き、v7はtransformまで対応済みで、どちらもlayer field/eventは存在しない。
 pub const MIN_COMPATIBLE_PROTOCOL_VERSION: u32 = 6;
 const _: () = assert!(MIN_COMPATIBLE_PROTOCOL_VERSION <= PROTOCOL_VERSION);
 pub const MAX_ITEMS: usize = 500;
 pub const MAX_TOTAL_POINTS: usize = 200_000;
 pub const MAX_STROKE_POINTS: usize = 10_000;
 pub const MAX_POINTS_PER_MESSAGE: usize = 512;
+pub const MAX_LAYERS: usize = 8;
+pub const DEFAULT_LAYER_ID: &str = "default";
+
+pub fn default_layer_id() -> String {
+    DEFAULT_LAYER_ID.to_owned()
+}
+
+pub fn default_layers() -> Vec<CanvasLayer> {
+    vec![CanvasLayer::default()]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasLayer {
+    pub layer_id: String,
+    pub name: String,
+}
+
+impl Default for CanvasLayer {
+    fn default() -> Self {
+        Self {
+            layer_id: default_layer_id(),
+            name: "レイヤー 1".to_owned(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -49,6 +75,9 @@ pub struct Brush {
 #[serde(rename_all = "camelCase")]
 pub struct Stroke {
     pub stroke_id: String,
+    /// v6/v7 itemでは存在しないため、既定レイヤーへ移行する。
+    #[serde(default = "default_layer_id")]
+    pub layer_id: String,
     pub brush: Brush,
     pub pts: Vec<Point>,
     pub done: bool,
@@ -92,6 +121,8 @@ pub struct LineStyle {
 #[serde(rename_all = "camelCase")]
 pub struct ShapeItem {
     pub item_id: String,
+    #[serde(default = "default_layer_id")]
+    pub layer_id: String,
     pub shape: ShapeKind,
     pub style: LineStyle,
     pub start: Position,
@@ -107,6 +138,8 @@ pub struct ShapeItem {
 #[serde(rename_all = "camelCase")]
 pub struct StampItem {
     pub item_id: String,
+    #[serde(default = "default_layer_id")]
+    pub layer_id: String,
     pub stamp_id: String,
     pub center: Position,
     /// キャンバス幅・高さに対する正規化表示サイズ。
@@ -152,6 +185,14 @@ impl CanvasItem {
             Self::Stroke { stroke } => stroke.done,
             Self::Shape { shape } => shape.done,
             Self::Stamp { stamp } => stamp.done,
+        }
+    }
+
+    pub fn layer_id(&self) -> &str {
+        match self {
+            Self::Stroke { stroke } => &stroke.layer_id,
+            Self::Shape { shape } => &shape.layer_id,
+            Self::Stamp { stamp } => &stamp.layer_id,
         }
     }
 
@@ -203,9 +244,12 @@ define_painter_messages! {
     #[serde(rename_all = "camelCase")]
     StrokeBegin {
         stroke_id: String,
+        #[serde(default = "default_layer_id")]
+        layer_id: String,
         brush: Brush,
     } => PainterMessage::StrokeBegin {
         stroke_id: "fixture-stroke-begin".into(),
+        layer_id: DEFAULT_LAYER_ID.into(),
         brush: fixture_brush(Tool::Marker),
     },
     #[serde(rename_all = "camelCase")]
@@ -310,6 +354,21 @@ define_painter_messages! {
         item_id: "fixture-transform-commit".into(),
         transform: fixture_transform(),
     },
+    #[serde(rename_all = "camelCase")]
+    LayerAdd {
+        layer: CanvasLayer,
+    } => PainterMessage::LayerAdd {
+        layer: CanvasLayer {
+            layer_id: "fixture-layer".into(),
+            name: "レイヤー 2".into(),
+        },
+    },
+    #[serde(rename_all = "camelCase")]
+    LayerDelete {
+        layer_id: String,
+    } => PainterMessage::LayerDelete {
+        layer_id: "fixture-layer".into(),
+    },
     Undo {} => PainterMessage::Undo {},
     Redo {
         item: CanvasItem,
@@ -339,6 +398,7 @@ fn fixture_brush(tool: Tool) -> Brush {
 fn fixture_shape(item_id: &str, shape: ShapeKind, done: bool) -> ShapeItem {
     ShapeItem {
         item_id: item_id.into(),
+        layer_id: DEFAULT_LAYER_ID.into(),
         shape,
         style: LineStyle {
             color: "#fedcba".into(),
@@ -357,6 +417,7 @@ fn fixture_shape(item_id: &str, shape: ShapeKind, done: bool) -> ShapeItem {
 fn fixture_stamp(item_id: &str, done: bool) -> StampItem {
     StampItem {
         item_id: item_id.into(),
+        layer_id: DEFAULT_LAYER_ID.into(),
         stamp_id: "fixture-stamp".into(),
         center: (0.25, 0.35),
         width_n: 0.125,
@@ -427,12 +488,16 @@ define_overlay_control_messages! {
         protocol_version: u32,
         rev: u64,
         fade_after_ms: Option<f64>,
+        /// 下から上へのユーザー描画レイヤー。
+        #[serde(default = "default_layers")]
+        layers: Vec<CanvasLayer>,
         /// 描画順を保つ完全な描画履歴。
         items: Vec<CanvasItem>,
     } => OverlayControlMessage::Snapshot {
         protocol_version: PROTOCOL_VERSION,
         rev: 40,
         fade_after_ms: Some(2_500.0),
+        layers: vec![CanvasLayer::default()],
         items: fixture_canvas_items(),
     },
     Pong {
@@ -448,6 +513,7 @@ fn fixture_canvas_items() -> Vec<CanvasItem> {
         CanvasItem::Stroke {
             stroke: Stroke {
                 stroke_id: "fixture-snapshot-stroke".into(),
+                layer_id: DEFAULT_LAYER_ID.into(),
                 brush: fixture_brush(Tool::Pen),
                 pts: vec![(0.1, 0.2, 0.5, 0.0, 0.25, -0.5)],
                 done: true,
@@ -495,6 +561,7 @@ mod tests {
     fn stroke_begin_json_matches_protocol() {
         let msg = PainterMessage::StrokeBegin {
             stroke_id: "s1".into(),
+            layer_id: DEFAULT_LAYER_ID.into(),
             brush: pen(),
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -503,6 +570,7 @@ mod tests {
             serde_json::json!({
                 "type": "stroke_begin",
                 "strokeId": "s1",
+                "layerId": "default",
                 "brush": {
                     "tool": "pen",
                     "color": "#ff4d6d",
@@ -578,9 +646,23 @@ mod tests {
                 assert_eq!(rev, 3);
                 assert_eq!(items.len(), 1);
                 assert_eq!(items[0].item_id(), "s1");
+                assert_eq!(items[0].layer_id(), DEFAULT_LAYER_ID);
             }
             OverlayControlMessage::Pong { .. } => panic!("unexpected pong"),
         }
+    }
+
+    #[test]
+    fn legacy_stroke_begin_without_layer_migrates_to_default_layer() {
+        let message: PainterMessage = serde_json::from_str(
+            r##"{"type":"stroke_begin","strokeId":"s1","brush":{"tool":"pen","color":"#ff4d6d","opacity":1,"widthN":0.005,"pressureWidth":true,"pressureMin":0.2,"tiltWidth":false,"tiltMaxScale":1}}"##,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            message,
+            PainterMessage::StrokeBegin { layer_id, .. } if layer_id == DEFAULT_LAYER_ID
+        ));
     }
 
     #[test]
@@ -680,6 +762,7 @@ mod tests {
         let item = CanvasItem::Shape {
             shape: ShapeItem {
                 item_id: "shape-1".into(),
+                layer_id: DEFAULT_LAYER_ID.into(),
                 shape: ShapeKind::Arrow,
                 style: LineStyle {
                     color: "#ffffff".into(),

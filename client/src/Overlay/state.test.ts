@@ -28,6 +28,7 @@ const brush: Brush = {
 function doneStroke(id: string): Stroke {
   return {
     strokeId: id,
+    layerId: "default",
     brush,
     pts: [[0.1, 0.1, 0.5, 0, 0, 0]],
     done: true,
@@ -47,6 +48,7 @@ function synchronizedState(items: CanvasItem[] = [], rev = 0): OverlayState {
       protocolVersion: PROTOCOL_VERSION,
       rev,
       fadeAfterMs: null,
+      layers: [{ layerId: "default", name: "レイヤー 1" }],
       items,
     }).kind,
   ).toBe("rebuild");
@@ -72,6 +74,7 @@ describe("OverlayState", () => {
     const activeShape: CanvasItem = {
       kind: "shape",
       itemId: "shape-v6",
+      layerId: "default",
       shape: "rectangle",
       style: { color: "#fff", opacity: 1, widthN: 0.01 },
       start: [0.2, 0.3],
@@ -82,6 +85,7 @@ describe("OverlayState", () => {
     const stamp: CanvasItem = {
       kind: "stamp",
       itemId: "stamp-v6",
+      layerId: "default",
       stampId: "asset",
       center: [0.5, 0.5],
       widthN: 0.1,
@@ -131,6 +135,7 @@ describe("OverlayState", () => {
         protocolVersion: PROTOCOL_VERSION,
         rev: 8,
         fadeAfterMs: 5_000,
+        layers: [{ layerId: "default", name: "レイヤー 1" }],
         items: [strokeItem("new")],
       }).kind,
     ).toBe("rebuild");
@@ -144,6 +149,7 @@ describe("OverlayState", () => {
     const begin = applyNext(state, {
       type: "stroke_begin",
       strokeId: "s1",
+      layerId: "default",
       brush,
     });
     expect(begin.kind).toBe("active");
@@ -184,6 +190,7 @@ describe("OverlayState", () => {
     const state = synchronizedState();
     const shape = {
       itemId: "shape-1",
+      layerId: "default",
       shape: "arrow" as const,
       style: { color: "#ffffff", opacity: 1, widthN: 0.005 },
       start: [0.1, 0.2] as [number, number],
@@ -219,6 +226,7 @@ describe("OverlayState", () => {
         {
           kind: "stamp",
           itemId: "stamp-item-1",
+          layerId: "default",
           stampId: "stamp-1",
           center: [0.5, 0.5],
           widthN: 0.1,
@@ -241,6 +249,7 @@ describe("OverlayState", () => {
     const shape: CanvasItem = {
       kind: "shape",
       itemId: "shape-1",
+      layerId: "default",
       shape: "rectangle",
       style: { color: "#fff", opacity: 1, widthN: 0.01 },
       start: [0.2, 0.2],
@@ -295,6 +304,7 @@ describe("OverlayState", () => {
       {
         kind: "stamp",
         itemId: "stamp-item-1",
+        layerId: "default",
         stampId: "stamp-1",
         center: [0.2, 0.3],
         widthN: 0.1,
@@ -382,6 +392,7 @@ describe("OverlayState", () => {
     applyNext(state, {
       type: "stroke_begin",
       strokeId: "e1",
+      layerId: "default",
       brush: { ...brush, tool: "eraser" },
     });
     expect(
@@ -391,7 +402,12 @@ describe("OverlayState", () => {
 
   test("pen の cancel は active layer の破棄を指示する", () => {
     const state = synchronizedState();
-    applyNext(state, { type: "stroke_begin", strokeId: "s1", brush });
+    applyNext(state, {
+      type: "stroke_begin",
+      strokeId: "s1",
+      layerId: "default",
+      brush,
+    });
     expect(applyNext(state, { type: "stroke_cancel", strokeId: "s1" })).toEqual(
       {
         kind: "cancel",
@@ -410,6 +426,7 @@ describe("OverlayState", () => {
     const effect = applyNext(state, {
       type: "stroke_begin",
       strokeId: "new",
+      layerId: "default",
       brush,
     });
     expect(effect.kind).toBe("rebuild");
@@ -442,7 +459,7 @@ describe("OverlayState", () => {
     ).toBe("resync");
   });
 
-  test("snapshot protocolVersionはnumberのsafe integer v6/v7だけを受理する", () => {
+  test("snapshot protocolVersionはnumberのsafe integer対応範囲だけを受理する", () => {
     const invalidVersions: unknown[] = [
       undefined,
       String(PROTOCOL_VERSION),
@@ -479,6 +496,7 @@ describe("OverlayState", () => {
           protocolVersion,
           rev: 1,
           fadeAfterMs: null,
+          layers: [{ layerId: "default", name: "レイヤー 1" }],
           items: [],
         }).kind,
       ).toBe("rebuild");
@@ -494,5 +512,193 @@ describe("OverlayState", () => {
       }).kind,
     ).toBe("resync");
     expect(state.rev).toBe(10);
+  });
+
+  test("v7 snapshotのlayers/layerId欠落を既定レイヤーへ移行する", () => {
+    const state = new OverlayState();
+    const raw = {
+      type: "snapshot",
+      protocolVersion: 7,
+      rev: 3,
+      fadeAfterMs: null,
+      items: [
+        {
+          kind: "stroke",
+          strokeId: "legacy",
+          brush,
+          pts: [[0.1, 0.2, 1, 0, 0, 0]],
+          done: true,
+          endedAt: 1,
+        },
+      ],
+    };
+    expect(state.apply(raw as unknown as ServerToOverlayMessage).kind).toBe(
+      "rebuild",
+    );
+    expect(state.layers).toEqual([{ layerId: "default", name: "レイヤー 1" }]);
+    expect(state.items[0]?.layerId).toBe("default");
+  });
+
+  test("v6/v7 sessionのlayerIdなし増分eventを既定レイヤーへ移行する", () => {
+    for (const protocolVersion of [6, 7]) {
+      const state = new OverlayState();
+      expect(
+        state.apply({
+          type: "snapshot",
+          protocolVersion,
+          rev: 0,
+          fadeAfterMs: null,
+          items: [],
+        }).kind,
+      ).toBe("rebuild");
+
+      const legacyEvents = [
+        { type: "stroke_begin", rev: 1, strokeId: "stroke", brush },
+        {
+          type: "shape_begin",
+          rev: 2,
+          shape: {
+            itemId: "shape",
+            shape: "rectangle",
+            style: { color: "#fff", opacity: 1, widthN: 0.01 },
+            start: [0.1, 0.1],
+            end: [0.2, 0.2],
+            done: false,
+            endedAt: null,
+          },
+        },
+        {
+          type: "stamp_add",
+          rev: 3,
+          stamp: {
+            itemId: "stamp",
+            stampId: "asset",
+            center: [0.5, 0.5],
+            widthN: 0.1,
+            heightN: 0.1,
+            opacity: 1,
+            done: true,
+            endedAt: 1,
+          },
+        },
+        {
+          type: "redo",
+          rev: 4,
+          item: {
+            kind: "stroke",
+            strokeId: "redo",
+            brush,
+            pts: [],
+            done: true,
+            endedAt: 2,
+          },
+        },
+      ];
+      for (const event of legacyEvents) {
+        expect(
+          state.apply(event as unknown as ServerToOverlayMessage).kind,
+        ).not.toBe("resync");
+      }
+      expect(state.items.map((item) => item.layerId)).toEqual([
+        "default",
+        "default",
+        "default",
+        "default",
+      ]);
+    }
+  });
+
+  test("v8のlayerId欠落とv7 sessionのlayer eventはresyncする", () => {
+    const current = synchronizedState();
+    expect(
+      current.apply({
+        type: "stroke_begin",
+        rev: 1,
+        strokeId: "missing-layer",
+        brush,
+      } as unknown as ServerToOverlayMessage).kind,
+    ).toBe("resync");
+
+    const unknownRedo = synchronizedState();
+    expect(
+      unknownRedo.apply({
+        type: "redo",
+        rev: 1,
+        item: { ...strokeItem("unknown-redo"), layerId: "missing" },
+      }).kind,
+    ).toBe("resync");
+
+    const legacy = new OverlayState();
+    legacy.apply({
+      type: "snapshot",
+      protocolVersion: 7,
+      rev: 0,
+      fadeAfterMs: null,
+      items: [],
+    });
+    expect(
+      legacy.apply({
+        type: "layer_add",
+        rev: 1,
+        layer: { layerId: "unexpected", name: "Layer" },
+      }).kind,
+    ).toBe("resync");
+  });
+
+  test("layer add/deleteは対象itemだけを変更しclearはlayerを維持する", () => {
+    const state = synchronizedState([strokeItem("bottom")]);
+    expect(
+      applyNext(state, {
+        type: "layer_add",
+        layer: { layerId: "top", name: "レイヤー 2" },
+      }).kind,
+    ).toBe("none");
+    expect(
+      applyNext(state, {
+        type: "stroke_begin",
+        strokeId: "top-stroke",
+        layerId: "top",
+        brush,
+      }).kind,
+    ).toBe("active");
+    applyNext(state, {
+      type: "stroke_end",
+      strokeId: "top-stroke",
+      endedAt: 2,
+    });
+    expect(
+      applyNext(state, { type: "layer_delete", layerId: "top" }).kind,
+    ).toBe("rebuild");
+    expect(
+      state.items.map((item) => item.kind === "stroke" && item.strokeId),
+    ).toEqual(["bottom"]);
+    expect(state.layers).toHaveLength(1);
+
+    applyNext(state, {
+      type: "layer_add",
+      layer: { layerId: "empty", name: "レイヤー 3" },
+    });
+    expect(applyNext(state, { type: "clear" }).kind).toBe("rebuild");
+    expect(state.layers.map((layer) => layer.layerId)).toEqual([
+      "default",
+      "empty",
+    ]);
+  });
+
+  test("未知layer参照と最後のlayer削除はresyncする", () => {
+    const unknown = synchronizedState();
+    expect(
+      applyNext(unknown, {
+        type: "stroke_begin",
+        strokeId: "bad",
+        layerId: "missing",
+        brush,
+      }).kind,
+    ).toBe("resync");
+
+    const last = synchronizedState();
+    expect(
+      applyNext(last, { type: "layer_delete", layerId: "default" }).kind,
+    ).toBe("resync");
   });
 });

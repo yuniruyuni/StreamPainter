@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- 最大8枚の描画レイヤーをラジアルパネルまたは従来メニューから追加・選択・削除する機能。
+  消しゴムと選択は現在レイヤーだけを対象にし、Undo／Redoは全レイヤーの操作順を維持
+
+### Changed
+
+- ローカルWebSocket protocolをversion 8へ更新し、snapshotのレイヤーカタログ、CanvasItemの
+  `layerId`、`layer_add`／`layer_delete`を追加。version 6/7の欠落レイヤー情報は既定レイヤーへ移行
+- Windows／Browser Sourceの描画をレイヤー別cacheへ変更し、active strokeとtransform中も
+  別レイヤーや選択対象より前の長い履歴を毎フレーム再生しない構成へ更新
+- レイヤー削除時は描画またはUndo／Redo履歴があれば不可逆確認を表示し、削除後は安全のため
+  履歴を破棄。全消去後もレイヤーカタログは維持
+
 ## [0.7.3] - 2026-08-03
 
 ### Changed

@@ -213,12 +213,17 @@ function harness(): Harness {
   };
 }
 
+function resetRuntimeCanvasLogs(runtime: FakeRuntime): void {
+  for (const canvas of runtime.canvases) canvas.context.resetLogs();
+}
+
 function stamp(
   center: [number, number] = [0.5, 0.5],
 ): Extract<CanvasItem, { kind: "stamp" }> {
   return {
     kind: "stamp",
     itemId: "item-1",
+    layerId: "default",
     stampId: "stamp-1",
     center,
     widthN: 0.1,
@@ -240,6 +245,7 @@ function marker(
   return {
     kind: "stroke",
     strokeId: `marker-${index}`,
+    layerId: "default",
     brush: {
       tool: "marker",
       color: "#ff00ff",
@@ -269,6 +275,7 @@ function lineShape(): Extract<CanvasItem, { kind: "shape" }> {
   return {
     kind: "shape",
     itemId: "shape-1",
+    layerId: "default",
     shape: "line",
     style: { color: "#00ffff", opacity: 0.7, widthN: 0.01 },
     start: [0.2, 0.8],
@@ -285,6 +292,7 @@ function rectangleShape(
   return {
     kind: "shape",
     itemId,
+    layerId: "default",
     shape: "rectangle",
     style: { color, opacity: 1, widthN: 0.01 },
     start: [0.2, 0.2],
@@ -323,7 +331,7 @@ describe("OverlayLayers marker compositing scratch", () => {
   });
 
   test("自己交差する半透明strokeを不透明scratchから1回だけ合成する", () => {
-    const { layers, baked, runtime } = harness();
+    const { layers, runtime } = harness();
     const crossingPoints: Extract<CanvasItem, { kind: "stroke" }>["pts"] = [
       [0.2, 0.2, 1, 0, 0, 0],
       [0.8, 0.8, 1, 1, 0, 0],
@@ -334,8 +342,9 @@ describe("OverlayLayers marker compositing scratch", () => {
 
     layers.rebuild([marker(1, 0.35, crossingPoints)]);
 
-    expect(runtime.canvases).toHaveLength(1);
-    const scratch = runtime.canvases[0] as FakeCanvas;
+    expect(runtime.canvases).toHaveLength(2);
+    const layerCanvas = runtime.canvases[0] as FakeCanvas;
+    const scratch = runtime.canvases[1] as FakeCanvas;
     const scratchStrokes = scratch.context.operations.filter(
       (operation) => operation.kind === "stroke",
     );
@@ -347,11 +356,11 @@ describe("OverlayLayers marker compositing scratch", () => {
           operation.compositeOperation === "source-over",
       ),
     ).toBe(true);
-    expect(baked.context.drawImageCalls).toEqual([
+    expect(layerCanvas.context.drawImageCalls).toEqual([
       { image: scratch.asCanvas(), args: [0, 0] },
     ]);
     expect(
-      baked.context.operations.filter(
+      layerCanvas.context.operations.filter(
         (operation) => operation.kind === "draw_image",
       ),
     ).toEqual([
@@ -370,6 +379,7 @@ describe("OverlayLayers marker compositing scratch", () => {
     layers.rebuild([stampItem]);
     runtime.images[0]?.succeed();
     baked.context.resetLogs();
+    resetRuntimeCanvasLogs(runtime);
 
     layers.rebuild([
       marker(1, 0.4),
@@ -379,8 +389,9 @@ describe("OverlayLayers marker compositing scratch", () => {
       marker(3, 0.6),
     ]);
 
-    const scratch = runtime.canvases[0] as FakeCanvas;
-    const renderOperations = baked.context.operations.filter(
+    const layerCanvas = runtime.canvases[0] as FakeCanvas;
+    const scratch = runtime.canvases[1] as FakeCanvas;
+    const renderOperations = layerCanvas.context.operations.filter(
       (operation) => operation.kind !== "clear",
     );
     expect(
@@ -405,7 +416,7 @@ describe("OverlayLayers marker compositing scratch", () => {
       runtime.images[0]?.asImage(),
       scratch.asCanvas(),
     ]);
-    expect(runtime.canvases).toHaveLength(1);
+    expect(runtime.canvases).toHaveLength(2);
   });
 
   test("1080p・4Kの500 markersを1枚のscratchで再構築する", () => {
@@ -419,19 +430,20 @@ describe("OverlayLayers marker compositing scratch", () => {
       layers.resize(width, height, items);
       const elapsedMs = performance.now() - startedAt;
       expect(elapsedMs).toBeLessThan(rebuildLimitMs);
-      expect(baked.context.drawImageCalls).toHaveLength(500);
+      expect(baked.context.drawImageCalls).toHaveLength(1);
       return elapsedMs;
     };
 
     rebuildAt(1_920, 1_080);
-    expect(runtime.canvases).toHaveLength(1);
-    const scratch = runtime.canvases[0] as FakeCanvas;
+    expect(runtime.canvases).toHaveLength(2);
+    const layerCanvas = runtime.canvases[0] as FakeCanvas;
+    const scratch = runtime.canvases[1] as FakeCanvas;
     expect([scratch.width, scratch.height]).toEqual([1_920, 1_080]);
     expect(scratch.context.clearRectCalls).toBe(500);
 
     rebuildAt(3_840, 2_160);
-    expect(runtime.canvases).toHaveLength(1);
-    expect(runtime.canvases[0]).toBe(scratch);
+    expect(runtime.canvases).toHaveLength(2);
+    expect(runtime.canvases[1]).toBe(scratch);
     expect([scratch.width, scratch.height]).toEqual([3_840, 2_160]);
     expect(scratch.context.clearRectCalls).toBe(1_000);
 
@@ -439,11 +451,132 @@ describe("OverlayLayers marker compositing scratch", () => {
     const startedAt = performance.now();
     layers.rebuild(items);
     expect(performance.now() - startedAt).toBeLessThan(rebuildLimitMs);
-    expect(runtime.canvases).toHaveLength(1);
-    expect(baked.context.drawImageCalls).toHaveLength(500);
+    expect(runtime.canvases).toHaveLength(2);
+    expect(baked.context.drawImageCalls).toHaveLength(1);
+    expect(layerCanvas.context.drawImageCalls).toHaveLength(1_500);
 
     layers.dispose();
     expect([scratch.width, scratch.height]).toEqual([0, 0]);
+  });
+});
+
+describe("OverlayLayers user layer compositing", () => {
+  const documentLayers = [
+    { layerId: "default", name: "レイヤー 1" },
+    { layerId: "top", name: "レイヤー 2" },
+  ];
+
+  test("layerを下から上へ合成しeraserは所属layerだけへ適用する", () => {
+    const { layers, baked, runtime } = harness();
+    const bottom = marker(1, 1);
+    const top = { ...marker(2, 1), layerId: "top" };
+    const topEraser = { ...eraser(3), layerId: "top" };
+
+    layers.rebuild([bottom, top, topEraser], documentLayers);
+
+    const bottomCanvas = runtime.canvases[0] as FakeCanvas;
+    const topCanvas = runtime.canvases[1] as FakeCanvas;
+    expect(
+      bottomCanvas.context.operations.some(
+        (operation) => operation.compositeOperation === "destination-out",
+      ),
+    ).toBe(false);
+    expect(
+      topCanvas.context.operations.some(
+        (operation) => operation.compositeOperation === "destination-out",
+      ),
+    ).toBe(true);
+    expect(
+      baked.context.drawImageCalls.slice(-2).map((call) => call.image),
+    ).toEqual([bottomCanvas.asCanvas(), topCanvas.asCanvas()]);
+  });
+
+  test("下位layerのactive strokeを上位layerより下へ合成する", () => {
+    const { layers, active, runtime } = harness();
+    const drawing = { ...marker(1, 1), done: false, endedAt: null };
+    const upper = { ...marker(2, 1), layerId: "top" };
+    layers.rebuild([drawing, upper], documentLayers);
+    layers.beginActive(drawing);
+    layers.appendActive(drawing);
+    layers.renderActive();
+
+    const upperCanvas = runtime.canvases.find((canvas) =>
+      canvas.context.operations.some(
+        (operation) =>
+          operation.kind === "stroke" && operation.strokeStyle === "#ff00ff",
+      ),
+    );
+    expect(upperCanvas).toBeDefined();
+    const preview = runtime.canvases.at(-1) as FakeCanvas;
+    expect(
+      active.context.drawImageCalls.slice(-2).map((call) => call.image),
+    ).toEqual([
+      preview.asCanvas(),
+      upperCanvas?.asCanvas() as CanvasImageSource,
+    ]);
+  });
+
+  test("layer削除時に不要offscreen canvasを解放する", () => {
+    const { layers, runtime } = harness();
+    const bottom = marker(1, 1);
+    const top = { ...marker(2, 1), layerId: "top" };
+    layers.rebuild([bottom, top], documentLayers);
+    const topCanvas = runtime.canvases[1] as FakeCanvas;
+
+    layers.rebuild([bottom], [documentLayers[0] as (typeof documentLayers)[0]]);
+    expect([topCanvas.width, topCanvas.height]).toEqual([0, 0]);
+  });
+
+  test("active eraserの1点追加は所属layer scratchへ1segmentだけ追記する", () => {
+    const { layers, runtime } = harness();
+    const base = marker(1, 1);
+    const drawing = {
+      ...eraser(2),
+      done: false,
+      endedAt: null,
+      pts: [
+        [0.1, 0.5, 1, 0, 0, 0],
+        [0.3, 0.5, 1, 1, 0, 0],
+        [0.5, 0.5, 1, 2, 0, 0],
+        [0.7, 0.5, 1, 3, 0, 0],
+      ] as Extract<CanvasItem, { kind: "stroke" }>["pts"],
+    };
+    layers.rebuild([base, drawing]);
+    const eraserScratch = runtime.canvases.find(
+      (canvas) =>
+        canvas.context.drawImageCalls.length > 0 &&
+        canvas.context.operations.some(
+          (operation) =>
+            operation.kind === "stroke" &&
+            operation.compositeOperation === "destination-out",
+        ),
+    );
+    expect(eraserScratch).toBeDefined();
+
+    resetRuntimeCanvasLogs(runtime);
+    const updated = {
+      ...drawing,
+      pts: [...drawing.pts, [0.9, 0.5, 1, 4, 0, 0]] as Extract<
+        CanvasItem,
+        { kind: "stroke" }
+      >["pts"],
+    };
+    layers.setDocument([base, updated], [{ layerId: "default", name: "L1" }]);
+    layers.appendActive(updated);
+
+    const incrementalEraserStrokes = runtime.canvases.flatMap((canvas) =>
+      canvas.context.operations.filter(
+        (operation) =>
+          operation.kind === "stroke" &&
+          operation.compositeOperation === "destination-out",
+      ),
+    );
+    expect(incrementalEraserStrokes).toHaveLength(1);
+    expect(
+      eraserScratch?.context.operations.filter(
+        (operation) => operation.kind === "stroke",
+      ),
+    ).toHaveLength(1);
   });
 });
 
@@ -472,6 +605,7 @@ describe("OverlayLayers item transform history ordering", () => {
 
     baked.context.resetLogs();
     active.context.resetLogs();
+    resetRuntimeCanvasLogs(runtime);
     layers.prepareItemPreview(transformed);
     layers.previewItem(transformed, true);
     layers.renderActive();
@@ -483,16 +617,16 @@ describe("OverlayLayers item transform history ordering", () => {
     );
     const prefix = runtime.canvases.at(-1) as FakeCanvas;
     expect(
-      active.context.operations.map((operation) => [
+      prefix.context.operations.map((operation) => [
         operation.kind,
         operation.alpha,
         operation.compositeOperation,
         operation.strokeStyle,
-        operation.image === prefix.asCanvas() ? "prefix" : undefined,
+        undefined,
       ]),
     ).toEqual([
       ["clear", 1, "source-over", undefined, undefined],
-      ["draw_image", 1, "source-over", undefined, "prefix"],
+      ["draw_image", 1, "source-over", undefined, undefined],
       ["stroke", 1, "source-over", "#00ff00", undefined],
       ["draw_image", 0.6, "source-over", undefined, undefined],
       ["stroke", 1, "destination-out", "#000000", undefined],
@@ -501,13 +635,14 @@ describe("OverlayLayers item transform history ordering", () => {
 
     // commit時のsuffix順もpreviewと同一で、targetが最前面へ移動しない。
     baked.context.resetLogs();
+    resetRuntimeCanvasLogs(runtime);
     layers.rebuild([
       history[0] as CanvasItem,
       transformed,
       ...history.slice(2),
     ]);
     expect(
-      baked.context.operations
+      (runtime.canvases[0] as FakeCanvas).context.operations
         .filter((operation) => operation.kind !== "clear")
         .map((operation) => [
           operation.kind,
@@ -525,7 +660,7 @@ describe("OverlayLayers item transform history ordering", () => {
   });
 
   test("first previewのRAF前resizeでもbaked ghostを作らずtransformと順序を維持する", () => {
-    const { layers, baked, active } = harness();
+    const { layers, baked, active, runtime } = harness();
     const target = rectangleShape("target", "#00ff00");
     const later = rectangleShape("later", "#0000ff");
     const prefix = marker(1, 0.4);
@@ -544,6 +679,7 @@ describe("OverlayLayers item transform history ordering", () => {
     layers.prepareItemPreview(transformed);
     baked.context.resetLogs();
     active.context.resetLogs();
+    resetRuntimeCanvasLogs(runtime);
     layers.resize(1_200, 600, [prefix, transformed, later]);
     expect(
       baked.context.operations.filter(
@@ -554,9 +690,11 @@ describe("OverlayLayers item transform history ordering", () => {
     // resizeが最初のqueueを取り消した後のrebuildBaked=false previewでも、
     // resize時に作ったprefixを保持してtargetを一度だけ正しい位置へ描く。
     active.context.resetLogs();
+    resetRuntimeCanvasLogs(runtime);
     layers.previewItem(transformed, false);
     layers.renderActive();
-    const strokes = active.context.operations.filter(
+    const preview = runtime.canvases.at(-1) as FakeCanvas;
+    const strokes = preview.context.operations.filter(
       (operation) => operation.kind === "stroke",
     );
     expect(strokes.map((operation) => operation.strokeStyle)).toEqual([
@@ -566,7 +704,7 @@ describe("OverlayLayers item transform history ordering", () => {
   });
 
   test("preview後のcommitがRAF待ちでもresizeは確定履歴を通常bakedへ再構築する", () => {
-    const { layers, baked, active } = harness();
+    const { layers, baked, active, runtime } = harness();
     const prefix = rectangleShape("prefix", "#ff0000");
     const target = rectangleShape("target", "#00ff00");
     const later = rectangleShape("later", "#0000ff");
@@ -587,10 +725,11 @@ describe("OverlayLayers item transform history ordering", () => {
     layers.prepareRebuild();
     baked.context.resetLogs();
     active.context.resetLogs();
+    resetRuntimeCanvasLogs(runtime);
     layers.resize(1_200, 600, [prefix, transformed, later]);
 
     expect(
-      baked.context.operations
+      (runtime.canvases[0] as FakeCanvas).context.operations
         .filter((operation) => operation.kind === "stroke")
         .map((operation) => operation.strokeStyle),
     ).toEqual(["#ff0000", "#00ff00", "#0000ff"]);
@@ -600,11 +739,66 @@ describe("OverlayLayers item transform history ordering", () => {
       ),
     ).toEqual([]);
   });
+
+  test("連続previewはselected前prefixと別layerの履歴を再生しない", () => {
+    const { layers, runtime } = harness();
+    const points = Array.from({ length: 40 }, (_, index) => [
+      index / 39,
+      0.2,
+      1,
+      index,
+      0,
+      0,
+    ]) as Extract<CanvasItem, { kind: "stroke" }>["pts"];
+    const prefix = {
+      ...marker(10, 1, points),
+      brush: { ...marker(10).brush, color: "#111111", opacity: 1 },
+    };
+    const target = rectangleShape("target-prefix", "#00ff00");
+    const suffix = {
+      ...marker(11, 1, points),
+      brush: { ...marker(11).brush, color: "#222222", opacity: 1 },
+    };
+    const otherLayer = {
+      ...marker(12, 1, points),
+      layerId: "top",
+      brush: { ...marker(12).brush, color: "#333333", opacity: 1 },
+    };
+    const documentLayers = [
+      { layerId: "default", name: "L1" },
+      { layerId: "top", name: "L2" },
+    ];
+    layers.rebuild([prefix, target, suffix, otherLayer], documentLayers);
+    const transformed = {
+      ...target,
+      transform: {
+        center: [0.6, 0.5] as [number, number],
+        widthN: 0.3,
+        heightN: 0.2,
+        rotation: 0.2,
+      },
+    };
+    layers.prepareItemPreview(transformed);
+    layers.previewItem(transformed, true);
+    layers.renderActive();
+
+    resetRuntimeCanvasLogs(runtime);
+    layers.previewItem(transformed, false);
+    layers.renderActive();
+    const replayedColors = runtime.canvases.flatMap((canvas) =>
+      canvas.context.operations
+        .filter((operation) => operation.kind === "stroke")
+        .map((operation) => operation.strokeStyle),
+    );
+    expect(replayedColors).not.toContain("#111111");
+    expect(replayedColors).not.toContain("#333333");
+    expect(replayedColors).toContain("#222222");
+  });
 });
 
 describe("OverlayLayers stamp image retry", () => {
   test("一時失敗後にretry成功するとbakedへ再描画する", () => {
-    const { layers, baked, active, runtime } = harness();
+    const { layers, active, runtime } = harness();
     layers.rebuild([stamp()]);
     expect(runtime.images).toHaveLength(1);
     expect(runtime.images[0]?.src).toBe("/stamps/stamp-1");
@@ -616,10 +810,13 @@ describe("OverlayLayers stamp image retry", () => {
     expect(runtime.images[1]?.src).toBe("/stamps/stamp-1?retry=1");
 
     runtime.images[1]?.succeed();
-    expect(baked.context.drawImageCalls).toHaveLength(1);
-    expect(baked.context.drawImageCalls[0]?.image).toBe(
-      runtime.images[1]?.asImage(),
-    );
+    expect(
+      runtime.canvases.some((canvas) =>
+        canvas.context.drawImageCalls.some(
+          (call) => call.image === runtime.images[1]?.asImage(),
+        ),
+      ),
+    ).toBe(true);
     expect(active.context.drawImageCalls).toHaveLength(0);
     expect(runtime.timers.pendingDelays()).toEqual([]);
   });
@@ -635,11 +832,15 @@ describe("OverlayLayers stamp image retry", () => {
     runtime.timers.advanceBy(1_000);
     runtime.images[1]?.succeed();
 
-    expect(baked.context.drawImageCalls).toHaveLength(0);
-    expect(active.context.drawImageCalls.at(-1)).toEqual({
-      image: runtime.images[1]?.asImage(),
-      args: [-50, -50, 100, 100],
-    });
+    expect(baked.context.operations.at(-1)?.kind).toBe("clear");
+    expect(
+      runtime.canvases.some((canvas) =>
+        canvas.context.drawImageCalls.some(
+          (call) => call.image === runtime.images[1]?.asImage(),
+        ),
+      ),
+    ).toBe(true);
+    expect(active.context.drawImageCalls.length).toBeGreaterThan(0);
   });
 
   test("連続失敗は30秒上限のexponential backoffでrebuild時も重複しない", () => {
@@ -677,11 +878,12 @@ describe("OverlayLayers stamp image retry", () => {
     const loading = harness();
     loading.layers.rebuild([stamp()]);
     const pending = loading.runtime.images[0];
+    const bakedDraws = loading.baked.context.drawImageCalls.length;
     loading.layers.setItems([]);
     expect(pending?.onload).toBeNull();
     expect(pending?.onerror).toBeNull();
     pending?.succeed();
-    expect(loading.baked.context.drawImageCalls).toHaveLength(0);
+    expect(loading.baked.context.drawImageCalls).toHaveLength(bakedDraws);
   });
 
   test("disposeはretryとload callbackを停止し再描画しない", () => {
@@ -697,11 +899,13 @@ describe("OverlayLayers stamp image retry", () => {
     const loading = harness();
     loading.layers.rebuild([stamp()]);
     const pending = loading.runtime.images[0];
+    const bakedDraws = loading.baked.context.drawImageCalls.length;
+    const activeDraws = loading.active.context.drawImageCalls.length;
     loading.layers.dispose();
     expect(pending?.onload).toBeNull();
     expect(pending?.onerror).toBeNull();
     pending?.succeed();
-    expect(loading.baked.context.drawImageCalls).toHaveLength(0);
-    expect(loading.active.context.drawImageCalls).toHaveLength(0);
+    expect(loading.baked.context.drawImageCalls).toHaveLength(bakedDraws);
+    expect(loading.active.context.drawImageCalls).toHaveLength(activeDraws);
   });
 });

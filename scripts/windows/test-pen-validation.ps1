@@ -25,10 +25,34 @@ function Add-TestStroke {
 }
 function New-StartedState {
     $state = New-PenValidationState
-    Add-PenValidationMessage $state ([pscustomobject]@{type='snapshot';protocolVersion=7;rev=20;items=@(
+    Add-PenValidationMessage $state ([pscustomobject]@{type='snapshot';protocolVersion=8;rev=20;layers=@(
+        [pscustomobject]@{layerId='default';name='レイヤー 1'});items=@(
         [pscustomobject]@{kind='stroke';pts=@(@(0,0,0,0,0,0))})})
     return $state
 }
+
+foreach ($supportedProtocol in @(6, 7, 8)) {
+    $supportedState = New-PenValidationState
+    Add-PenValidationMessage $supportedState ([pscustomobject]@{
+        type='snapshot';protocolVersion=$supportedProtocol;rev=0;items=@()
+    })
+    Assert-True ($supportedState.ProtocolVersion -eq $supportedProtocol) `
+        "protocol v$supportedProtocol baseline accepted"
+}
+foreach ($unsupportedProtocol in @(5, 9)) {
+    Assert-Throws {
+        $unsupportedState = New-PenValidationState
+        Add-PenValidationMessage $unsupportedState ([pscustomobject]@{
+            type='snapshot';protocolVersion=$unsupportedProtocol;rev=0;items=@()
+        })
+    } '6, 7, or 8' "protocol v$unsupportedProtocol baseline rejected"
+}
+
+$v8PenOnly = New-StartedState
+Add-TestStroke $v8PenOnly 'v8-without-layer-id' 21 @(
+    ,@(0,0,0.20,0,-0.04,-0.03),,@(0,0,0.80,1,0.04,0.03))
+Assert-True ($v8PenOnly.CompletedStrokes -eq 1) `
+    'protocol v8 pen-only validator does not require layerId'
 
 $emptyProgressState = New-PenValidationState
 $emptyProgress = Get-PenValidationProgressText $emptyProgressState
@@ -181,7 +205,7 @@ Assert-True ((Get-PenValidationResult $ps51UnwrappedPoint).CompletedMarkerStroke
 Assert-Throws {
     $postBaselineSnapshot = New-StartedState
     Add-PenValidationMessage $postBaselineSnapshot ([pscustomobject]@{type='stroke_begin';rev=21;strokeId='interrupted';brush=(New-Brush)})
-    Add-PenValidationMessage $postBaselineSnapshot ([pscustomobject]@{type='snapshot';protocolVersion=7;rev=22;items=@()})
+    Add-PenValidationMessage $postBaselineSnapshot ([pscustomobject]@{type='snapshot';protocolVersion=8;rev=22;layers=@();items=@()})
 } 'unexpected snapshot after baseline' 'authoritative snapshot interrupts validation'
 Assert-Throws {
     $revisionGap = New-StartedState
