@@ -1816,10 +1816,12 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
             item_counts: &layer_counts,
             active_layer_id: &active_layer_id,
         },
-        can_undo,
-        can_redo,
-        can_clear,
-        confirm_before_clear,
+        menu::CommandMenuState {
+            can_undo,
+            can_redo,
+            can_clear,
+            confirm_before_clear,
+        },
     );
     apply_menu_result(hwnd, app_ptr, action);
 }

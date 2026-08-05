@@ -111,6 +111,13 @@ pub struct LayerMenuState<'a> {
     pub active_layer_id: &'a str,
 }
 
+pub struct CommandMenuState {
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub can_clear: bool,
+    pub confirm_before_clear: bool,
+}
+
 /// メニューを表示し、選択されたアクションを返す (選択なしは None)
 pub fn show(
     hwnd: HWND,
@@ -118,16 +125,19 @@ pub fn show(
     color: &str,
     stamps: &[StampConfig],
     layer_state: LayerMenuState<'_>,
-    can_undo: bool,
-    can_redo: bool,
-    can_clear: bool,
-    confirm_before_clear: bool,
+    command_state: CommandMenuState,
 ) -> Option<MenuAction> {
     let LayerMenuState {
         layers,
         item_counts: layer_item_counts,
         active_layer_id,
     } = layer_state;
+    let CommandMenuState {
+        can_undo,
+        can_redo,
+        can_clear,
+        confirm_before_clear,
+    } = command_state;
     // TrackPopupMenu の内部メッセージループ中に通常の projector timer が動いても、
     // overlay をこの popup より前へ移動させない。
     let _foreground_ui = crate::win::projector::ForegroundUiGuard::new();

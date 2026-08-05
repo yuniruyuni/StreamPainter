@@ -1068,7 +1068,7 @@ impl CanvasEngine {
     }
 
     pub fn can_clear(&self) -> bool {
-        self.active.is_none() && !self.items.lock().unwrap().is_empty()
+        self.active.is_none() && self.has_items()
     }
 
     pub fn clear(&mut self) -> Vec<PainterMessage> {
