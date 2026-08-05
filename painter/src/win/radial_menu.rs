@@ -79,6 +79,7 @@ pub enum RadialSelection {
     Command(RadialCommand),
     Layer(usize),
     LayerAdd,
+    LayerClear,
     LayerDelete,
 }
 
@@ -286,6 +287,7 @@ impl RadialMenu {
                         | MenuAction::Redo
                         | MenuAction::SelectLayer(_)
                         | MenuAction::AddLayer
+                        | MenuAction::ClearLayer(_)
                         | MenuAction::DeleteLayer(_)
                 );
             return RadialRelease::Action { action, keep_open };
@@ -298,6 +300,7 @@ impl RadialMenu {
                         | RadialSelection::Command(_)
                         | RadialSelection::Layer(_)
                         | RadialSelection::LayerAdd
+                        | RadialSelection::LayerClear
                         | RadialSelection::LayerDelete
                 )
             )
@@ -390,6 +393,25 @@ impl RadialMenu {
             right: panel.right - 5.0 * self.scale,
             bottom: panel.top + 5.0 * self.scale + size,
         }
+    }
+
+    /// 現在レイヤーの内容だけを消去するヘッダーボタン。
+    pub fn layer_clear_button(&self) -> RadialRect {
+        let add = self.layer_add_button();
+        let gap = 5.0 * self.scale;
+        let size = LAYER_ACTION_SIZE * self.scale;
+        RadialRect {
+            left: add.left - gap - size,
+            top: add.top,
+            right: add.left - gap,
+            bottom: add.bottom,
+        }
+    }
+
+    pub fn layer_clear_enabled(&self) -> bool {
+        self.layers
+            .iter()
+            .any(|layer| layer.layer_id == self.active_layer_id && layer.item_count > 0)
     }
 
     /// 表示順（上レイヤーから）とmodel indexの対応。
@@ -592,6 +614,9 @@ impl RadialMenu {
         if add_button.contains(local) {
             return Some(RadialSelection::LayerAdd);
         }
+        if self.layer_clear_button().contains(local) {
+            return Some(RadialSelection::LayerClear);
+        }
         if self.layers.len() > 1
             && self
                 .layer_delete_button()
@@ -683,6 +708,9 @@ impl RadialMenu {
             RadialSelection::LayerAdd if self.layers.len() < MAX_LAYERS => {
                 Some(MenuAction::AddLayer)
             }
+            RadialSelection::LayerClear if self.layer_clear_enabled() => {
+                Some(MenuAction::ClearLayer(self.active_layer_id.clone()))
+            }
             RadialSelection::LayerDelete if self.layers.len() > 1 => {
                 Some(MenuAction::DeleteLayer(self.active_layer_id.clone()))
             }
@@ -691,6 +719,7 @@ impl RadialMenu {
             | RadialSelection::Stamp(_)
             | RadialSelection::Command(_)
             | RadialSelection::LayerAdd
+            | RadialSelection::LayerClear
             | RadialSelection::LayerDelete => None,
         }
     }
@@ -1351,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_layer_rows_add_and_delete_are_directly_hittable() {
+    fn pinned_layer_rows_and_actions_are_directly_hittable() {
         let mut menu = pin_at_anchor(layer_menu((500.0, 400.0), 3, 1));
         assert_eq!(
             menu.layer_rows()
@@ -1387,6 +1416,18 @@ mod tests {
         );
 
         assert!(menu.begin_click(21));
+        let clear = screen_for_local(&menu, menu.layer_clear_button().center());
+        menu.update(clear);
+        assert_eq!(menu.highlighted(), Some(RadialSelection::LayerClear));
+        assert_eq!(
+            menu.release(clear),
+            RadialRelease::Action {
+                action: MenuAction::ClearLayer("layer-1".into()),
+                keep_open: true,
+            }
+        );
+
+        assert!(menu.begin_click(22));
         let delete = screen_for_local(&menu, menu.layer_delete_button().unwrap().center());
         menu.update(delete);
         assert_eq!(menu.highlighted(), Some(RadialSelection::LayerDelete));
@@ -1396,8 +1437,10 @@ mod tests {
                 action: MenuAction::DeleteLayer("layer-1".into()),
                 keep_open: true,
             },
-            "confirmation No/Yes can keep the pinned layer panel open"
+            "destructive layer actions keep the pinned panel open for immediate Undo"
         );
+
+        assert!(menu.layer_clear_button().right < menu.layer_add_button().left);
     }
 
     #[test]
@@ -1435,6 +1478,32 @@ mod tests {
     }
 
     #[test]
+    fn layer_clear_closes_a_hold_menu_but_stays_open_when_pinned() {
+        let mut hold = layer_menu((500.0, 400.0), 2, 1);
+        let target = screen_for_local(&hold, hold.layer_clear_button().center());
+        hold.update(target);
+        assert_eq!(
+            hold.release(target),
+            RadialRelease::Action {
+                action: MenuAction::ClearLayer("layer-1".into()),
+                keep_open: false,
+            }
+        );
+
+        let mut pinned = pin_at_anchor(layer_menu((500.0, 400.0), 2, 1));
+        assert!(pinned.begin_click(2));
+        let target = screen_for_local(&pinned, pinned.layer_clear_button().center());
+        pinned.update(target);
+        assert_eq!(
+            pinned.release(target),
+            RadialRelease::Action {
+                action: MenuAction::ClearLayer("layer-1".into()),
+                keep_open: true,
+            }
+        );
+    }
+
+    #[test]
     fn layer_limits_disable_add_and_last_layer_delete() {
         let mut maximum = pin_at_anchor(layer_menu((500.0, 400.0), MAX_LAYERS, 7));
         assert!(maximum.begin_click(2));
@@ -1444,6 +1513,12 @@ mod tests {
         assert_eq!(maximum.release(add), RadialRelease::StayOpen);
 
         let mut last = pin_at_anchor(layer_menu((500.0, 400.0), 1, 0));
+        assert!(last.begin_click(2));
+        let clear = screen_for_local(&last, last.layer_clear_button().center());
+        last.update(clear);
+        assert_eq!(last.highlighted(), Some(RadialSelection::LayerClear));
+        assert_eq!(last.release(clear), RadialRelease::StayOpen);
+
         assert!(last.begin_click(2));
         let delete = screen_for_local(&last, last.layer_delete_button().unwrap().center());
         last.update(delete);

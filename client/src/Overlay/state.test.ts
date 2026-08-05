@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type {
   Brush,
   CanvasItem,
+  CanvasLayer,
   PaintEvent,
   RevisionedPaintEvent,
   ServerToOverlayMessage,
@@ -36,8 +37,12 @@ function doneStroke(id: string): Stroke {
   };
 }
 
-function strokeItem(id: string): CanvasItem {
+function strokeItem(id: string): Extract<CanvasItem, { kind: "stroke" }> {
   return { kind: "stroke", ...doneStroke(id) };
+}
+
+function itemIdForTest(item: CanvasItem): string {
+  return item.kind === "stroke" ? item.strokeId : item.itemId;
 }
 
 function synchronizedState(items: CanvasItem[] = [], rev = 0): OverlayState {
@@ -60,6 +65,78 @@ function applyNext(state: OverlayState, event: PaintEvent) {
     ...event,
     rev: state.rev + 1,
   } as RevisionedPaintEvent);
+}
+
+function applyDocumentSnapshot(
+  state: OverlayState,
+  rev: number,
+  layers: CanvasLayer[],
+  items: CanvasItem[],
+) {
+  return state.apply({
+    type: "snapshot",
+    protocolVersion: PROTOCOL_VERSION,
+    rev,
+    fadeAfterMs: null,
+    layers,
+    items,
+  });
+}
+
+function layeredDocument(): {
+  layers: CanvasLayer[];
+  items: CanvasItem[];
+} {
+  const layers = [
+    { layerId: "default", name: "レイヤー 1" },
+    { layerId: "middle", name: "レイヤー 2" },
+    { layerId: "top", name: "レイヤー 3" },
+  ];
+  const items: CanvasItem[] = [
+    strokeItem("bottom-before"),
+    {
+      kind: "stamp",
+      itemId: "middle-stamp",
+      layerId: "middle",
+      stampId: "middle-asset",
+      center: [0.3, 0.4],
+      widthN: 0.1,
+      heightN: 0.2,
+      opacity: 0.8,
+      done: true,
+      endedAt: 110,
+    },
+    {
+      kind: "shape",
+      itemId: "top-shape",
+      layerId: "top",
+      shape: "rectangle",
+      style: { color: "#00ffff", opacity: 1, widthN: 0.01 },
+      start: [0.2, 0.2],
+      end: [0.6, 0.7],
+      done: true,
+      endedAt: 120,
+    },
+    {
+      ...strokeItem("middle-eraser"),
+      layerId: "middle",
+      brush: { ...brush, tool: "eraser" },
+    },
+    {
+      kind: "stamp",
+      itemId: "bottom-after",
+      layerId: "default",
+      stampId: "bottom-asset",
+      center: [0.7, 0.6],
+      widthN: 0.08,
+      heightN: 0.12,
+      opacity: 1,
+      done: true,
+      endedAt: 140,
+    },
+    { ...strokeItem("top-after"), layerId: "top" },
+  ];
+  return { layers, items };
 }
 
 describe("OverlayState", () => {
@@ -436,6 +513,88 @@ describe("OverlayState", () => {
     expect(state.layers).toEqual(layers);
     expect(state.items).toEqual(restored);
     expect(state.rev).toBe(7);
+  });
+
+  test("レイヤー内容消去のsnapshotはcatalogを維持しUndo/Redoでglobal item順を復元する", () => {
+    const { layers, items: before } = layeredDocument();
+    const cleared = before.filter((item) => item.layerId !== "middle");
+    const state = new OverlayState();
+
+    expect(applyDocumentSnapshot(state, 10, layers, before).kind).toBe(
+      "rebuild",
+    );
+    expect(applyDocumentSnapshot(state, 11, layers, cleared).kind).toBe(
+      "rebuild",
+    );
+    expect(state.layers).toEqual(layers);
+    expect(state.items).toEqual(cleared);
+    expect(state.items.map((item) => itemIdForTest(item))).toEqual([
+      "bottom-before",
+      "top-shape",
+      "bottom-after",
+      "top-after",
+    ]);
+
+    expect(applyDocumentSnapshot(state, 12, layers, before).kind).toBe(
+      "rebuild",
+    );
+    expect(state.layers).toEqual(layers);
+    expect(state.items).toEqual(before);
+    expect(state.items.map((item) => itemIdForTest(item))).toEqual([
+      "bottom-before",
+      "middle-stamp",
+      "top-shape",
+      "middle-eraser",
+      "bottom-after",
+      "top-after",
+    ]);
+
+    expect(applyDocumentSnapshot(state, 13, layers, cleared).kind).toBe(
+      "rebuild",
+    );
+    expect(state.layers).toEqual(layers);
+    expect(state.items).toEqual(cleared);
+    expect(state.rev).toBe(13);
+  });
+
+  test("レイヤー削除eventをUndo snapshotで戻しRedo eventで再削除する", () => {
+    const { layers: beforeLayers, items: beforeItems } = layeredDocument();
+    const deletedLayers = beforeLayers.filter(
+      (layer) => layer.layerId !== "middle",
+    );
+    const deletedItems = beforeItems.filter(
+      (item) => item.layerId !== "middle",
+    );
+    const state = new OverlayState();
+
+    expect(
+      applyDocumentSnapshot(state, 20, beforeLayers, beforeItems).kind,
+    ).toBe("rebuild");
+    expect(
+      applyNext(state, { type: "layer_delete", layerId: "middle" }).kind,
+    ).toBe("rebuild");
+    expect(state.layers).toEqual([
+      { layerId: "default", name: "レイヤー 1" },
+      { layerId: "top", name: "レイヤー 3" },
+    ]);
+    expect(state.items).toEqual(deletedItems);
+
+    expect(
+      applyDocumentSnapshot(state, 22, beforeLayers, beforeItems).kind,
+    ).toBe("rebuild");
+    expect(state.layers).toEqual(beforeLayers);
+    expect(state.layers[1]).toEqual({
+      layerId: "middle",
+      name: "レイヤー 2",
+    });
+    expect(state.items).toEqual(beforeItems);
+
+    expect(
+      applyNext(state, { type: "layer_delete", layerId: "middle" }).kind,
+    ).toBe("rebuild");
+    expect(state.layers).toEqual(deletedLayers);
+    expect(state.items).toEqual(deletedItems);
+    expect(state.rev).toBe(23);
   });
 
   test("eraser の cancel は rebuild になる", () => {

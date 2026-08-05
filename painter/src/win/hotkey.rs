@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use anyhow::{anyhow, Context, Result};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_ESCAPE,
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT, VK_DELETE, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_APP};
 
@@ -19,6 +19,8 @@ const SECONDARY_ID: i32 = 2;
 pub const SETTINGS_PROBE_ID: i32 = 3;
 /// WS_EX_NOACTIVATE overlayでもtransformをEscapeで取り消せる一時global hotkey。
 pub const TRANSFORM_ESCAPE_ID: i32 = 4;
+/// WS_EX_NOACTIVATE overlayでも描画モード中に現在レイヤーを消去できる一時global hotkey。
+pub const LAYER_CLEAR_ID: i32 = 5;
 
 pub fn register_transform_escape(hwnd: HWND) -> Result<()> {
     unsafe {
@@ -34,6 +36,22 @@ pub fn register_transform_escape(hwnd: HWND) -> Result<()> {
 
 pub fn unregister_transform_escape(hwnd: HWND) {
     let _ = unsafe { UnregisterHotKey(Some(hwnd), TRANSFORM_ESCAPE_ID) };
+}
+
+pub fn register_layer_clear(hwnd: HWND) -> Result<()> {
+    unsafe {
+        RegisterHotKey(
+            Some(hwnd),
+            LAYER_CLEAR_ID,
+            HOT_KEY_MODIFIERS(MOD_NOREPEAT.0),
+            u32::from(VK_DELETE.0),
+        )
+    }
+    .with_context(|| "register active-layer Delete hotkey")
+}
+
+pub fn unregister_layer_clear(hwnd: HWND) {
+    let _ = unsafe { UnregisterHotKey(Some(hwnd), LAYER_CLEAR_ID) };
 }
 
 /// 設定画面からoverlayへ同期送信する。request本体はUI thread-localへ置き、外部processが

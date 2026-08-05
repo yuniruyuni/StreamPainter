@@ -516,15 +516,106 @@ describe("OverlayLayers user layer compositing", () => {
     ]);
   });
 
-  test("layer削除時に不要offscreen canvasを解放する", () => {
-    const { layers, runtime } = harness();
+  test("layer削除rebuildはcacheを解放しUndoで元の合成位置へ復元してRedoで再解放する", () => {
+    const { layers, baked } = harness();
     const bottom = marker(1, 1);
     const top = { ...marker(2, 1), layerId: "top" };
     layers.rebuild([bottom, top], documentLayers);
-    const topCanvas = runtime.canvases[1] as FakeCanvas;
+    const [bottomCanvas, deletedTopCanvas] = baked.context.drawImageCalls
+      .slice(-2)
+      .map((call) => call.image as unknown as FakeCanvas);
 
+    baked.context.resetLogs();
     layers.rebuild([bottom], [documentLayers[0] as (typeof documentLayers)[0]]);
-    expect([topCanvas.width, topCanvas.height]).toEqual([0, 0]);
+    expect([deletedTopCanvas?.width, deletedTopCanvas?.height]).toEqual([0, 0]);
+    expect(
+      baked.context.drawImageCalls.map(
+        (call) => call.image as unknown as FakeCanvas,
+      ),
+    ).toEqual([bottomCanvas]);
+
+    baked.context.resetLogs();
+    layers.rebuild([bottom, top], documentLayers);
+    const restored = baked.context.drawImageCalls.map(
+      (call) => call.image as unknown as FakeCanvas,
+    );
+    expect(restored[0]).toBe(bottomCanvas);
+    expect(restored[1]).not.toBe(deletedTopCanvas);
+    expect([restored[1]?.width, restored[1]?.height]).toEqual([1_000, 500]);
+
+    baked.context.resetLogs();
+    layers.rebuild([bottom], [documentLayers[0] as (typeof documentLayers)[0]]);
+    expect([restored[1]?.width, restored[1]?.height]).toEqual([0, 0]);
+    expect(
+      baked.context.drawImageCalls.map(
+        (call) => call.image as unknown as FakeCanvas,
+      ),
+    ).toEqual([bottomCanvas]);
+  });
+
+  test("レイヤー内容消去snapshotはcatalogを残してcacheだけ除去しUndoでitem順と合成順を戻す", () => {
+    const { layers, baked } = harness();
+    const catalog = [
+      { layerId: "default", name: "レイヤー 1" },
+      { layerId: "middle", name: "レイヤー 2" },
+      { layerId: "top", name: "レイヤー 3" },
+    ];
+    const coloredMarker = (index: number, layerId: string, color: string) => {
+      const item = marker(index, 1);
+      return {
+        ...item,
+        layerId,
+        brush: { ...item.brush, color },
+      };
+    };
+    const before = [
+      coloredMarker(1, "default", "#ff0000"),
+      coloredMarker(2, "middle", "#00ff00"),
+      coloredMarker(3, "top", "#0000ff"),
+      coloredMarker(4, "middle", "#ffff00"),
+      coloredMarker(5, "default", "#ff00ff"),
+    ];
+    const cleared = before.filter((item) => item.layerId !== "middle");
+
+    layers.rebuild(before, catalog);
+    const [bottomCanvas, clearedMiddleCanvas, topCanvas] =
+      baked.context.drawImageCalls
+        .slice(-3)
+        .map((call) => call.image as unknown as FakeCanvas);
+
+    baked.context.resetLogs();
+    layers.rebuild(cleared, catalog);
+    expect([clearedMiddleCanvas?.width, clearedMiddleCanvas?.height]).toEqual([
+      0, 0,
+    ]);
+    expect(
+      baked.context.drawImageCalls.map(
+        (call) => call.image as unknown as FakeCanvas,
+      ),
+    ).toEqual([bottomCanvas, topCanvas]);
+
+    baked.context.resetLogs();
+    layers.rebuild(before, catalog);
+    const restored = baked.context.drawImageCalls.map(
+      (call) => call.image as unknown as FakeCanvas,
+    );
+    expect(restored[0]).toBe(bottomCanvas);
+    expect(restored[1]).not.toBe(clearedMiddleCanvas);
+    expect(restored[2]).toBe(topCanvas);
+    expect(
+      restored[1]?.context.operations
+        .filter((operation) => operation.kind === "stroke")
+        .map((operation) => operation.strokeStyle),
+    ).toEqual(["#00ff00", "#ffff00"]);
+
+    baked.context.resetLogs();
+    layers.rebuild(cleared, catalog);
+    expect([restored[1]?.width, restored[1]?.height]).toEqual([0, 0]);
+    expect(
+      baked.context.drawImageCalls.map(
+        (call) => call.image as unknown as FakeCanvas,
+      ),
+    ).toEqual([bottomCanvas, topCanvas]);
   });
 
   test("active eraserの1点追加は所属layer scratchへ1segmentだけ追記する", () => {

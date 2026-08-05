@@ -100,9 +100,11 @@ JSONフィールドはcamelCase、`type`値はsnake_caseです。
 削除します。最後の1枚は削除できません。レイヤー選択はPainter内の操作状態なので配信せず、
 新しいstroke／shape／stampの`layerId`で結果を確定します。消しゴムと選択hit-test／transformは
 現在レイヤーだけを対象にします。Undo／Redoはレイヤーをまたいだ確定時刻順を維持し、`redo.item`
-も元の`layerId`へ戻します。レイヤー削除は削除済みIDを参照する復元点を残さないためUndo／Redo
-履歴を破棄し、Painterは描画または履歴がある場合に不可逆確認を表示します。`clear`はitemだけを
-消し、レイヤーカタログは維持します。
+も元の`layerId`へ戻します。レイヤー追加・削除も履歴操作で、削除のUndoは元のカタログ位置・名前・
+item順を完全snapshotで復元し、Redoは`layer_delete`で再適用します。現在レイヤーの内容だけを
+消す操作もレイヤーカタログを維持した完全snapshotとして同期し、Undo／Redoできます。これらの
+レイヤー単位操作は確認画面を表示しません。`clear`は全レイヤーのitemだけを消し、レイヤーカタログを
+維持します。
 
 `transform`は図形とスタンプに共通する永続geometryです。`center`はcontent正規化座標、`widthN`は
 content幅、`heightN`はcontent高さに対する比率、`rotation`はcanvas上で時計回りのradianです。

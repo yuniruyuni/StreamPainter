@@ -42,7 +42,7 @@ use crate::net::obs::{self, ObsSettings, ProjectorView};
 use crate::net::obs_request::{
     PollDisposition, ProjectorRequestTracker, RequestGeneration, WorkerDisposition,
 };
-use crate::protocol::{Brush, CanvasItem, CanvasLayer, LineStyle, ShapeKind, Tool};
+use crate::protocol::{Brush, CanvasItem, CanvasLayer, LineStyle, PainterMessage, ShapeKind, Tool};
 use crate::win::hotkey::{self, ChangeCommand, HotkeyManager};
 use crate::win::menu::{self, DrawTool, MenuAction};
 use crate::win::monitor::{self, Monitor};
@@ -113,6 +113,18 @@ fn clear_confirmation_required(confirm_before_clear: bool, can_clear: bool) -> b
     confirm_before_clear && can_clear
 }
 
+/// Deleteはオーバーレイがキーボードfocusを持たないためglobal hotkeyで受ける。
+/// StreamPainter自身のUIや入力操作の最中に背後のキャンバスを消さない。
+fn layer_clear_hotkey_allowed(
+    draw_mode: bool,
+    radial_menu_open: bool,
+    foreground_ui_active: bool,
+    engine_active: bool,
+    item_drag_active: bool,
+) -> bool {
+    draw_mode && !radial_menu_open && !foreground_ui_active && !engine_active && !item_drag_active
+}
+
 struct App {
     engine: CanvasEngine,
     web: LocalServerHandle,
@@ -155,6 +167,8 @@ struct App {
     projector_z_order: projector::ZOrderGuard,
     /// 右ボタンを押している間のジェスチャーメニュー。
     radial_menu: Option<RadialMenu>,
+    /// 描画モードの間だけ予約する、現在レイヤー消去用Delete hotkey。
+    layer_clear_hotkey_registered: bool,
     /// 選択中shape/stampより前をcacheし、対象以降を履歴順にフレーム合成する。
     item_selection: Option<ItemSelection>,
     frame_gate: FrameGate,
@@ -288,6 +302,7 @@ pub fn run() -> Result<()> {
         projector_opened_by_us: false,
         projector_z_order: projector::ZOrderGuard::default(),
         radial_menu: None,
+        layer_clear_hotkey_registered: false,
         item_selection: None,
         frame_gate: FrameGate::default(),
     });
@@ -463,10 +478,6 @@ fn select_monitor(monitors: &[Monitor], configured: usize) -> Option<(usize, Mon
         .or_else(|| monitors.first().copied().map(|monitor| (0, monitor)))
 }
 
-fn layer_delete_requires_confirmation(item_count: usize, can_undo: bool, can_redo: bool) -> bool {
-    item_count > 0 || can_undo || can_redo
-}
-
 /// Freehand tool dynamics are serialized with each stroke so Direct2D and the
 /// Browser Source never need hidden platform-specific tuning.
 fn brush_for_tool(tool: &DrawTool, color: &str, width_n: f64) -> Option<Brush> {
@@ -631,6 +642,45 @@ impl App {
         }
     }
 
+    /// 複数項目やレイヤーを復元した場合は、増分eventより完全snapshotを優先する。
+    fn dispatch_engine_change(&mut self, messages: Vec<PainterMessage>) -> bool {
+        let full_sync = self.engine.take_full_sync_required();
+        let changed = full_sync || !messages.is_empty();
+        if full_sync {
+            self.web.send_snapshot();
+        } else if changed {
+            self.web.send_all(messages);
+        }
+        changed
+    }
+
+    fn set_layer_clear_hotkey_enabled(&mut self, hwnd: HWND, enabled: bool) {
+        if enabled {
+            if self.layer_clear_hotkey_registered {
+                return;
+            }
+            match hotkey::register_layer_clear(hwnd) {
+                Ok(()) => self.layer_clear_hotkey_registered = true,
+                Err(error) => warn!(
+                    "active-layer Delete hotkey is unavailable; use the layer menu instead: {error:#}"
+                ),
+            }
+        } else if self.layer_clear_hotkey_registered {
+            hotkey::unregister_layer_clear(hwnd);
+            self.layer_clear_hotkey_registered = false;
+        }
+    }
+
+    fn can_handle_layer_clear_hotkey(&self) -> bool {
+        layer_clear_hotkey_allowed(
+            self.draw_mode,
+            self.radial_menu.is_some(),
+            projector::foreground_ui_active(),
+            self.engine.is_drawing(),
+            self.item_drag_active(),
+        ) && self.engine.can_clear_layer(self.engine.active_layer_id())
+    }
+
     /// popup が閉じた後に選択結果を反映する。true はアプリ終了要求。
     fn apply_menu_action(&mut self, hwnd: HWND, action: MenuAction) -> bool {
         match action {
@@ -671,36 +721,28 @@ impl App {
             MenuAction::AddLayer => {
                 let deselected = self.item_selection.take().is_some();
                 let messages = self.engine.add_layer();
-                if !messages.is_empty() {
-                    self.web.send_all(messages);
-                }
-                if deselected {
+                let changed = self.dispatch_engine_change(messages);
+                if deselected || changed {
                     self.rebuild();
+                    self.render();
                 }
-                self.render();
             }
-            MenuAction::DeleteLayer(layer_id) => {
-                let count = self.engine.layer_item_count(&layer_id);
-                let can_undo = self.engine.can_undo();
-                let can_redo = self.engine.can_redo();
-                if layer_delete_requires_confirmation(count, can_undo, can_redo) {
-                    let name = self
-                        .engine
-                        .layers()
-                        .into_iter()
-                        .find(|layer| layer.layer_id == layer_id)
-                        .map_or_else(|| "現在のレイヤー".to_owned(), |layer| layer.name);
-                    let prompt = format!("{name} を削除しますか？\n\nこのレイヤーの描画 {count} 件と Undo/Redo 履歴が削除されます。\nこの操作は元に戻せません。");
-                    if !crate::win::confirm(hwnd, &prompt) {
-                        return false;
-                    }
+            MenuAction::ClearLayer(layer_id) => {
+                if !self.engine.can_clear_layer(&layer_id) {
+                    return false;
                 }
                 let deselected = self.item_selection.take().is_some();
-                let messages = self.engine.delete_layer(&layer_id);
-                let changed = !messages.is_empty();
-                if changed {
-                    self.web.send_all(messages);
+                let messages = self.engine.clear_layer(&layer_id);
+                let changed = self.dispatch_engine_change(messages);
+                if deselected || changed {
+                    self.rebuild();
+                    self.render();
                 }
+            }
+            MenuAction::DeleteLayer(layer_id) => {
+                let deselected = self.item_selection.take().is_some();
+                let messages = self.engine.delete_layer(&layer_id);
+                let changed = self.dispatch_engine_change(messages);
                 if deselected || changed {
                     self.rebuild();
                     self.render();
@@ -708,14 +750,8 @@ impl App {
             }
             MenuAction::Undo => {
                 let deselected = self.item_selection.take().is_some();
-                let msgs = self.engine.undo();
-                let full_sync = self.engine.take_full_sync_required();
-                let changed = full_sync || !msgs.is_empty();
-                if full_sync {
-                    self.web.send_snapshot();
-                } else if changed {
-                    self.web.send_all(msgs);
-                }
+                let messages = self.engine.undo();
+                let changed = self.dispatch_engine_change(messages);
                 if deselected || changed {
                     self.rebuild();
                     self.render();
@@ -723,11 +759,8 @@ impl App {
             }
             MenuAction::Redo => {
                 let deselected = self.item_selection.take().is_some();
-                let msgs = self.engine.redo();
-                let changed = !msgs.is_empty();
-                if changed {
-                    self.web.send_all(msgs);
-                }
+                let messages = self.engine.redo();
+                let changed = self.dispatch_engine_change(messages);
                 if deselected || changed {
                     self.rebuild();
                     self.render();
@@ -744,11 +777,8 @@ impl App {
                     return false;
                 }
                 let deselected = self.item_selection.take().is_some();
-                let msgs = self.engine.clear();
-                let changed = !msgs.is_empty();
-                if changed {
-                    self.web.send_all(msgs);
-                }
+                let messages = self.engine.clear();
+                let changed = self.dispatch_engine_change(messages);
                 if deselected || changed {
                     self.rebuild();
                     self.render();
@@ -1213,6 +1243,7 @@ impl App {
         }
         let t = std::time::Instant::now();
         self.draw_mode = on;
+        self.set_layer_clear_hotkey_enabled(hwnd, self.draw_mode);
         if !self.draw_mode {
             self.frame_gate.cancel();
             self.radial_menu = None;
@@ -1838,6 +1869,17 @@ unsafe extern "system" fn window_proc(
     }
 
     match msg {
+        WM_HOTKEY if wparam.0 as i32 == hotkey::LAYER_CLEAR_ID => {
+            let action = {
+                let app = unsafe { &*app_ptr };
+                app.can_handle_layer_clear_hotkey()
+                    .then(|| MenuAction::ClearLayer(app.engine.active_layer_id().to_owned()))
+            };
+            if action.is_some() {
+                apply_menu_result(hwnd, app_ptr, action);
+            }
+            LRESULT(0)
+        }
         WM_HOTKEY if wparam.0 as i32 == hotkey::TRANSFORM_ESCAPE_ID => {
             unsafe { &mut *app_ptr }.cancel_item_drag(hwnd);
             LRESULT(0)
@@ -2081,6 +2123,7 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             tray::remove(hwnd);
             let app = unsafe { &mut *app_ptr };
+            app.set_layer_clear_hotkey_enabled(hwnd, false);
             app.obs_worker_wake_enabled
                 .store(false, std::sync::atomic::Ordering::Release);
             if let Some(generation) = app.obs_requests.cancel() {
@@ -2151,11 +2194,15 @@ mod tests {
     }
 
     #[test]
-    fn layer_delete_confirms_for_items_or_any_history() {
-        assert!(!layer_delete_requires_confirmation(0, false, false));
-        assert!(layer_delete_requires_confirmation(1, false, false));
-        assert!(layer_delete_requires_confirmation(0, true, false));
-        assert!(layer_delete_requires_confirmation(0, false, true));
+    fn layer_clear_hotkey_is_only_allowed_while_canvas_input_is_idle() {
+        assert!(layer_clear_hotkey_allowed(true, false, false, false, false));
+        assert!(!layer_clear_hotkey_allowed(
+            false, false, false, false, false
+        ));
+        assert!(!layer_clear_hotkey_allowed(true, true, false, false, false));
+        assert!(!layer_clear_hotkey_allowed(true, false, true, false, false));
+        assert!(!layer_clear_hotkey_allowed(true, false, false, true, false));
+        assert!(!layer_clear_hotkey_allowed(true, false, false, false, true));
     }
 
     #[test]

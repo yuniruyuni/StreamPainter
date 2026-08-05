@@ -1779,6 +1779,7 @@ impl Renderer {
                 .get(index)
                 .map_or("レイヤー", |layer| layer.name.as_str()),
             Some(RadialSelection::LayerAdd) => "レイヤー\n追加",
+            Some(RadialSelection::LayerClear) => "内容\n消去",
             Some(RadialSelection::LayerDelete) => "レイヤー\n削除",
             None if menu.stamp_mode() => "スタンプ\n選択",
             None => "標準\nメニュー",
@@ -1842,6 +1843,19 @@ impl Renderer {
         let add_enabled = menu.layers().len() < crate::protocol::MAX_LAYERS;
         let add_highlighted = add_enabled && menu.highlighted() == Some(RadialSelection::LayerAdd);
         self.draw_layer_button(add, add_highlighted, add_enabled, "+", menu.scale(), text)?;
+
+        let clear = menu.layer_clear_button();
+        let clear_enabled = menu.layer_clear_enabled();
+        let clear_highlighted =
+            clear_enabled && menu.highlighted() == Some(RadialSelection::LayerClear);
+        self.draw_layer_button(
+            clear,
+            clear_highlighted,
+            clear_enabled,
+            "消",
+            menu.scale(),
+            text,
+        )?;
 
         for (index, row) in menu.layer_rows() {
             let Some(layer) = menu.layers().get(index) else {

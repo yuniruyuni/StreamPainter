@@ -107,6 +107,15 @@ describe("RenderQueue", () => {
     expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
   });
 
+  test("同一frameのレイヤー削除event・Undo snapshot・Redo eventを最新rebuild 1件へ集約する", () => {
+    const queue = new RenderQueue();
+    queue.enqueue({ kind: "rebuild" }); // layer_delete event
+    queue.enqueue({ kind: "rebuild" }); // Undo後の完全snapshot
+    queue.enqueue({ kind: "rebuild" }); // Redoのlayer_delete event
+
+    expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
+  });
+
   test("同じスタンプのpreviewは初回再構築を保ったまま最新位置へ集約する", () => {
     const queue = new RenderQueue();
     const first = stampPreview(1, true);

@@ -75,8 +75,13 @@ impl ActiveItem {
     }
 }
 
-/// 確定済み項目の追加とshape/stamp transformを、ユーザー操作の順番で戻す。
-/// Add は項目本体を items 側に保持しているため ID だけを持つ。
+/// 項目の追加・transform、全消去、レイヤーの追加・削除・内容消去を、
+/// ユーザー操作のグローバルな順番で戻す。Addは項目本体をitems側に保持するためIDだけを持つ。
+struct IndexedItem {
+    index: usize,
+    item: CanvasItem,
+}
+
 enum UndoAction {
     Add {
         item_id: String,
@@ -92,6 +97,21 @@ enum UndoAction {
     Clear {
         items: Vec<CanvasItem>,
     },
+    LayerAdd {
+        layer: CanvasLayer,
+        previous_active_layer_id: String,
+    },
+    LayerDelete {
+        layer: CanvasLayer,
+        layer_index: usize,
+        items: Vec<IndexedItem>,
+        active_before: String,
+        active_after: String,
+    },
+    LayerClear {
+        layer_id: String,
+        items: Vec<IndexedItem>,
+    },
 }
 
 /// Add の項目本体は Undo 時に items からこちらへ移す。
@@ -106,13 +126,38 @@ enum RedoAction {
         wire: TransformWire,
     },
     Clear,
+    LayerAdd {
+        layer: CanvasLayer,
+        previous_active_layer_id: String,
+    },
+    LayerDelete {
+        layer_id: String,
+        active_before: String,
+        active_after: String,
+    },
+    LayerClear {
+        layer_id: String,
+    },
 }
 
 impl UndoAction {
     fn item_id(&self) -> Option<&str> {
         match self {
             Self::Add { item_id } | Self::Transform { item_id, .. } => Some(item_id),
-            Self::Clear { .. } => None,
+            Self::Clear { .. }
+            | Self::LayerAdd { .. }
+            | Self::LayerDelete { .. }
+            | Self::LayerClear { .. } => None,
+        }
+    }
+
+    fn retained_size(&self) -> (usize, usize) {
+        match self {
+            Self::Clear { items } => item_slice_size(items),
+            Self::LayerDelete { items, .. } | Self::LayerClear { items, .. } => {
+                indexed_item_slice_size(items)
+            }
+            Self::Add { .. } | Self::Transform { .. } | Self::LayerAdd { .. } => (0, 0),
         }
     }
 }
@@ -122,9 +167,41 @@ impl RedoAction {
         match self {
             Self::Add { item } => Some(item.item_id()),
             Self::Transform { item_id, .. } => Some(item_id),
-            Self::Clear => None,
+            Self::Clear
+            | Self::LayerAdd { .. }
+            | Self::LayerDelete { .. }
+            | Self::LayerClear { .. } => None,
         }
     }
+
+    fn retained_size(&self) -> (usize, usize) {
+        match self {
+            Self::Add { item } => (1, item.point_count()),
+            Self::Transform { .. }
+            | Self::Clear
+            | Self::LayerAdd { .. }
+            | Self::LayerDelete { .. }
+            | Self::LayerClear { .. } => (0, 0),
+        }
+    }
+}
+
+fn item_slice_size(items: &[CanvasItem]) -> (usize, usize) {
+    (
+        items.len(),
+        items.iter().fold(0usize, |count, item| {
+            count.saturating_add(item.point_count())
+        }),
+    )
+}
+
+fn indexed_item_slice_size(items: &[IndexedItem]) -> (usize, usize) {
+    (
+        items.len(),
+        items.iter().fold(0usize, |count, entry| {
+            count.saturating_add(entry.item.point_count())
+        }),
+    )
 }
 
 pub struct CanvasEngine {
@@ -174,7 +251,8 @@ impl CanvasEngine {
         &self.active_layer_id
     }
 
-    pub fn layer_item_count(&self, layer_id: &str) -> usize {
+    #[cfg(test)]
+    fn layer_item_count(&self, layer_id: &str) -> usize {
         self.items
             .lock()
             .unwrap()
@@ -208,6 +286,7 @@ impl CanvasEngine {
         if self.active.is_some() || self.layers.lock().unwrap().len() >= MAX_LAYERS {
             return Vec::new();
         }
+        let previous_active_layer_id = self.active_layer_id.clone();
         let layer = CanvasLayer {
             layer_id: uuid::Uuid::now_v7().to_string(),
             name: format!("レイヤー {}", self.next_layer_number),
@@ -215,46 +294,207 @@ impl CanvasEngine {
         self.next_layer_number += 1;
         self.active_layer_id.clone_from(&layer.layer_id);
         self.layers.lock().unwrap().push(layer.clone());
+        self.redo_actions.clear();
+        self.undo_actions.push(UndoAction::LayerAdd {
+            layer: layer.clone(),
+            previous_active_layer_id,
+        });
         vec![PainterMessage::LayerAdd { layer }]
     }
 
-    /// 指定レイヤーとその項目を破棄する。最低1枚を維持し、履歴参照を安全に破棄する。
+    /// 指定レイヤーとその項目を削除し、完全な復元点をUndo履歴へ積む。
     pub fn delete_layer(&mut self, layer_id: &str) -> Vec<PainterMessage> {
         if self.active.is_some() {
             return Vec::new();
         }
-        let fallback_id = {
-            let mut layers = self.layers.lock().unwrap();
-            if layers.len() <= 1 {
-                return Vec::new();
-            }
-            let Some(index) = layers.iter().position(|layer| layer.layer_id == layer_id) else {
-                return Vec::new();
-            };
-            layers.remove(index);
-            let fallback_index = index.saturating_sub(1).min(layers.len() - 1);
-            layers[fallback_index].layer_id.clone()
+        let active_before = self.active_layer_id.clone();
+        let Some((layer, layer_index, items, fallback_id)) = self.take_layer_and_items(layer_id)
+        else {
+            return Vec::new();
         };
-        let mut items = self.items.lock().unwrap();
-        let mut removed_points = 0;
-        items.retain(|item| {
-            let keep = item.layer_id() != layer_id;
-            if !keep {
-                removed_points += item.point_count();
-            }
-            keep
-        });
-        drop(items);
-        self.total_points = self.total_points.saturating_sub(removed_points);
-        self.undo_actions.clear();
+        let active_after = if active_before == layer_id {
+            fallback_id
+        } else {
+            active_before.clone()
+        };
+        self.active_layer_id.clone_from(&active_after);
         self.redo_actions.clear();
-        if self.active_layer_id == layer_id {
-            self.active_layer_id = fallback_id;
-        }
+        self.undo_actions.push(UndoAction::LayerDelete {
+            layer,
+            layer_index,
+            items,
+            active_before,
+            active_after,
+        });
         self.rebuild_required = true;
         vec![PainterMessage::LayerDelete {
             layer_id: layer_id.to_owned(),
         }]
+    }
+
+    /// 指定レイヤーの項目を一括削除できるか。レイヤー自体は維持する。
+    pub fn can_clear_layer(&self, layer_id: &str) -> bool {
+        if self.active.is_some()
+            || !self
+                .layers
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|layer| layer.layer_id == layer_id)
+        {
+            return false;
+        }
+        self.items
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|item| item.layer_id() == layer_id)
+    }
+
+    /// レイヤー自体を残し、指定レイヤーの全項目をUndo可能な1操作で削除する。
+    /// 複数項目の変更のため、成功時は増分eventではなくsnapshot同期を要求する。
+    pub fn clear_layer(&mut self, layer_id: &str) -> Vec<PainterMessage> {
+        if !self.can_clear_layer(layer_id) {
+            return Vec::new();
+        }
+        let items = self.take_items_in_layer(layer_id);
+        if items.is_empty() {
+            return Vec::new();
+        }
+        self.redo_actions.clear();
+        self.undo_actions.push(UndoAction::LayerClear {
+            layer_id: layer_id.to_owned(),
+            items,
+        });
+        self.rebuild_required = true;
+        self.full_sync_required = true;
+        Vec::new()
+    }
+
+    /// レイヤー順とグローバルなitem順を別々に保持しながら、指定レイヤーをlive stateから移動する。
+    fn take_layer_and_items(
+        &mut self,
+        layer_id: &str,
+    ) -> Option<(CanvasLayer, usize, Vec<IndexedItem>, String)> {
+        let (layer, layer_index, fallback_id) = {
+            let mut layers = self.layers.lock().unwrap();
+            if layers.len() <= 1 {
+                return None;
+            }
+            let layer_index = layers.iter().position(|layer| layer.layer_id == layer_id)?;
+            let layer = layers.remove(layer_index);
+            let fallback_index = layer_index.saturating_sub(1).min(layers.len() - 1);
+            let fallback_id = layers[fallback_index].layer_id.clone();
+            (layer, layer_index, fallback_id)
+        };
+        let items = self.take_items_in_layer(layer_id);
+        Some((layer, layer_index, items, fallback_id))
+    }
+
+    fn take_items_in_layer(&mut self, layer_id: &str) -> Vec<IndexedItem> {
+        let mut items = self.items.lock().unwrap();
+        let original = std::mem::take(&mut *items);
+        let mut retained = Vec::with_capacity(original.len());
+        let mut removed = Vec::new();
+        let mut removed_points = 0usize;
+        for (index, item) in original.into_iter().enumerate() {
+            if item.layer_id() == layer_id {
+                removed_points = removed_points.saturating_add(item.point_count());
+                removed.push(IndexedItem { index, item });
+            } else {
+                retained.push(item);
+            }
+        }
+        *items = retained;
+        drop(items);
+        self.total_points = self.total_points.saturating_sub(removed_points);
+        removed
+    }
+
+    fn can_restore_indexed_items(&self, restored: &[IndexedItem]) -> bool {
+        let (restored_item_count, restored_point_count) = indexed_item_slice_size(restored);
+        let items = self.items.lock().unwrap();
+        if items.len().saturating_add(restored_item_count) > MAX_ITEMS
+            || self.total_points.saturating_add(restored_point_count) > MAX_TOTAL_POINTS
+            || restored.iter().any(|entry| {
+                items
+                    .iter()
+                    .any(|item| item.item_id() == entry.item.item_id())
+            })
+        {
+            return false;
+        }
+        let mut previous_index = None;
+        for (offset, entry) in restored.iter().enumerate() {
+            let expanded_len = items.len().saturating_add(offset);
+            if entry.index > expanded_len
+                || previous_index.is_some_and(|previous| previous >= entry.index)
+            {
+                return false;
+            }
+            previous_index = Some(entry.index);
+        }
+        true
+    }
+
+    fn restore_indexed_items(&mut self, restored: Vec<IndexedItem>) {
+        let (_, restored_point_count) = indexed_item_slice_size(&restored);
+        let mut items = self.items.lock().unwrap();
+        for entry in restored {
+            items.insert(entry.index, entry.item);
+        }
+        drop(items);
+        self.total_points = self.total_points.saturating_add(restored_point_count);
+    }
+
+    fn can_restore_deleted_layer(
+        &self,
+        layer: &CanvasLayer,
+        layer_index: usize,
+        items: &[IndexedItem],
+        active_before: &str,
+    ) -> bool {
+        let layers = self.layers.lock().unwrap();
+        let valid_catalog = layers.len() < MAX_LAYERS
+            && layer_index <= layers.len()
+            && !layers
+                .iter()
+                .any(|existing| existing.layer_id == layer.layer_id)
+            && (active_before == layer.layer_id
+                || layers
+                    .iter()
+                    .any(|existing| existing.layer_id == active_before));
+        drop(layers);
+        valid_catalog
+            && items
+                .iter()
+                .all(|entry| entry.item.layer_id() == layer.layer_id)
+            && self.can_restore_indexed_items(items)
+    }
+
+    fn restore_layer(&mut self, layer: CanvasLayer, layer_index: usize) {
+        self.layers.lock().unwrap().insert(layer_index, layer);
+    }
+
+    fn remove_empty_added_layer(&mut self, layer_id: &str) -> bool {
+        if self
+            .items
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|item| item.layer_id() == layer_id)
+        {
+            return false;
+        }
+        let mut layers = self.layers.lock().unwrap();
+        if layers.len() <= 1 {
+            return false;
+        }
+        let Some(index) = layers.iter().position(|layer| layer.layer_id == layer_id) else {
+            return false;
+        };
+        layers.remove(index);
+        true
     }
 
     pub fn is_drawing(&self) -> bool {
@@ -925,7 +1165,7 @@ impl CanvasEngine {
         vec![message]
     }
 
-    /// 最後の確定操作（項目追加またはshape/stamp transform）を戻す。
+    /// 最後の確定操作（項目操作・一括消去・レイヤー操作）を戻す。
     pub fn undo(&mut self) -> Vec<PainterMessage> {
         while let Some(action) = self.undo_actions.pop() {
             match action {
@@ -984,6 +1224,93 @@ impl CanvasEngine {
                     *items = restored;
                     drop(items);
                     self.redo_actions.push(RedoAction::Clear);
+                    self.full_sync_required = true;
+                    return Vec::new();
+                }
+                UndoAction::LayerAdd {
+                    layer,
+                    previous_active_layer_id,
+                } => {
+                    if self.active.is_some()
+                        || !self
+                            .layers
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|existing| existing.layer_id == previous_active_layer_id)
+                        || !self.remove_empty_added_layer(&layer.layer_id)
+                    {
+                        self.undo_actions.push(UndoAction::LayerAdd {
+                            layer,
+                            previous_active_layer_id,
+                        });
+                        return Vec::new();
+                    }
+                    let layer_id = layer.layer_id.clone();
+                    self.active_layer_id.clone_from(&previous_active_layer_id);
+                    self.redo_actions.push(RedoAction::LayerAdd {
+                        layer,
+                        previous_active_layer_id,
+                    });
+                    return vec![PainterMessage::LayerDelete { layer_id }];
+                }
+                UndoAction::LayerDelete {
+                    layer,
+                    layer_index,
+                    items,
+                    active_before,
+                    active_after,
+                } => {
+                    if self.active.is_some()
+                        || !self.can_restore_deleted_layer(
+                            &layer,
+                            layer_index,
+                            &items,
+                            &active_before,
+                        )
+                    {
+                        self.undo_actions.push(UndoAction::LayerDelete {
+                            layer,
+                            layer_index,
+                            items,
+                            active_before,
+                            active_after,
+                        });
+                        return Vec::new();
+                    }
+                    let layer_id = layer.layer_id.clone();
+                    self.restore_layer(layer, layer_index);
+                    self.restore_indexed_items(items);
+                    self.active_layer_id.clone_from(&active_before);
+                    self.redo_actions.push(RedoAction::LayerDelete {
+                        layer_id,
+                        active_before,
+                        active_after,
+                    });
+                    self.rebuild_required = true;
+                    self.full_sync_required = true;
+                    return Vec::new();
+                }
+                UndoAction::LayerClear { layer_id, items } => {
+                    let layer_exists = self
+                        .layers
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|layer| layer.layer_id == layer_id);
+                    if self.active.is_some()
+                        || !layer_exists
+                        || !self.can_restore_indexed_items(&items)
+                    {
+                        self.undo_actions
+                            .push(UndoAction::LayerClear { layer_id, items });
+                        return Vec::new();
+                    }
+                    self.restore_indexed_items(items);
+                    self.redo_actions.push(RedoAction::LayerClear {
+                        layer_id: layer_id.clone(),
+                    });
+                    self.rebuild_required = true;
                     self.full_sync_required = true;
                     return Vec::new();
                 }
@@ -1053,6 +1380,93 @@ impl CanvasEngine {
                     self.active = None;
                     self.undo_actions.push(UndoAction::Clear { items: cleared });
                     return vec![PainterMessage::Clear {}];
+                }
+                RedoAction::LayerAdd {
+                    layer,
+                    previous_active_layer_id,
+                } => {
+                    let can_restore = {
+                        let layers = self.layers.lock().unwrap();
+                        layers.len() < MAX_LAYERS
+                            && layers
+                                .iter()
+                                .any(|existing| existing.layer_id == previous_active_layer_id)
+                            && !layers
+                                .iter()
+                                .any(|existing| existing.layer_id == layer.layer_id)
+                    };
+                    if !can_restore {
+                        self.redo_actions.push(RedoAction::LayerAdd {
+                            layer,
+                            previous_active_layer_id,
+                        });
+                        return Vec::new();
+                    }
+                    self.layers.lock().unwrap().push(layer.clone());
+                    self.active_layer_id.clone_from(&layer.layer_id);
+                    self.undo_actions.push(UndoAction::LayerAdd {
+                        layer: layer.clone(),
+                        previous_active_layer_id,
+                    });
+                    return vec![PainterMessage::LayerAdd { layer }];
+                }
+                RedoAction::LayerDelete {
+                    layer_id,
+                    active_before,
+                    active_after,
+                } => {
+                    let Some((layer, layer_index, items, _)) = self.take_layer_and_items(&layer_id)
+                    else {
+                        self.redo_actions.push(RedoAction::LayerDelete {
+                            layer_id,
+                            active_before,
+                            active_after,
+                        });
+                        return Vec::new();
+                    };
+                    let active_after_exists = self
+                        .layers
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|existing| existing.layer_id == active_after);
+                    if !active_after_exists {
+                        // 履歴順が壊れた場合は、先に削除した状態を完全に戻す。
+                        self.restore_layer(layer, layer_index);
+                        self.restore_indexed_items(items);
+                        self.redo_actions.push(RedoAction::LayerDelete {
+                            layer_id,
+                            active_before,
+                            active_after,
+                        });
+                        return Vec::new();
+                    }
+                    self.active_layer_id.clone_from(&active_after);
+                    self.undo_actions.push(UndoAction::LayerDelete {
+                        layer,
+                        layer_index,
+                        items,
+                        active_before,
+                        active_after,
+                    });
+                    self.rebuild_required = true;
+                    return vec![PainterMessage::LayerDelete { layer_id }];
+                }
+                RedoAction::LayerClear { layer_id } => {
+                    if !self.can_clear_layer(&layer_id) {
+                        self.redo_actions.push(RedoAction::LayerClear { layer_id });
+                        return Vec::new();
+                    }
+                    let items = self.take_items_in_layer(&layer_id);
+                    if items.is_empty() {
+                        self.redo_actions.push(RedoAction::LayerClear { layer_id });
+                        return Vec::new();
+                    }
+                    self.undo_actions
+                        .push(UndoAction::LayerClear { layer_id, items });
+                    self.rebuild_required = true;
+                    self.full_sync_required = true;
+                    return Vec::new();
                 }
             }
         }
@@ -1128,60 +1542,70 @@ impl CanvasEngine {
                     .is_none_or(|item_id| !removed_ids.iter().any(|id| id == item_id))
             });
         }
-        self.discard_clear_restore_point_over_budget(live_item_count, live_point_count);
+        self.discard_bulk_restore_points_over_budget(live_item_count, live_point_count);
         self.rebuild_required |= removed_any;
     }
 
-    /// CanvasItemを所有するlive state・Clear復元点・Redo待ち項目の合計を、通常の
-    /// キャンバス上限内へ保つ。Clear復元点は部分的に切り詰めると正確な復元ではなくなるため、
-    /// 上限を超える場合は復元点全体だけを失効させる。
-    fn discard_clear_restore_point_over_budget(
+    /// CanvasItemを所有するlive state・一括削除復元点・Redo待ち項目の合計を
+    /// キャンバス上限内へ保つ。一括復元点だけを抜くと、それより古いAdd /
+    /// Transformが存在しないitemやlayerを参照する。そのため、容量超過時は最も古い
+    /// payload付き操作までのprefix全体を失効させる。
+    fn discard_bulk_restore_points_over_budget(
         &mut self,
         live_item_count: usize,
         live_point_count: usize,
     ) {
-        let (clear_item_count, clear_point_count) = self
-            .undo_actions
-            .iter()
-            .filter_map(|action| match action {
-                UndoAction::Clear { items } => Some(items),
-                _ => None,
-            })
-            .fold((0usize, 0usize), |(item_count, point_count), items| {
-                (
-                    item_count.saturating_add(items.len()),
-                    items.iter().fold(point_count, |count, item| {
-                        count.saturating_add(item.point_count())
-                    }),
-                )
-            });
-        if clear_item_count == 0 {
+        loop {
+            let (undo_item_count, undo_point_count) = self.undo_actions.iter().fold(
+                (0usize, 0usize),
+                |(item_count, point_count), action| {
+                    let (action_items, action_points) = action.retained_size();
+                    (
+                        item_count.saturating_add(action_items),
+                        point_count.saturating_add(action_points),
+                    )
+                },
+            );
+            let (redo_item_count, redo_point_count) = self.redo_actions.iter().fold(
+                (0usize, 0usize),
+                |(item_count, point_count), action| {
+                    let (action_items, action_points) = action.retained_size();
+                    (
+                        item_count.saturating_add(action_items),
+                        point_count.saturating_add(action_points),
+                    )
+                },
+            );
+            let retained_item_count = live_item_count
+                .saturating_add(undo_item_count)
+                .saturating_add(redo_item_count);
+            let retained_point_count = live_point_count
+                .saturating_add(undo_point_count)
+                .saturating_add(redo_point_count);
+            if retained_item_count <= MAX_ITEMS && retained_point_count <= MAX_TOTAL_POINTS {
+                return;
+            }
+
+            if let Some(index) = self
+                .undo_actions
+                .iter()
+                .position(|action| action.retained_size() != (0, 0))
+            {
+                self.undo_actions.drain(..=index);
+                continue;
+            }
+
+            // 正常な履歴順ではRedo itemだけでlive上限を超えないが、
+            // 履歴の不整合時にメモリ上限を破らないよう守る。
+            if self
+                .redo_actions
+                .iter()
+                .any(|action| action.retained_size() != (0, 0))
+            {
+                self.redo_actions.clear();
+                continue;
+            }
             return;
-        }
-
-        let (redo_item_count, redo_point_count) = self
-            .redo_actions
-            .iter()
-            .filter_map(|action| match action {
-                RedoAction::Add { item } => Some(item),
-                _ => None,
-            })
-            .fold((0usize, 0usize), |(item_count, point_count), item| {
-                (
-                    item_count.saturating_add(1),
-                    point_count.saturating_add(item.point_count()),
-                )
-            });
-        let retained_item_count = live_item_count
-            .saturating_add(redo_item_count)
-            .saturating_add(clear_item_count);
-        let retained_point_count = live_point_count
-            .saturating_add(redo_point_count)
-            .saturating_add(clear_point_count);
-
-        if retained_item_count > MAX_ITEMS || retained_point_count > MAX_TOTAL_POINTS {
-            self.undo_actions
-                .retain(|action| !matches!(action, UndoAction::Clear { .. }));
         }
     }
 }
@@ -1314,6 +1738,19 @@ mod tests {
         match &items[0] {
             CanvasItem::Stroke { stroke } => stroke,
             _ => panic!("expected stroke"),
+        }
+    }
+
+    fn done_stroke(item_id: &str, layer_id: &str, point_count: usize) -> CanvasItem {
+        CanvasItem::Stroke {
+            stroke: Stroke {
+                stroke_id: item_id.to_owned(),
+                layer_id: layer_id.to_owned(),
+                brush: brush(),
+                pts: vec![(0.1, 0.1, 1.0, 0.0, 0.0, 0.0); point_count],
+                done: true,
+                ended_at: Some(1.0),
+            },
         }
     }
 
@@ -1969,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_history_restores_layered_items_without_rewinding_the_layer_catalog() {
+    fn clear_and_later_layer_add_follow_one_global_history_order() {
         let mut engine = CanvasEngine::new();
         engine.begin(POINTER_ID, brush(), 0.1, 0.2, 0.35, 0.0);
         engine.move_to(POINTER_ID, 0.3, 0.4, 0.8, 16.0);
@@ -1990,26 +2427,33 @@ mod tests {
         let before = engine.shared_items().lock().unwrap().clone();
 
         assert_eq!(drain_types(&engine.clear()), ["clear"]);
+        let catalog_at_clear = engine.layers();
         assert_eq!(drain_types(&engine.add_layer()), ["layer_add"]);
         let active_empty_layer = engine.active_layer_id().to_owned();
         let catalog_after_clear = engine.layers();
         assert_eq!(catalog_after_clear.len(), 3);
 
+        assert_eq!(drain_types(&engine.undo()), ["layer_delete"]);
+        assert!(!engine.take_full_sync_required());
+        assert_eq!(engine.layers(), catalog_at_clear);
+        assert_eq!(engine.active_layer_id(), top_layer_id);
+
         assert!(engine.undo().is_empty());
         assert!(engine.take_full_sync_required());
         assert_eq!(*engine.shared_items().lock().unwrap(), before);
-        assert_eq!(engine.layers(), catalog_after_clear);
-        assert_eq!(engine.active_layer_id(), active_empty_layer);
+        assert_eq!(engine.layers(), catalog_at_clear);
+        assert_eq!(engine.active_layer_id(), top_layer_id);
         assert_eq!(engine.layer_item_count(&top_layer_id), 2);
 
         assert_eq!(drain_types(&engine.redo()), ["clear"]);
         assert!(engine.shared_items().lock().unwrap().is_empty());
+        assert_eq!(drain_types(&engine.redo()), ["layer_add"]);
         assert_eq!(engine.layers(), catalog_after_clear);
         assert_eq!(engine.active_layer_id(), active_empty_layer);
     }
 
     #[test]
-    fn deleting_a_layer_invalidates_clear_restore_and_redo_points() {
+    fn layer_deletion_composes_with_clear_history_and_discards_a_redo_branch() {
         let mut engine = CanvasEngine::new();
         engine.add_layer();
         let removed_layer_id = engine.active_layer_id().to_owned();
@@ -2021,9 +2465,15 @@ mod tests {
             drain_types(&engine.delete_layer(&removed_layer_id)),
             ["layer_delete"]
         );
-        assert!(!engine.can_undo());
+        assert!(engine.can_undo());
         assert!(!engine.can_redo());
+
         assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.active_layer_id(), removed_layer_id);
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layer_item_count(&removed_layer_id), 1);
 
         let mut engine = CanvasEngine::new();
         engine.add_layer();
@@ -2038,9 +2488,14 @@ mod tests {
             drain_types(&engine.delete_layer(&removed_layer_id)),
             ["layer_delete"]
         );
-        assert!(!engine.can_undo());
+        assert!(engine.can_undo());
         assert!(!engine.can_redo());
-        assert!(engine.redo().is_empty());
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layer_item_count(&removed_layer_id), 1);
+        assert_eq!(drain_types(&engine.redo()), ["layer_delete"]);
+        assert!(!engine.take_full_sync_required());
+        assert_eq!(engine.layer_item_count(&removed_layer_id), 0);
     }
 
     #[test]
@@ -2179,6 +2634,71 @@ mod tests {
     }
 
     #[test]
+    fn layer_clear_restore_prefix_expires_before_item_history_exceeds_the_cap() {
+        let mut engine = CanvasEngine::new();
+        engine.add_layer();
+        let layer_id = engine.active_layer_id().to_owned();
+        for i in 0..MAX_ITEMS - 1 {
+            engine.add_stamp(format!("before-{i}"), (0.1, 0.1), 0.1, 0.1, 1.0, i as f64);
+        }
+        assert!(engine.clear_layer(&layer_id).is_empty());
+        assert!(engine.take_full_sync_required());
+
+        engine.add_stamp("at-cap".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 1_000.0);
+        engine.add_stamp("over-cap".into(), (0.3, 0.3), 0.1, 0.1, 1.0, 1_001.0);
+
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(!engine.can_undo());
+        assert!(engine.undo().is_empty());
+        assert!(engine
+            .layers()
+            .iter()
+            .any(|layer| layer.layer_id == layer_id));
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn layer_delete_restore_prefix_expires_before_point_history_exceeds_the_cap() {
+        let mut engine = CanvasEngine::new();
+        engine.add_layer();
+        let layer_id = engine.active_layer_id().to_owned();
+        let mut remaining = MAX_TOTAL_POINTS - 1;
+        let mut before = Vec::new();
+        let mut index = 0;
+        while remaining > 0 {
+            let point_count = remaining.min(MAX_STROKE_POINTS);
+            before.push(done_stroke(
+                &format!("before-{index}"),
+                &layer_id,
+                point_count,
+            ));
+            remaining -= point_count;
+            index += 1;
+        }
+        engine.total_points = MAX_TOTAL_POINTS - 1;
+        *engine.items.lock().unwrap() = before;
+        assert_eq!(
+            drain_types(&engine.delete_layer(&layer_id)),
+            ["layer_delete"]
+        );
+
+        engine.begin(POINTER_ID, brush(), 0.2, 0.2, 1.0, 1_000.0);
+        assert!(engine.can_undo());
+        engine.move_to(POINTER_ID, 0.3, 0.3, 1.0, 1_016.0);
+        assert!(!engine.can_undo());
+        engine.end(POINTER_ID, 1_020.0);
+
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(!engine.can_undo());
+        assert!(!engine
+            .layers()
+            .iter()
+            .any(|layer| layer.layer_id == layer_id));
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn clearing_an_empty_canvas_preserves_redo_history() {
         let mut engine = CanvasEngine::new();
         engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
@@ -2229,6 +2749,8 @@ mod tests {
 
         assert_eq!(drain_types(&engine.undo()), ["undo"]);
         assert_eq!(engine.layer_item_count(&top), 0);
+        assert_eq!(drain_types(&engine.undo()), ["layer_delete"]);
+        assert_eq!(engine.layers(), vec![CanvasLayer::default()]);
         assert_eq!(drain_types(&engine.undo()), ["undo"]);
         assert_eq!(
             engine.layer_item_count(crate::protocol::DEFAULT_LAYER_ID),
@@ -2239,6 +2761,175 @@ mod tests {
             engine.layer_item_count(crate::protocol::DEFAULT_LAYER_ID),
             1
         );
+        assert_eq!(drain_types(&engine.redo()), ["layer_add"]);
+        assert_eq!(engine.active_layer_id(), top);
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+        assert_eq!(engine.layer_item_count(&top), 1);
+    }
+
+    #[test]
+    fn clearing_one_layer_round_trips_exact_items_without_changing_the_catalog() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("bottom-1".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 1.0);
+        engine.add_layer();
+        let top = engine.active_layer_id().to_owned();
+        engine.add_stamp("top-1".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 2.0);
+        assert!(engine.select_layer(crate::protocol::DEFAULT_LAYER_ID));
+        engine.add_stamp("bottom-2".into(), (0.3, 0.3), 0.1, 0.1, 1.0, 3.0);
+        assert!(engine.select_layer(&top));
+        engine.begin(POINTER_ID, brush(), 0.4, 0.4, 1.0, 4.0);
+        engine.move_to(POINTER_ID, 0.5, 0.5, 1.0, 5.0);
+        engine.end(POINTER_ID, 6.0);
+        let before_layers = engine.layers();
+        let before_items = engine.shared_items().lock().unwrap().clone();
+        let before_points = engine.total_points;
+        let retained = before_items
+            .iter()
+            .filter(|item| item.layer_id() != top)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(engine.can_clear_layer(&top));
+        assert!(engine.clear_layer(&top).is_empty());
+        assert!(engine.take_full_sync_required());
+        assert!(!engine.take_full_sync_required());
+        assert_eq!(engine.layers(), before_layers);
+        assert_eq!(engine.active_layer_id(), top);
+        assert_eq!(*engine.shared_items().lock().unwrap(), retained);
+        assert_eq!(engine.total_points, 0);
+
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layers(), before_layers);
+        assert_eq!(engine.active_layer_id(), top);
+        assert_eq!(*engine.shared_items().lock().unwrap(), before_items);
+        assert_eq!(engine.total_points, before_points);
+
+        assert!(engine.redo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layers(), before_layers);
+        assert_eq!(engine.active_layer_id(), top);
+        assert_eq!(*engine.shared_items().lock().unwrap(), retained);
+        assert_eq!(engine.total_points, 0);
+    }
+
+    #[test]
+    fn empty_or_invalid_layer_clear_preserves_redo_and_pending_sync_flags() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 1.0);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(engine.can_redo());
+
+        assert!(!engine.can_clear_layer(crate::protocol::DEFAULT_LAYER_ID));
+        assert!(engine
+            .clear_layer(crate::protocol::DEFAULT_LAYER_ID)
+            .is_empty());
+        assert!(engine.clear_layer("missing").is_empty());
+        assert!(engine.can_redo());
+        assert!(!engine.take_full_sync_required());
+
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+        assert!(engine
+            .clear_layer(crate::protocol::DEFAULT_LAYER_ID)
+            .is_empty());
+        engine.begin(POINTER_ID, brush(), 0.2, 0.2, 1.0, 2.0);
+        assert!(engine
+            .clear_layer(crate::protocol::DEFAULT_LAYER_ID)
+            .is_empty());
+        assert!(engine.take_full_sync_required());
+    }
+
+    #[test]
+    fn deleting_a_middle_layer_restores_global_item_order_and_active_ids() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("bottom-1".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 1.0);
+        engine.add_layer();
+        let middle = engine.active_layer_id().to_owned();
+        engine.add_stamp("middle-1".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 2.0);
+        engine.add_layer();
+        let top = engine.active_layer_id().to_owned();
+        engine.add_stamp("top-1".into(), (0.3, 0.3), 0.1, 0.1, 1.0, 3.0);
+        assert!(engine.select_layer(crate::protocol::DEFAULT_LAYER_ID));
+        engine.add_stamp("bottom-2".into(), (0.4, 0.4), 0.1, 0.1, 1.0, 4.0);
+        assert!(engine.select_layer(&middle));
+        engine.add_stamp("middle-2".into(), (0.5, 0.5), 0.1, 0.1, 1.0, 5.0);
+        assert!(engine.select_layer(&top));
+        engine.add_stamp("top-2".into(), (0.6, 0.6), 0.1, 0.1, 1.0, 6.0);
+        assert!(engine.select_layer(&middle));
+        let before_layers = engine.layers();
+        let before_items = engine.shared_items().lock().unwrap().clone();
+
+        assert_eq!(drain_types(&engine.delete_layer(&middle)), ["layer_delete"]);
+        let after_layers = engine.layers();
+        let after_items = engine.shared_items().lock().unwrap().clone();
+        assert_eq!(after_layers.len(), 2);
+        assert_eq!(after_layers[0].layer_id, crate::protocol::DEFAULT_LAYER_ID);
+        assert_eq!(after_layers[1].layer_id, top);
+        assert_eq!(engine.active_layer_id(), crate::protocol::DEFAULT_LAYER_ID);
+        assert_eq!(
+            after_items
+                .iter()
+                .map(|item| item.layer_id())
+                .collect::<Vec<_>>(),
+            [
+                crate::protocol::DEFAULT_LAYER_ID,
+                top.as_str(),
+                crate::protocol::DEFAULT_LAYER_ID,
+                top.as_str(),
+            ]
+        );
+
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layers(), before_layers);
+        assert_eq!(*engine.shared_items().lock().unwrap(), before_items);
+        assert_eq!(engine.active_layer_id(), middle);
+
+        assert_eq!(drain_types(&engine.redo()), ["layer_delete"]);
+        assert!(!engine.take_full_sync_required());
+        assert_eq!(engine.layers(), after_layers);
+        assert_eq!(*engine.shared_items().lock().unwrap(), after_items);
+        assert_eq!(engine.active_layer_id(), crate::protocol::DEFAULT_LAYER_ID);
+    }
+
+    #[test]
+    fn added_layers_are_undoable_at_the_layer_cap_and_keep_history_order() {
+        let mut engine = CanvasEngine::new();
+        for _ in 1..MAX_LAYERS {
+            assert_eq!(drain_types(&engine.add_layer()), ["layer_add"]);
+        }
+        let deleted = engine.active_layer_id().to_owned();
+        assert_eq!(
+            drain_types(&engine.delete_layer(&deleted)),
+            ["layer_delete"]
+        );
+        let replacement = match &engine.add_layer()[..] {
+            [PainterMessage::LayerAdd { layer }] => layer.layer_id.clone(),
+            _ => panic!("expected replacement layer"),
+        };
+        assert_eq!(engine.layers().len(), MAX_LAYERS);
+
+        assert_eq!(drain_types(&engine.undo()), ["layer_delete"]);
+        assert_eq!(engine.layers().len(), MAX_LAYERS - 1);
+        assert!(!engine
+            .layers()
+            .iter()
+            .any(|layer| layer.layer_id == replacement));
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layers().len(), MAX_LAYERS);
+        assert!(engine
+            .layers()
+            .iter()
+            .any(|layer| layer.layer_id == deleted));
+
+        assert_eq!(drain_types(&engine.redo()), ["layer_delete"]);
+        assert_eq!(drain_types(&engine.redo()), ["layer_add"]);
+        assert_eq!(engine.layers().len(), MAX_LAYERS);
+        assert!(engine
+            .layers()
+            .iter()
+            .any(|layer| layer.layer_id == replacement));
     }
 
     #[test]
@@ -2273,7 +2964,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_layer_only_removes_its_items_and_clears_history_references() {
+    fn deleting_a_layer_only_removes_its_items_and_is_undoable() {
         let mut engine = CanvasEngine::new();
         engine.add_stamp("bottom".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 1.0);
         engine.add_layer();
@@ -2288,8 +2979,16 @@ mod tests {
             engine.layer_item_count(crate::protocol::DEFAULT_LAYER_ID),
             1
         );
-        assert!(!engine.can_undo());
+        assert!(engine.can_undo());
         assert!(!engine.can_redo());
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(engine.layers().len(), 2);
+        assert_eq!(engine.active_layer_id(), top);
+        assert_eq!(engine.layer_item_count(&top), 1);
+        assert_eq!(drain_types(&engine.redo()), ["layer_delete"]);
+        assert_eq!(engine.layers().len(), 1);
+        assert_eq!(engine.active_layer_id(), crate::protocol::DEFAULT_LAYER_ID);
         assert!(engine
             .delete_layer(crate::protocol::DEFAULT_LAYER_ID)
             .is_empty());

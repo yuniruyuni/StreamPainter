@@ -45,6 +45,7 @@ pub enum MenuAction {
     SelectColor(&'static str),
     SelectLayer(String),
     AddLayer,
+    ClearLayer(String),
     DeleteLayer(String),
     Undo,
     Redo,
@@ -68,7 +69,10 @@ const ID_COLOR_BASE: usize = 100;
 const ID_STAMP_BASE: usize = 1000;
 const ID_LAYER_ADD: usize = 2000;
 const ID_LAYER_DELETE: usize = 2001;
+const ID_LAYER_CLEAR: usize = 2002;
 const ID_LAYER_BASE: usize = 2100;
+const LAYER_CLEAR_LABEL: &str = "現在のレイヤーの内容を全消去\tDelete";
+const LAYER_DELETE_LABEL: &str = "現在のレイヤーを削除";
 
 fn checked(flag: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS {
     if flag {
@@ -227,11 +231,23 @@ pub fn show(
             ID_LAYER_ADD,
             "新規レイヤー",
         );
+        let active_layer_item_count = layers
+            .iter()
+            .position(|layer| layer.layer_id == active_layer_id)
+            .and_then(|index| layer_item_counts.get(index))
+            .copied()
+            .unwrap_or_default();
+        append(
+            layer_menu,
+            enabled(active_layer_item_count > 0),
+            ID_LAYER_CLEAR,
+            LAYER_CLEAR_LABEL,
+        );
         append(
             layer_menu,
             enabled(layers.len() > 1),
             ID_LAYER_DELETE,
-            "現在のレイヤーを削除...",
+            LAYER_DELETE_LABEL,
         );
         let _ = AppendMenuW(
             root,
@@ -291,6 +307,9 @@ pub fn show(
             ID_REDO => Some(MenuAction::Redo),
             ID_CLEAR => Some(MenuAction::Clear),
             ID_LAYER_ADD if layers.len() < MAX_LAYERS => Some(MenuAction::AddLayer),
+            ID_LAYER_CLEAR if active_layer_item_count > 0 => {
+                Some(MenuAction::ClearLayer(active_layer_id.to_owned()))
+            }
             ID_LAYER_DELETE if layers.len() > 1 => {
                 Some(MenuAction::DeleteLayer(active_layer_id.to_owned()))
             }
@@ -311,11 +330,18 @@ pub fn show(
 
 #[cfg(test)]
 mod tests {
-    use super::clear_menu_label;
+    use super::{clear_menu_label, LAYER_CLEAR_LABEL, LAYER_DELETE_LABEL};
 
     #[test]
     fn clear_label_only_has_ellipsis_when_confirmation_is_enabled() {
         assert_eq!(clear_menu_label(true), "全消去...");
         assert_eq!(clear_menu_label(false), "全消去");
+    }
+
+    #[test]
+    fn layer_destructive_actions_are_immediate_and_advertise_delete_shortcut() {
+        assert!(LAYER_CLEAR_LABEL.ends_with("\tDelete"));
+        assert!(!LAYER_CLEAR_LABEL.contains("..."));
+        assert!(!LAYER_DELETE_LABEL.contains("..."));
     }
 }
