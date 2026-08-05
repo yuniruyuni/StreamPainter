@@ -38,6 +38,9 @@ UI／worker共通の5秒絶対deadlineを持ち、接続・認証・モニター
 - 新規接続: 現在の1〜8枚のレイヤーカタログと全CanvasItemをsnapshotとして最初に送信
 - 通常描画: `stroke_*`、`shape_*`、`stamp_add`、legacy互換の`stamp_move_*`、
   `item_transform_*`、`layer_add`、`layer_delete`、`undo`、`redo`、`clear` を増分配信
+- 全消去のUndo: 現在のレイヤーカタログと消去前の全CanvasItemを完全snapshot 1件で置換し、接続queueを項目数だけ
+  消費せずにローカル表示とBrowser Sourceを再同期。live state・Clear復元点・Redo待ち項目の
+  合計が通常上限を超える前にClear復元点全体を失効させ、部分復元と履歴メモリの膨張を防止
 - 再接続: 古いクライアント状態をsnapshotで全置換
 - backpressure: 各接続は256メッセージの上限を持つ
 - 遅延時: 接続をハブから除外し、Browser Source側の再接続に任せる

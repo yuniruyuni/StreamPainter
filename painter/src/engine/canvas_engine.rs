@@ -87,6 +87,11 @@ enum UndoAction {
         to: ItemTransform,
         wire: TransformWire,
     },
+    /// 全消去前のキャンバス。項目をlive stateから移動して保持し、後続項目を含む
+    /// 履歴全体がMAX_ITEMS / MAX_TOTAL_POINTSを超える前に復元点を失効させる。
+    Clear {
+        items: Vec<CanvasItem>,
+    },
 }
 
 /// Add の項目本体は Undo 時に items からこちらへ移す。
@@ -100,21 +105,24 @@ enum RedoAction {
         to: ItemTransform,
         wire: TransformWire,
     },
+    Clear,
 }
 
 impl UndoAction {
-    fn item_id(&self) -> &str {
+    fn item_id(&self) -> Option<&str> {
         match self {
-            Self::Add { item_id } | Self::Transform { item_id, .. } => item_id,
+            Self::Add { item_id } | Self::Transform { item_id, .. } => Some(item_id),
+            Self::Clear { .. } => None,
         }
     }
 }
 
 impl RedoAction {
-    fn item_id(&self) -> &str {
+    fn item_id(&self) -> Option<&str> {
         match self {
-            Self::Add { item } => item.item_id(),
-            Self::Transform { item_id, .. } => item_id,
+            Self::Add { item } => Some(item.item_id()),
+            Self::Transform { item_id, .. } => Some(item_id),
+            Self::Clear => None,
         }
     }
 }
@@ -129,6 +137,7 @@ pub struct CanvasEngine {
     redo_actions: Vec<RedoAction>,
     total_points: usize,
     rebuild_required: bool,
+    full_sync_required: bool,
 }
 
 impl CanvasEngine {
@@ -143,6 +152,7 @@ impl CanvasEngine {
             redo_actions: Vec::new(),
             total_points: 0,
             rebuild_required: false,
+            full_sync_required: false,
         }
     }
 
@@ -270,6 +280,11 @@ impl CanvasEngine {
     /// 上限トリムで baked 履歴から項目が消えたかを一度だけ通知する。
     pub fn take_rebuild_required(&mut self) -> bool {
         std::mem::take(&mut self.rebuild_required)
+    }
+
+    /// 複数itemを一括復元したため、増分eventではなく完全snapshotを配信する必要がある。
+    pub fn take_full_sync_required(&mut self) -> bool {
+        std::mem::take(&mut self.full_sync_required)
     }
 
     /// フリーハンドのペンダウン。stroke_begin を返す。
@@ -955,6 +970,23 @@ impl CanvasEngine {
                     });
                     return vec![transform_message(wire, item_id, from, false)];
                 }
+                UndoAction::Clear { items: restored } => {
+                    let mut items = self.items.lock().unwrap();
+                    if !items.is_empty() {
+                        // 履歴順が壊れていなければ、Clearの直前には必ず空になる。
+                        // 不整合時に既存キャンバスを上書きしない。
+                        drop(items);
+                        self.undo_actions
+                            .push(UndoAction::Clear { items: restored });
+                        return Vec::new();
+                    }
+                    self.total_points = restored.iter().map(CanvasItem::point_count).sum();
+                    *items = restored;
+                    drop(items);
+                    self.redo_actions.push(RedoAction::Clear);
+                    self.full_sync_required = true;
+                    return Vec::new();
+                }
             }
         }
         Vec::new()
@@ -1010,6 +1042,18 @@ impl CanvasEngine {
                     });
                     return vec![transform_message(wire, item_id, to, false)];
                 }
+                RedoAction::Clear => {
+                    let mut items = self.items.lock().unwrap();
+                    if items.is_empty() {
+                        continue;
+                    }
+                    let cleared = std::mem::take(&mut *items);
+                    drop(items);
+                    self.total_points = 0;
+                    self.active = None;
+                    self.undo_actions.push(UndoAction::Clear { items: cleared });
+                    return vec![PainterMessage::Clear {}];
+                }
             }
         }
         Vec::new()
@@ -1023,17 +1067,26 @@ impl CanvasEngine {
         !self.redo_actions.is_empty() && self.active.is_none()
     }
 
+    pub fn can_clear(&self) -> bool {
+        self.active.is_none() && !self.items.lock().unwrap().is_empty()
+    }
+
     pub fn clear(&mut self) -> Vec<PainterMessage> {
+        if self.active.is_some() {
+            return Vec::new();
+        }
         let mut items = self.items.lock().unwrap();
-        self.undo_actions.clear();
-        self.redo_actions.clear();
         if items.is_empty() {
             return Vec::new();
         }
-        items.clear();
-        self.total_points = 0;
+        let cleared = std::mem::take(&mut *items);
         drop(items);
-        self.active = None;
+        // 全消去snapshotを複数世代保持しない。従来Clearが過去履歴を破棄していた
+        // 境界を維持しつつ、今回のClearだけを1回Undoできるようにする。
+        self.undo_actions.clear();
+        self.redo_actions.clear();
+        self.undo_actions.push(UndoAction::Clear { items: cleared });
+        self.total_points = 0;
         vec![PainterMessage::Clear {}]
     }
 
@@ -1060,14 +1113,76 @@ impl CanvasEngine {
             removed_ids.push(removed.item_id().to_owned());
             removed_any = true;
         }
+        let live_item_count = items.len();
+        let live_point_count = self.total_points;
         drop(items);
         if !removed_ids.is_empty() {
-            self.undo_actions
-                .retain(|action| !removed_ids.iter().any(|id| id == action.item_id()));
-            self.redo_actions
-                .retain(|action| !removed_ids.iter().any(|id| id == action.item_id()));
+            self.undo_actions.retain(|action| {
+                action
+                    .item_id()
+                    .is_none_or(|item_id| !removed_ids.iter().any(|id| id == item_id))
+            });
+            self.redo_actions.retain(|action| {
+                action
+                    .item_id()
+                    .is_none_or(|item_id| !removed_ids.iter().any(|id| id == item_id))
+            });
         }
+        self.discard_clear_restore_point_over_budget(live_item_count, live_point_count);
         self.rebuild_required |= removed_any;
+    }
+
+    /// CanvasItemを所有するlive state・Clear復元点・Redo待ち項目の合計を、通常の
+    /// キャンバス上限内へ保つ。Clear復元点は部分的に切り詰めると正確な復元ではなくなるため、
+    /// 上限を超える場合は復元点全体だけを失効させる。
+    fn discard_clear_restore_point_over_budget(
+        &mut self,
+        live_item_count: usize,
+        live_point_count: usize,
+    ) {
+        let (clear_item_count, clear_point_count) = self
+            .undo_actions
+            .iter()
+            .filter_map(|action| match action {
+                UndoAction::Clear { items } => Some(items),
+                _ => None,
+            })
+            .fold((0usize, 0usize), |(item_count, point_count), items| {
+                (
+                    item_count.saturating_add(items.len()),
+                    items.iter().fold(point_count, |count, item| {
+                        count.saturating_add(item.point_count())
+                    }),
+                )
+            });
+        if clear_item_count == 0 {
+            return;
+        }
+
+        let (redo_item_count, redo_point_count) = self
+            .redo_actions
+            .iter()
+            .filter_map(|action| match action {
+                RedoAction::Add { item } => Some(item),
+                _ => None,
+            })
+            .fold((0usize, 0usize), |(item_count, point_count), item| {
+                (
+                    item_count.saturating_add(1),
+                    point_count.saturating_add(item.point_count()),
+                )
+            });
+        let retained_item_count = live_item_count
+            .saturating_add(redo_item_count)
+            .saturating_add(clear_item_count);
+        let retained_point_count = live_point_count
+            .saturating_add(redo_point_count)
+            .saturating_add(clear_point_count);
+
+        if retained_item_count > MAX_ITEMS || retained_point_count > MAX_TOTAL_POINTS {
+            self.undo_actions
+                .retain(|action| !matches!(action, UndoAction::Clear { .. }));
+        }
     }
 }
 
@@ -1819,6 +1934,248 @@ mod tests {
         engine.add_stamp("replacement".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 20.0);
         assert!(!engine.can_redo());
         assert!(engine.redo().is_empty());
+    }
+
+    #[test]
+    fn clear_is_an_undoable_and_redoable_canvas_operation() {
+        let mut engine = CanvasEngine::new();
+        engine.begin(POINTER_ID, brush(), 0.1, 0.2, 0.35, 0.0);
+        engine.move_to(POINTER_ID, 0.3, 0.4, 0.8, 16.0);
+        engine.end(POINTER_ID, 20.0);
+        engine.add_stamp("stamp".into(), (0.6, 0.5), 0.2, 0.3, 0.75, 30.0);
+        let before = engine.shared_items().lock().unwrap().clone();
+
+        assert!(engine.can_clear());
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+        assert!(engine.can_undo());
+        assert!(!engine.can_clear());
+
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert!(!engine.take_full_sync_required());
+        assert_eq!(*engine.shared_items().lock().unwrap(), before);
+        assert!(engine.can_redo());
+        assert!(engine.can_clear());
+
+        assert_eq!(drain_types(&engine.redo()), ["clear"]);
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+        assert!(engine.can_undo());
+        assert!(!engine.can_clear());
+
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(*engine.shared_items().lock().unwrap(), before);
+    }
+
+    #[test]
+    fn clear_history_restores_layered_items_without_rewinding_the_layer_catalog() {
+        let mut engine = CanvasEngine::new();
+        engine.begin(POINTER_ID, brush(), 0.1, 0.2, 0.35, 0.0);
+        engine.move_to(POINTER_ID, 0.3, 0.4, 0.8, 16.0);
+        engine.end(POINTER_ID, 20.0);
+        engine.add_layer();
+        let top_layer_id = engine.active_layer_id().to_owned();
+        engine.begin_shape(
+            POINTER_ID,
+            ShapeKind::Rectangle,
+            line_style(),
+            0.2,
+            0.3,
+            1.0,
+        );
+        engine.move_to(POINTER_ID, 0.7, 0.8, 0.5, 30.0);
+        engine.end(POINTER_ID, 40.0);
+        engine.add_stamp("top".into(), (0.8, 0.8), 0.2, 0.2, 0.75, 50.0);
+        let before = engine.shared_items().lock().unwrap().clone();
+
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+        assert_eq!(drain_types(&engine.add_layer()), ["layer_add"]);
+        let active_empty_layer = engine.active_layer_id().to_owned();
+        let catalog_after_clear = engine.layers();
+        assert_eq!(catalog_after_clear.len(), 3);
+
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert_eq!(*engine.shared_items().lock().unwrap(), before);
+        assert_eq!(engine.layers(), catalog_after_clear);
+        assert_eq!(engine.active_layer_id(), active_empty_layer);
+        assert_eq!(engine.layer_item_count(&top_layer_id), 2);
+
+        assert_eq!(drain_types(&engine.redo()), ["clear"]);
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+        assert_eq!(engine.layers(), catalog_after_clear);
+        assert_eq!(engine.active_layer_id(), active_empty_layer);
+    }
+
+    #[test]
+    fn deleting_a_layer_invalidates_clear_restore_and_redo_points() {
+        let mut engine = CanvasEngine::new();
+        engine.add_layer();
+        let removed_layer_id = engine.active_layer_id().to_owned();
+        engine.add_stamp("top".into(), (0.5, 0.5), 0.1, 0.1, 1.0, 10.0);
+        engine.clear();
+        assert!(engine.can_undo());
+
+        assert_eq!(
+            drain_types(&engine.delete_layer(&removed_layer_id)),
+            ["layer_delete"]
+        );
+        assert!(!engine.can_undo());
+        assert!(!engine.can_redo());
+        assert!(engine.undo().is_empty());
+
+        let mut engine = CanvasEngine::new();
+        engine.add_layer();
+        let removed_layer_id = engine.active_layer_id().to_owned();
+        engine.add_stamp("top".into(), (0.5, 0.5), 0.1, 0.1, 1.0, 10.0);
+        engine.clear();
+        engine.undo();
+        assert!(engine.take_full_sync_required());
+        assert!(engine.can_redo());
+
+        assert_eq!(
+            drain_types(&engine.delete_layer(&removed_layer_id)),
+            ["layer_delete"]
+        );
+        assert!(!engine.can_undo());
+        assert!(!engine.can_redo());
+        assert!(engine.redo().is_empty());
+    }
+
+    #[test]
+    fn a_later_clear_replaces_the_previous_restore_point() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
+        engine.add_stamp("two".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 20.0);
+
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+        engine.add_stamp("after-clear".into(), (0.3, 0.3), 0.1, 0.1, 1.0, 30.0);
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        assert!(!engine.can_undo());
+
+        let items = engine.shared_items();
+        let items = items.lock().unwrap();
+        let stamp_ids: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                CanvasItem::Stamp { stamp } => Some(stamp.stamp_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stamp_ids, ["after-clear"]);
+    }
+
+    #[test]
+    fn empty_or_active_canvas_clear_is_a_history_noop() {
+        let mut engine = CanvasEngine::new();
+        assert!(engine.clear().is_empty());
+        assert!(!engine.can_undo());
+        assert!(!engine.can_clear());
+
+        engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 0.0);
+        assert!(engine.clear().is_empty());
+        assert!(engine.is_drawing());
+        assert!(!engine.can_undo());
+    }
+
+    #[test]
+    fn new_item_after_clear_undo_discards_clear_redo() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
+        engine.clear();
+        engine.undo();
+        assert!(engine.take_full_sync_required());
+        assert!(engine.can_redo());
+
+        engine.add_stamp("replacement".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 20.0);
+        assert!(!engine.can_redo());
+        assert!(engine.redo().is_empty());
+    }
+
+    #[test]
+    fn items_added_after_clear_keep_their_history_around_the_clear_boundary() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("before".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
+        engine.clear();
+        engine.add_stamp("after".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 20.0);
+
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+        assert!(engine.undo().is_empty());
+        assert!(engine.take_full_sync_required());
+        let restored = engine.shared_items().lock().unwrap().clone();
+        assert_eq!(restored.len(), 1);
+        assert!(matches!(
+            &restored[0],
+            CanvasItem::Stamp { stamp } if stamp.stamp_id == "before"
+        ));
+
+        assert_eq!(drain_types(&engine.redo()), ["clear"]);
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+        let final_items = engine.shared_items().lock().unwrap().clone();
+        assert_eq!(final_items.len(), 1);
+        assert!(matches!(
+            &final_items[0],
+            CanvasItem::Stamp { stamp } if stamp.stamp_id == "after"
+        ));
+    }
+
+    #[test]
+    fn clear_restore_point_expires_before_item_history_exceeds_canvas_cap() {
+        let mut engine = CanvasEngine::new();
+        for i in 0..MAX_ITEMS - 1 {
+            engine.add_stamp(format!("before-{i}"), (0.1, 0.1), 0.1, 0.1, 1.0, i as f64);
+        }
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+
+        engine.add_stamp("at-cap".into(), (0.2, 0.2), 0.1, 0.1, 1.0, 1_000.0);
+        assert!(engine.can_undo());
+        engine.add_stamp("over-cap".into(), (0.3, 0.3), 0.1, 0.1, 1.0, 1_001.0);
+
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(!engine.can_undo());
+        assert!(engine.undo().is_empty());
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_restore_point_expires_before_point_history_exceeds_canvas_cap() {
+        let mut engine = CanvasEngine::new();
+        let mut remaining = MAX_TOTAL_POINTS - 1;
+        let mut before = Vec::new();
+        let mut index = 0;
+        while remaining > 0 {
+            let point_count = remaining.min(MAX_STROKE_POINTS);
+            before.push(CanvasItem::Stroke {
+                stroke: Stroke {
+                    stroke_id: format!("before-{index}"),
+                    layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                    brush: brush(),
+                    pts: vec![(0.1, 0.1, 1.0, 0.0, 0.0, 0.0); point_count],
+                    done: true,
+                    ended_at: Some(index as f64),
+                },
+            });
+            remaining -= point_count;
+            index += 1;
+        }
+        engine.total_points = MAX_TOTAL_POINTS - 1;
+        *engine.items.lock().unwrap() = before;
+        assert_eq!(drain_types(&engine.clear()), ["clear"]);
+
+        engine.begin(POINTER_ID, brush(), 0.2, 0.2, 1.0, 1_000.0);
+        assert!(engine.can_undo());
+        engine.move_to(POINTER_ID, 0.3, 0.3, 1.0, 1_016.0);
+        assert!(!engine.can_undo());
+        engine.end(POINTER_ID, 1_020.0);
+
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(!engine.can_undo());
+        assert!(engine.shared_items().lock().unwrap().is_empty());
     }
 
     #[test]

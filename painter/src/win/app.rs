@@ -701,8 +701,11 @@ impl App {
             MenuAction::Undo => {
                 let deselected = self.item_selection.take().is_some();
                 let msgs = self.engine.undo();
-                let changed = !msgs.is_empty();
-                if changed {
+                let full_sync = self.engine.take_full_sync_required();
+                let changed = full_sync || !msgs.is_empty();
+                if full_sync {
+                    self.web.send_snapshot();
+                } else if changed {
                     self.web.send_all(msgs);
                 }
                 if deselected || changed {
@@ -1450,7 +1453,7 @@ impl App {
             (
                 self.engine.can_undo(),
                 self.engine.can_redo(),
-                self.engine.has_items(),
+                self.engine.can_clear(),
             ),
             layers,
             self.engine.active_layer_id().to_owned(),
@@ -1541,7 +1544,7 @@ impl App {
     fn sync_radial_history(&mut self) {
         let can_undo = self.engine.can_undo();
         let can_redo = self.engine.can_redo();
-        let can_clear = self.engine.has_items();
+        let can_clear = self.engine.can_clear();
         let layers = self.radial_layer_entries();
         let active_layer_id = self.engine.active_layer_id().to_owned();
         let changed = self.radial_menu.as_mut().is_some_and(|menu| {
@@ -1763,6 +1766,7 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
                 app.stamps.clone(),
                 app.engine.can_undo(),
                 app.engine.can_redo(),
+                app.engine.can_clear(),
                 app.engine.layers(),
                 app.radial_layer_entries()
                     .into_iter()
@@ -1772,8 +1776,17 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
             )
         })
     };
-    let Some((tool, color, stamps, can_undo, can_redo, layers, layer_counts, active_layer_id)) =
-        menu_input
+    let Some((
+        tool,
+        color,
+        stamps,
+        can_undo,
+        can_redo,
+        can_clear,
+        layers,
+        layer_counts,
+        active_layer_id,
+    )) = menu_input
     else {
         return;
     };
@@ -1789,6 +1802,7 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
         },
         can_undo,
         can_redo,
+        can_clear,
     );
     apply_menu_result(hwnd, app_ptr, action);
 }

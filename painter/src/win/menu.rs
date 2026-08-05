@@ -112,6 +112,7 @@ pub fn show(
     layer_state: LayerMenuState<'_>,
     can_undo: bool,
     can_redo: bool,
+    can_clear: bool,
 ) -> Option<MenuAction> {
     let LayerMenuState {
         layers,
@@ -235,7 +236,7 @@ pub fn show(
 
         append(root, enabled(can_undo), ID_UNDO, "元に戻す");
         append(root, enabled(can_redo), ID_REDO, "やり直す");
-        append(root, MF_STRING, ID_CLEAR, "全消去...");
+        append(root, enabled(can_clear), ID_CLEAR, "全消去...");
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
         append(root, MF_STRING, ID_EXIT, "終了");
 

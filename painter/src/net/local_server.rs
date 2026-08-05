@@ -199,6 +199,18 @@ pub struct LocalServerHandle {
 }
 
 impl LocalServerHandle {
+    fn schedule_snapshot_recovery(&self) {
+        let generation = self.recovery.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let items = self.source_items.lock().unwrap().clone();
+        let layers = self.source_layers.lock().unwrap().clone();
+        *self.recovery.snapshot.lock().unwrap() = Some(RecoverySnapshot {
+            generation,
+            layers,
+            items,
+        });
+        warn!("scheduled local overlay snapshot recovery generation {generation}");
+    }
+
     /// `true` は同じバッチの後続イベントを送ってよいことを表す。
     fn enqueue(&self, message: PainterMessage) -> bool {
         let generation = self.recovery.generation.load(Ordering::Acquire);
@@ -214,17 +226,7 @@ impl LocalServerHandle {
             Err(mpsc::error::TrySendError::Full(_)) => {
                 // イベントを1件だけ落とすとハブの状態が恒久的に壊れる。完全状態を退避し、
                 // ハブ側で古い世代の待機イベントを無視してsnapshotへ置換する。
-                let generation = self.recovery.generation.fetch_add(1, Ordering::AcqRel) + 1;
-                let items = self.source_items.lock().unwrap().clone();
-                let layers = self.source_layers.lock().unwrap().clone();
-                *self.recovery.snapshot.lock().unwrap() = Some(RecoverySnapshot {
-                    generation,
-                    layers,
-                    items,
-                });
-                warn!(
-                    "local overlay hub input queue was full; scheduled snapshot recovery generation {generation}"
-                );
+                self.schedule_snapshot_recovery();
                 false
             }
         }
@@ -234,6 +236,26 @@ impl LocalServerHandle {
         for message in messages {
             if !self.enqueue(message) {
                 break;
+            }
+        }
+    }
+
+    /// 複数itemを一括変更した現在状態を、接続ごとに1件のsnapshotとして再同期する。
+    pub fn send_snapshot(&self) {
+        let generation = self.recovery.generation.load(Ordering::Acquire);
+        let items = self.source_items.lock().unwrap().clone();
+        let layers = self.source_layers.lock().unwrap().clone();
+        match self.hub.tx.try_send(HubCommand::Replace {
+            generation,
+            layers,
+            items,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("local overlay hub is not running");
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.schedule_snapshot_recovery();
             }
         }
     }
@@ -565,6 +587,11 @@ enum HubCommand {
     Apply {
         generation: u64,
         message: PainterMessage,
+    },
+    Replace {
+        generation: u64,
+        layers: Vec<CanvasLayer>,
+        items: Vec<CanvasItem>,
     },
     Subscribe {
         reply: oneshot::Sender<(u64, mpsc::Receiver<String>)>,
@@ -1006,6 +1033,19 @@ async fn run_hub(mut commands: mpsc::Receiver<HubCommand>, recovery: Arc<HubReco
                     continue;
                 };
                 subscribers.retain(|subscriber| subscriber.tx.try_send(text.clone()).is_ok());
+            }
+            HubCommand::Replace {
+                generation: replacement_generation,
+                layers,
+                items,
+            } => {
+                if replacement_generation != generation {
+                    continue;
+                }
+                let Some(snapshot) = state.replace_document(layers, items) else {
+                    continue;
+                };
+                subscribers.retain(|subscriber| subscriber.tx.try_send(snapshot.clone()).is_ok());
             }
             HubCommand::Subscribe { reply } => {
                 let Some(snapshot) = state.snapshot() else {
@@ -1602,13 +1642,30 @@ mod tests {
         mpsc::Receiver<HubCommand>,
         Arc<HubRecovery>,
     ) {
+        queued_server_with_document(
+            capacity,
+            Arc::new(Mutex::new(default_layers())),
+            source_items,
+        )
+    }
+
+    fn queued_server_with_document(
+        capacity: usize,
+        source_layers: SharedLayers,
+        source_items: SharedItems,
+    ) -> (
+        LocalServerHandle,
+        HubHandle,
+        mpsc::Receiver<HubCommand>,
+        Arc<HubRecovery>,
+    ) {
         let recovery = Arc::new(HubRecovery::default());
         let (tx, rx) = mpsc::channel(capacity);
         let hub = HubHandle { tx };
         let server = LocalServerHandle {
             hub: hub.clone(),
             source_items,
-            source_layers: Arc::new(Mutex::new(default_layers())),
+            source_layers,
             recovery: Arc::clone(&recovery),
             shutdown: None,
             thread: None,
@@ -1620,10 +1677,14 @@ mod tests {
     }
 
     async fn current_hub_items(hub: &HubHandle) -> Vec<CanvasItem> {
+        current_hub_document(hub).await.1
+    }
+
+    async fn current_hub_document(hub: &HubHandle) -> (Vec<CanvasLayer>, Vec<CanvasItem>) {
         let (_, mut receiver) = hub.subscribe().await.unwrap();
         let snapshot = receiver.recv().await.unwrap();
         match serde_json::from_str::<OverlayControlMessage>(&snapshot).unwrap() {
-            OverlayControlMessage::Snapshot { items, .. } => items,
+            OverlayControlMessage::Snapshot { layers, items, .. } => (layers, items),
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
     }
@@ -2170,6 +2231,141 @@ mod tests {
             }
             OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_full_sync_replaces_state_with_one_snapshot() {
+        let layers = vec![
+            CanvasLayer::default(),
+            CanvasLayer {
+                layer_id: "top".into(),
+                name: "レイヤー 2".into(),
+            },
+            CanvasLayer {
+                layer_id: "empty".into(),
+                name: "空レイヤー".into(),
+            },
+        ];
+        let restored = [
+            ("restored-1", crate::protocol::DEFAULT_LAYER_ID),
+            ("restored-2", "top"),
+        ]
+        .into_iter()
+        .map(|(item_id, layer_id)| CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: item_id.into(),
+                layer_id: layer_id.into(),
+                stamp_id: "fixture-stamp".into(),
+                center: (0.5, 0.5),
+                width_n: 0.1,
+                height_n: 0.2,
+                rotation: 0.0,
+                opacity: 1.0,
+                done: true,
+                ended_at: Some(20.0),
+            },
+        })
+        .collect::<Vec<_>>();
+        let source_layers = Arc::new(Mutex::new(layers.clone()));
+        let source_items = Arc::new(Mutex::new(restored.clone()));
+        let (server, hub, rx, recovery) =
+            queued_server_with_document(4, source_layers, source_items);
+        tokio::spawn(run_hub(rx, recovery));
+
+        let (_, mut receiver) = hub.subscribe().await.unwrap();
+        let initial = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&initial).unwrap() {
+            OverlayControlMessage::Snapshot {
+                rev,
+                layers: initial_layers,
+                items,
+                ..
+            } => {
+                assert_eq!(rev, 0);
+                assert_eq!(initial_layers, default_layers());
+                assert!(items.is_empty());
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+
+        server.send_snapshot();
+        let replacement = receiver.recv().await.unwrap();
+        match serde_json::from_str::<OverlayControlMessage>(&replacement).unwrap() {
+            OverlayControlMessage::Snapshot {
+                rev,
+                layers: actual_layers,
+                items,
+                ..
+            } => {
+                assert_eq!(rev, 1);
+                assert_eq!(actual_layers, layers);
+                assert_eq!(items, restored);
+            }
+            OverlayControlMessage::Pong { .. } => panic!("expected snapshot"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_queue_pressure_uses_generation_snapshot_recovery() {
+        let source_layers = Arc::new(Mutex::new(default_layers()));
+        let source_items = Arc::new(Mutex::new(vec![CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: "before".into(),
+                layer_id: crate::protocol::DEFAULT_LAYER_ID.into(),
+                stamp_id: "before".into(),
+                center: (0.25, 0.25),
+                width_n: 0.1,
+                height_n: 0.2,
+                rotation: 0.0,
+                opacity: 1.0,
+                done: true,
+                ended_at: Some(10.0),
+            },
+        }]));
+        let (server, hub, rx, recovery) =
+            queued_server_with_document(1, Arc::clone(&source_layers), Arc::clone(&source_items));
+        server.send_all(vec![PainterMessage::Clear {}]);
+
+        let restored = CanvasItem::Stamp {
+            stamp: StampItem {
+                item_id: "restored".into(),
+                layer_id: "top".into(),
+                stamp_id: "restored".into(),
+                center: (0.75, 0.75),
+                width_n: 0.2,
+                height_n: 0.3,
+                rotation: 0.25,
+                opacity: 0.8,
+                done: true,
+                ended_at: Some(20.0),
+            },
+        };
+        let restored_layers = vec![
+            CanvasLayer::default(),
+            CanvasLayer {
+                layer_id: "top".into(),
+                name: "レイヤー 2".into(),
+            },
+            CanvasLayer {
+                layer_id: "empty".into(),
+                name: "空レイヤー".into(),
+            },
+        ];
+        *source_layers.lock().unwrap() = restored_layers.clone();
+        *source_items.lock().unwrap() = vec![restored.clone()];
+        server.send_snapshot();
+        assert_eq!(recovery.generation.load(Ordering::Acquire), 1);
+
+        tokio::spawn(run_hub(rx, recovery));
+        assert_eq!(
+            current_hub_document(&hub).await,
+            (restored_layers, vec![restored])
+        );
     }
 
     #[test]

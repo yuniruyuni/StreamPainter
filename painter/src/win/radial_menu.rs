@@ -145,7 +145,7 @@ impl RadialMenu {
         surface_size: (u32, u32),
         scale: f32,
         stamp_count: usize,
-        history_available: (bool, bool),
+        command_available: (bool, bool, bool),
     ) -> Self {
         Self::new_with_layers(
             pointer_id,
@@ -154,11 +154,7 @@ impl RadialMenu {
             surface_size,
             scale,
             stamp_count,
-            (
-                history_available.0,
-                history_available.1,
-                history_available.0,
-            ),
+            command_available,
             vec![RadialLayerEntry {
                 layer_id: "default".into(),
                 name: "レイヤー 1".into(),
@@ -176,7 +172,7 @@ impl RadialMenu {
         surface_size: (u32, u32),
         scale: f32,
         stamp_count: usize,
-        history_available: (bool, bool, bool),
+        command_available: (bool, bool, bool),
         layers: Vec<RadialLayerEntry>,
         active_layer_id: String,
     ) -> Self {
@@ -220,9 +216,9 @@ impl RadialMenu {
             scale,
             stamp_count,
             stamp_mode: false,
-            can_undo: history_available.0,
-            can_redo: history_available.1,
-            can_clear: history_available.2,
+            can_undo: command_available.0,
+            can_redo: command_available.1,
+            can_clear: command_available.2,
             layers,
             active_layer_id,
             panel_on_right,
@@ -836,7 +832,12 @@ mod tests {
         (radius * angle.cos(), radius * angle.sin())
     }
 
-    fn menu_with_history(stamp_count: usize, can_undo: bool, can_redo: bool) -> RadialMenu {
+    fn menu_with_history(
+        stamp_count: usize,
+        can_undo: bool,
+        can_redo: bool,
+        can_clear: bool,
+    ) -> RadialMenu {
         RadialMenu::new(
             1,
             (0.0, 0.0),
@@ -844,12 +845,12 @@ mod tests {
             (1000, 1000),
             1.0,
             stamp_count,
-            (can_undo, can_redo),
+            (can_undo, can_redo, can_clear),
         )
     }
 
     fn menu(stamp_count: usize) -> RadialMenu {
-        menu_with_history(stamp_count, false, false)
+        menu_with_history(stamp_count, false, false, false)
     }
 
     fn layer_entries(count: usize) -> Vec<RadialLayerEntry> {
@@ -1013,7 +1014,7 @@ mod tests {
             (RadialCommand::Redo, MenuAction::Redo, true),
             (RadialCommand::Clear, MenuAction::Clear, false),
         ] {
-            let mut menu = pin(menu_with_history(0, true, true));
+            let mut menu = pin(menu_with_history(0, true, true, true));
             let target = command_point(&menu, command);
             assert!(menu.begin_click(2));
             menu.update(target);
@@ -1038,6 +1039,20 @@ mod tests {
     }
 
     #[test]
+    fn clear_availability_is_independent_from_undo_history() {
+        let mut menu = menu_with_history(0, false, true, true);
+        assert!(!menu.command_enabled(RadialCommand::Undo));
+        assert!(menu.command_enabled(RadialCommand::Redo));
+        assert!(menu.command_enabled(RadialCommand::Clear));
+
+        assert!(menu.set_command_availability(true, false, false));
+        assert!(menu.command_enabled(RadialCommand::Undo));
+        assert!(!menu.command_enabled(RadialCommand::Redo));
+        assert!(!menu.command_enabled(RadialCommand::Clear));
+        assert!(!menu.set_command_availability(true, false, false));
+    }
+
+    #[test]
     fn command_dock_moves_above_the_ring_near_the_bottom_edge() {
         let menu = RadialMenu::new(
             1,
@@ -1046,7 +1061,7 @@ mod tests {
             (1000, 1000),
             1.0,
             0,
-            (true, true),
+            (true, true, true),
         );
         for (_, rect) in menu.command_buttons() {
             assert!(rect.bottom < menu.center_local().1 - menu.color_outer_radius());
@@ -1140,7 +1155,7 @@ mod tests {
                         (width, height),
                         scale_for_surface(width, height),
                         stamp_count,
-                        (true, true),
+                        (true, true, true),
                     );
                     assert!(
                         menu.layout_within_surface(),
@@ -1213,7 +1228,15 @@ mod tests {
     #[test]
     fn adjusted_center_preserves_hold_pin_legacy_menu_and_pinned_clicks() {
         let anchor = (2500.0, -1200.0);
-        let mut menu = RadialMenu::new(1, anchor, (0.0, 0.0), (640, 480), 1.6, 32, (true, true));
+        let mut menu = RadialMenu::new(
+            1,
+            anchor,
+            (0.0, 0.0),
+            (640, 480),
+            1.6,
+            32,
+            (true, true, true),
+        );
         assert_ne!(menu.center_local(), (0.0, 0.0));
         assert!(menu.scale() < 1.6);
         assert!(menu.layout_within_surface());
@@ -1222,7 +1245,15 @@ mod tests {
         assert!(menu.begin_click(2));
         assert_eq!(menu.release(menu.center_screen), RadialRelease::LegacyMenu);
 
-        let mut menu = RadialMenu::new(1, anchor, (0.0, 0.0), (640, 480), 1.6, 32, (true, true));
+        let mut menu = RadialMenu::new(
+            1,
+            anchor,
+            (0.0, 0.0),
+            (640, 480),
+            1.6,
+            32,
+            (true, true, true),
+        );
         assert_eq!(menu.release(anchor), RadialRelease::Pin);
         assert!(menu.begin_click(2));
         let target = screen_point(
@@ -1252,7 +1283,7 @@ mod tests {
             (640, 480),
             scale_for_surface(640, 480),
             32,
-            (false, false),
+            (false, false, false),
         );
         let tool = screen_point(
             &menu,
@@ -1278,7 +1309,7 @@ mod tests {
                         (width, height),
                         requested_scale,
                         32,
-                        (true, true),
+                        (true, true, true),
                     );
                     assert!(menu.scale() <= requested_scale);
                     assert!(menu.layout_within_surface());

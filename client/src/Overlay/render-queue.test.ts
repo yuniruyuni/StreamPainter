@@ -99,6 +99,14 @@ describe("RenderQueue", () => {
     expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
   });
 
+  test("同一frameの全消去とUndo snapshotは最新documentのrebuild 1件へ集約する", () => {
+    const queue = new RenderQueue();
+    queue.enqueue({ kind: "rebuild" }); // clear
+    queue.enqueue({ kind: "rebuild" }); // Undo後の完全snapshot
+
+    expect(queue.drain()).toEqual([{ kind: "rebuild" }]);
+  });
+
   test("同じスタンプのpreviewは初回再構築を保ったまま最新位置へ集約する", () => {
     const queue = new RenderQueue();
     const first = stampPreview(1, true);

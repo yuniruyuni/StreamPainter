@@ -387,6 +387,57 @@ describe("OverlayState", () => {
     expect(state.strokes).toHaveLength(0);
   });
 
+  test("clear後の完全snapshotは複数itemを1回で元の順序へ復元する", () => {
+    const layers = [
+      { layerId: "default", name: "レイヤー 1" },
+      { layerId: "top", name: "レイヤー 2" },
+      { layerId: "empty", name: "空レイヤー" },
+    ];
+    const restored: CanvasItem[] = [
+      strokeItem("s1"),
+      {
+        kind: "stamp",
+        itemId: "stamp-item-1",
+        layerId: "top",
+        stampId: "stamp-1",
+        center: [0.5, 0.5],
+        widthN: 0.1,
+        heightN: 0.2,
+        rotation: 0.25,
+        opacity: 0.8,
+        done: true,
+        endedAt: 200,
+      },
+    ];
+    const state = new OverlayState();
+    expect(
+      state.apply({
+        type: "snapshot",
+        protocolVersion: PROTOCOL_VERSION,
+        rev: 5,
+        fadeAfterMs: null,
+        layers,
+        items: restored,
+      }).kind,
+    ).toBe("rebuild");
+    expect(applyNext(state, { type: "clear" }).kind).toBe("rebuild");
+    expect(state.layers).toEqual(layers);
+
+    expect(
+      state.apply({
+        type: "snapshot",
+        protocolVersion: PROTOCOL_VERSION,
+        rev: 7,
+        fadeAfterMs: null,
+        layers,
+        items: restored,
+      }).kind,
+    ).toBe("rebuild");
+    expect(state.layers).toEqual(layers);
+    expect(state.items).toEqual(restored);
+    expect(state.rev).toBe(7);
+  });
+
   test("eraser の cancel は rebuild になる", () => {
     const state = synchronizedState();
     applyNext(state, {

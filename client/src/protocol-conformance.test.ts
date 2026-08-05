@@ -782,6 +782,40 @@ describe("Rust / TypeScript protocol conformance", () => {
     ]);
   });
 
+  test("全消去後のRust完全snapshotで全CanvasItemを元の順序へ復元する", () => {
+    const rawSnapshot = fixture.controlMessages.find(
+      (raw) => expectObject(raw, "control message").type === "snapshot",
+    );
+    if (rawSnapshot === undefined)
+      throw new Error("snapshot fixture is required");
+    const snapshot = decodeServerMessage(rawSnapshot);
+    if (snapshot.type !== "snapshot")
+      throw new Error("expected snapshot fixture");
+
+    const clearCase = fixture.eventCases.find(
+      (eventCase) => eventCase.name === "clear",
+    );
+    if (clearCase === undefined) throw new Error("clear fixture is required");
+    const clear = decodeServerMessage(clearCase.message);
+    if (clear.type !== "clear") throw new Error("expected clear fixture");
+
+    const state = new OverlayState();
+    expect(state.apply(snapshot).kind).toBe("rebuild");
+    const layersBefore = structuredClone(state.layers);
+    const before = structuredClone(state.items);
+    expect(state.apply(clear).kind).toBe("rebuild");
+    expect(state.layers).toEqual(layersBefore);
+    expect(state.items).toEqual([]);
+
+    const restored = decodeServerMessage({
+      ...expectObject(rawSnapshot, "snapshot fixture"),
+      rev: clear.rev + 1,
+    });
+    expect(state.apply(restored).kind).toBe("rebuild");
+    expect(state.layers).toEqual(layersBefore);
+    expect(state.items).toEqual(before);
+  });
+
   for (const eventCase of fixture.eventCases) {
     test(`${eventCase.name} をdecode / applyしてRust状態と一致する`, () => {
       const state = new OverlayState();
