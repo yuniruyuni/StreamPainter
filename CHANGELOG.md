@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-05
+
 ### Added
 
 - 最大8枚の描画レイヤーをラジアルパネルまたは従来メニューから追加・選択・削除する機能。
@@ -229,7 +231,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.0...v0.7.1
