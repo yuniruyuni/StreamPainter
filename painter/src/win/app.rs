@@ -107,6 +107,12 @@ impl FrameGate {
     }
 }
 
+/// 設定ポリシーとエンジンの全消去可否から、確認画面が必要かだけを決める。
+/// 空キャンバスや操作中は不要な確認を出さない。
+fn clear_confirmation_required(confirm_before_clear: bool, can_clear: bool) -> bool {
+    confirm_before_clear && can_clear
+}
+
 struct App {
     engine: CanvasEngine,
     web: LocalServerHandle,
@@ -125,6 +131,7 @@ struct App {
     monitor: Monitor,
     draw_mode: bool,
     local_echo: bool,
+    confirm_before_clear: bool,
     /// OBS プロジェクター表示への追従 (config.follow_projector)
     follow_projector: bool,
     /// プロジェクター検知結果。false の間はオーバーレイを隠し切替も無効
@@ -268,6 +275,7 @@ pub fn run() -> Result<()> {
         monitor: mon,
         draw_mode: false,
         local_echo: config.local_echo,
+        confirm_before_clear: config.confirm_before_clear,
         follow_projector: config.follow_projector,
         projector_visible: false,
         obs,
@@ -726,7 +734,13 @@ impl App {
                 }
             }
             MenuAction::Clear => {
-                if !crate::win::confirm(hwnd, "すべての描画を消去しますか？") {
+                let can_clear = self.engine.can_clear();
+                if !can_clear {
+                    return false;
+                }
+                if clear_confirmation_required(self.confirm_before_clear, can_clear)
+                    && !crate::win::confirm(hwnd, "すべての描画を消去しますか？")
+                {
                     return false;
                 }
                 let deselected = self.item_selection.take().is_some();
@@ -1767,6 +1781,7 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
                 app.engine.can_undo(),
                 app.engine.can_redo(),
                 app.engine.can_clear(),
+                app.confirm_before_clear,
                 app.engine.layers(),
                 app.radial_layer_entries()
                     .into_iter()
@@ -1783,6 +1798,7 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
         can_undo,
         can_redo,
         can_clear,
+        confirm_before_clear,
         layers,
         layer_counts,
         active_layer_id,
@@ -1803,6 +1819,7 @@ fn show_legacy_menu(hwnd: HWND, app_ptr: *mut App) {
         can_undo,
         can_redo,
         can_clear,
+        confirm_before_clear,
     );
     apply_menu_result(hwnd, app_ptr, action);
 }
@@ -2182,6 +2199,14 @@ mod tests {
         assert!(gate.request());
         gate.cancel();
         assert!(!gate.take());
+    }
+
+    #[test]
+    fn clear_confirmation_policy_requires_both_setting_and_content() {
+        assert!(clear_confirmation_required(true, true));
+        assert!(!clear_confirmation_required(true, false));
+        assert!(!clear_confirmation_required(false, true));
+        assert!(!clear_confirmation_required(false, false));
     }
 
     #[test]

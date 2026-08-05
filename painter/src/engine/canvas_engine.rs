@@ -2179,6 +2179,19 @@ mod tests {
     }
 
     #[test]
+    fn clearing_an_empty_canvas_preserves_redo_history() {
+        let mut engine = CanvasEngine::new();
+        engine.add_stamp("one".into(), (0.1, 0.1), 0.1, 0.1, 1.0, 10.0);
+        assert_eq!(drain_types(&engine.undo()), ["undo"]);
+        assert!(engine.shared_items().lock().unwrap().is_empty());
+        assert!(engine.can_redo());
+
+        assert!(engine.clear().is_empty());
+        assert!(engine.can_redo());
+        assert_eq!(drain_types(&engine.redo()), ["redo"]);
+    }
+
+    #[test]
     fn cancel_discards_active() {
         let mut engine = CanvasEngine::new();
         engine.begin(POINTER_ID, brush(), 0.1, 0.1, 0.5, 0.0);

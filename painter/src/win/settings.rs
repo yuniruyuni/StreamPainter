@@ -88,6 +88,7 @@ const ID_HOTKEY_CLEAR: i32 = 123;
 const ID_HOTKEY_DEFAULT: i32 = 124;
 const ID_AUTOSTART: i32 = 125;
 const ID_AUTOSTART_STATUS: i32 = 126;
+const ID_CONFIRM_BEFORE_CLEAR: i32 = 127;
 
 const WM_DIAGNOSTICS_CHANGED: u32 = WM_APP + 1;
 
@@ -800,6 +801,18 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ES_AUTOHSCROLL,
         )?;
 
+        create_checkbox(
+            hwnd,
+            font,
+            ID_CONFIRM_BEFORE_CLEAR,
+            "全消去の前に確認画面を表示する（推奨）",
+            config.confirm_before_clear,
+            s(330),
+            s(494),
+            s(310),
+            row_height,
+        )?;
+
         create_label(
             hwnd,
             font,
@@ -1493,6 +1506,7 @@ fn read_config(hwnd: HWND, state: &mut SettingsState) -> Result<Config> {
         screen,
         canvas_aspect: control_text(hwnd, ID_ASPECT)?.trim().to_owned(),
         local_echo: checked(hwnd, ID_LOCAL_ECHO)?,
+        confirm_before_clear: checked(hwnd, ID_CONFIRM_BEFORE_CLEAR)?,
         follow_projector: checked(hwnd, ID_FOLLOW_PROJECTOR)?,
         obs_control: checked(hwnd, ID_OBS_CONTROL)?,
         obs_websocket_url: control_text(hwnd, ID_OBS_URL)?.trim().to_owned(),

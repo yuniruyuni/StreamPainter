@@ -41,6 +41,9 @@ pub struct Config {
     pub canvas_aspect: String,
     #[serde(default = "default_true")]
     pub local_echo: bool,
+    /// 全消去を実行する前に確認画面を表示する。
+    #[serde(default = "default_true")]
+    pub confirm_before_clear: bool,
     /// OBS 全画面プロジェクターの表示に追従してオーバーレイを自動で有効/無効化する
     #[serde(default = "default_true")]
     pub follow_projector: bool,
@@ -77,6 +80,7 @@ impl fmt::Debug for Config {
             .field("screen", &self.screen)
             .field("canvas_aspect", &self.canvas_aspect)
             .field("local_echo", &self.local_echo)
+            .field("confirm_before_clear", &self.confirm_before_clear)
             .field("follow_projector", &self.follow_projector)
             .field("obs_control", &self.obs_control)
             .field("obs_websocket_url", &self.obs_websocket_url)
@@ -386,6 +390,7 @@ impl Default for Config {
             screen: 0,
             canvas_aspect: default_aspect(),
             local_echo: true,
+            confirm_before_clear: true,
             follow_projector: true,
             obs_control: true,
             obs_websocket_url: default_obs_url(),
@@ -450,6 +455,9 @@ canvas_aspect = "16:9"
 
 # ローカルエコー (自分の画面に即時描画するか)
 local_echo = true
+
+# 全消去を実行する前に確認画面を表示する（推奨）
+confirm_before_clear = true
 
 # OBS 全画面プロジェクターが対象モニタに表示されている間だけ有効化する
 follow_projector = true
@@ -1634,10 +1642,24 @@ mod tests {
         assert_eq!(config.canvas_aspect, "16:9");
         assert_eq!(config.screen, 0);
         assert!(config.local_echo);
+        assert!(config.confirm_before_clear);
         assert_eq!(config.brush.width_n, 0.005);
         assert!(config.stamps.is_empty());
         assert_eq!(config.hotkey, HotkeyConfig::default());
         assert_eq!(config.hotkey.display_name(), "F9");
+    }
+
+    #[test]
+    fn clear_confirmation_setting_round_trips_when_disabled() {
+        let configured = Config {
+            confirm_before_clear: false,
+            ..Config::default()
+        };
+
+        let serialized = toml::to_string(&configured).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+
+        assert!(!restored.confirm_before_clear);
     }
 
     #[test]

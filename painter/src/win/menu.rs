@@ -86,6 +86,14 @@ fn enabled(flag: bool) -> windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLA
     }
 }
 
+fn clear_menu_label(confirm_before_clear: bool) -> &'static str {
+    if confirm_before_clear {
+        "全消去..."
+    } else {
+        "全消去"
+    }
+}
+
 fn append(
     menu: HMENU,
     flags: windows::Win32::UI::WindowsAndMessaging::MENU_ITEM_FLAGS,
@@ -113,6 +121,7 @@ pub fn show(
     can_undo: bool,
     can_redo: bool,
     can_clear: bool,
+    confirm_before_clear: bool,
 ) -> Option<MenuAction> {
     let LayerMenuState {
         layers,
@@ -236,7 +245,12 @@ pub fn show(
 
         append(root, enabled(can_undo), ID_UNDO, "元に戻す");
         append(root, enabled(can_redo), ID_REDO, "やり直す");
-        append(root, enabled(can_clear), ID_CLEAR, "全消去...");
+        append(
+            root,
+            enabled(can_clear),
+            ID_CLEAR,
+            clear_menu_label(confirm_before_clear),
+        );
         let _ = AppendMenuW(root, MF_SEPARATOR, 0, None);
         append(root, MF_STRING, ID_EXIT, "終了");
 
@@ -282,5 +296,16 @@ pub fn show(
             ),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_menu_label;
+
+    #[test]
+    fn clear_label_only_has_ellipsis_when_confirmation_is_enabled() {
+        assert_eq!(clear_menu_label(true), "全消去...");
+        assert_eq!(clear_menu_label(false), "全消去");
     }
 }

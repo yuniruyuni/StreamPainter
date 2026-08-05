@@ -35,6 +35,7 @@ Cloud Run、外部DB、Twitchログイン、公開Webアプリは使いません
 `%APPDATA%\StreamPainter\config\config.toml` を直接編集する必要はありません。ポート競合などで
 通常起動できない場合も、`stream-painter.exe --settings` で設定画面だけを開けます。
 PNGスタンプの登録・削除・名称・既定サイズ・不透明度も同じ設定画面で管理できます。
+全消去前の確認画面も設定から有効・無効を選べます（既定は有効です）。
 OBS WebSocketパスワードは設定ファイルへ含めず、現在のWindowsユーザーの資格情報マネージャーへ
 保存します。そのため設定バックアップやportableなexeのコピー時にはパスワードを再入力します。
 設定画面とトレイでは、ローカルサーバーが到達可能か、OBS Browser SourceのWebSocketが実際に
