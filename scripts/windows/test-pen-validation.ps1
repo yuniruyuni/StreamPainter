@@ -26,7 +26,7 @@ function Add-TestStroke {
 function New-StartedState {
     $state = New-PenValidationState
     Add-PenValidationMessage $state ([pscustomobject]@{type='snapshot';protocolVersion=8;rev=20;layers=@(
-        [pscustomobject]@{layerId='default';name='レイヤー 1'});items=@(
+        [pscustomobject]@{layerId='default';name='Layer 1'});items=@(
         [pscustomobject]@{kind='stroke';pts=@(@(0,0,0,0,0,0))})})
     return $state
 }
