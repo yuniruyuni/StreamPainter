@@ -1702,6 +1702,49 @@ canvas_aspect = "16:9"
     }
 
     #[test]
+    fn hotkey_examples_round_trip_with_expected_display_and_chord() {
+        let examples = [
+            (
+                HotkeyConfig {
+                    enabled: true,
+                    modifiers: Vec::new(),
+                    key: "F18".to_owned(),
+                },
+                "F18",
+                HotkeyChord {
+                    modifiers: 0,
+                    virtual_key: 0x81,
+                },
+            ),
+            (
+                HotkeyConfig {
+                    enabled: true,
+                    modifiers: vec![HotkeyModifier::Ctrl],
+                    key: "M".to_owned(),
+                },
+                "Ctrl+M",
+                HotkeyChord {
+                    modifiers: HOTKEY_MOD_CTRL,
+                    virtual_key: u32::from(b'M'),
+                },
+            ),
+        ];
+
+        for (configured, expected_display, expected_chord) in examples {
+            let config = Config {
+                hotkey: configured.clone(),
+                ..Config::default()
+            };
+            let text = toml::to_string_pretty(&config).unwrap();
+            let decoded: Config = toml::from_str(&text).unwrap();
+
+            assert_eq!(decoded.hotkey, configured);
+            assert_eq!(decoded.hotkey.display_name(), expected_display);
+            assert_eq!(decoded.hotkey.chord().unwrap(), Some(expected_chord));
+        }
+    }
+
+    #[test]
     fn hotkey_validation_rejects_unsafe_or_ambiguous_values() {
         let letter_without_modifier = HotkeyConfig {
             key: "A".to_owned(),

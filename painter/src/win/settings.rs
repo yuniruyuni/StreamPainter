@@ -236,6 +236,47 @@ fn key_is_down(key: u32) -> bool {
     (unsafe { GetKeyState(key as i32) }) < 0
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HotkeyCaptureDecision {
+    PassThrough,
+    Consume,
+    Update(HotkeyConfig),
+    Reject(String),
+}
+
+fn hotkey_capture_decision(message: u32, key: u32, modifiers: u32) -> HotkeyCaptureDecision {
+    if !matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+        return HotkeyCaptureDecision::PassThrough;
+    }
+
+    // Tab / Shift+Tab と Esc は通常のdialog移動・キャンセルとして扱う。
+    // Shift+Tabをcaptureすると、キーボードだけで前のcontrolへ戻れなくなる。
+    let dialog_tab = key == u32::from(VK_TAB.0) && matches!(modifiers, 0 | HOTKEY_MOD_SHIFT);
+    let dialog_escape = key == u32::from(VK_ESCAPE.0) && modifiers == 0;
+    if dialog_tab || dialog_escape {
+        return HotkeyCaptureDecision::PassThrough;
+    }
+    if matches!(message, WM_KEYUP | WM_SYSKEYUP) {
+        return HotkeyCaptureDecision::Consume;
+    }
+    if [
+        u32::from(VK_CONTROL.0),
+        u32::from(VK_MENU.0),
+        u32::from(VK_SHIFT.0),
+        u32::from(VK_LWIN.0),
+        u32::from(VK_RWIN.0),
+    ]
+    .contains(&key)
+    {
+        return HotkeyCaptureDecision::Consume;
+    }
+
+    match HotkeyConfig::from_virtual_key(key, modifiers) {
+        Ok(config) => HotkeyCaptureDecision::Update(config),
+        Err(error) => HotkeyCaptureDecision::Reject(error.to_string()),
+    }
+}
+
 unsafe fn capture_hotkey_message(settings_hwnd: HWND, message: &MSG) -> bool {
     let Ok(capture) = control(settings_hwnd, ID_HOTKEY_CAPTURE) else {
         return false;
@@ -264,43 +305,27 @@ unsafe fn capture_hotkey_message(settings_hwnd: HWND, message: &MSG) -> bool {
         modifiers |= HOTKEY_MOD_WIN;
     }
 
-    // Tab / Esc は修飾なしなら通常のdialog移動・キャンセルとして扱う。
-    if modifiers == 0 && (key == u32::from(VK_TAB.0) || key == u32::from(VK_ESCAPE.0)) {
-        return false;
-    }
-    if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) {
-        return true;
-    }
-    if [
-        u32::from(VK_CONTROL.0),
-        u32::from(VK_MENU.0),
-        u32::from(VK_SHIFT.0),
-        u32::from(VK_LWIN.0),
-        u32::from(VK_RWIN.0),
-    ]
-    .contains(&key)
-    {
-        return true;
-    }
-
-    let state_ptr = GetWindowLongPtrW(settings_hwnd, GWLP_USERDATA) as *mut SettingsState;
-    let Some(state) = state_ptr.as_mut() else {
-        return true;
-    };
-    match HotkeyConfig::from_virtual_key(key, modifiers) {
-        Ok(config) => {
+    match hotkey_capture_decision(message.message, key, modifiers) {
+        HotkeyCaptureDecision::PassThrough => false,
+        HotkeyCaptureDecision::Consume => true,
+        HotkeyCaptureDecision::Update(config) => {
+            let state_ptr = GetWindowLongPtrW(settings_hwnd, GWLP_USERDATA) as *mut SettingsState;
+            let Some(state) = state_ptr.as_mut() else {
+                return true;
+            };
             state.hotkey = config;
             let _ = update_hotkey_control(settings_hwnd, state);
+            true
         }
-        Err(error) => {
+        HotkeyCaptureDecision::Reject(error) => {
             let _ = set_control_text(
                 settings_hwnd,
                 ID_HOTKEY_CAPTURE,
                 &format!("使用できないキー: {error}"),
             );
+            true
         }
     }
-    true
 }
 
 /// 通常起動できない場合にも `stream-painter.exe --settings` で設定だけを編集できる。
@@ -719,11 +744,11 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
         create_label(
             hwnd,
             font,
-            "切替キー（欄を選びキー入力）",
+            "切替キー（欄を選択して入力）\n例: F18 / Ctrl+M",
             label_x,
-            s(397),
+            s(385),
             label_width,
-            row_height,
+            s(42),
         )?;
         create_edit(
             hwnd,
@@ -1924,6 +1949,68 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotkey_capture_accepts_f18_and_ctrl_m() {
+        let HotkeyCaptureDecision::Update(f18) = hotkey_capture_decision(WM_KEYDOWN, 0x81, 0)
+        else {
+            panic!("F18 must be captured");
+        };
+        assert_eq!(f18.display_name(), "F18");
+        assert_eq!(
+            f18.chord().unwrap(),
+            Some(crate::config::HotkeyChord {
+                modifiers: 0,
+                virtual_key: 0x81,
+            })
+        );
+
+        let HotkeyCaptureDecision::Update(ctrl_m) =
+            hotkey_capture_decision(WM_KEYDOWN, u32::from(b'M'), HOTKEY_MOD_CTRL)
+        else {
+            panic!("Ctrl+M must be captured");
+        };
+        assert_eq!(ctrl_m.display_name(), "Ctrl+M");
+        assert_eq!(
+            ctrl_m.chord().unwrap(),
+            Some(crate::config::HotkeyChord {
+                modifiers: HOTKEY_MOD_CTRL,
+                virtual_key: u32::from(b'M'),
+            })
+        );
+    }
+
+    #[test]
+    fn hotkey_capture_preserves_dialog_and_validation_rules() {
+        assert_eq!(
+            hotkey_capture_decision(WM_KEYDOWN, u32::from(VK_TAB.0), 0),
+            HotkeyCaptureDecision::PassThrough
+        );
+        assert_eq!(
+            hotkey_capture_decision(WM_KEYDOWN, u32::from(VK_TAB.0), HOTKEY_MOD_SHIFT),
+            HotkeyCaptureDecision::PassThrough
+        );
+        assert_eq!(
+            hotkey_capture_decision(WM_KEYDOWN, u32::from(VK_ESCAPE.0), 0),
+            HotkeyCaptureDecision::PassThrough
+        );
+        assert_eq!(
+            hotkey_capture_decision(WM_KEYDOWN, u32::from(VK_CONTROL.0), HOTKEY_MOD_CTRL),
+            HotkeyCaptureDecision::Consume
+        );
+        assert_eq!(
+            hotkey_capture_decision(WM_KEYUP, u32::from(b'M'), HOTKEY_MOD_CTRL),
+            HotkeyCaptureDecision::Consume
+        );
+        assert!(matches!(
+            hotkey_capture_decision(WM_KEYDOWN, 0x7b, 0),
+            HotkeyCaptureDecision::Reject(message) if message.contains("F12")
+        ));
+        assert_eq!(
+            hotkey_capture_decision(WM_COMMAND, u32::from(b'M'), HOTKEY_MOD_CTRL),
+            HotkeyCaptureDecision::PassThrough
+        );
+    }
 
     fn diagnostics(
         reachability: LocalServerReachability,
