@@ -1495,7 +1495,11 @@ impl App {
             (self.monitor.width as u32, self.monitor.height as u32),
             scale,
             self.stamps.len(),
-            (self.engine.can_undo(), self.engine.can_redo()),
+            (
+                self.engine.can_undo(),
+                self.engine.can_redo(),
+                self.engine.can_clear_layer(self.engine.active_layer_id()),
+            ),
             layers,
             self.engine.active_layer_id().to_owned(),
         ));
@@ -1585,10 +1589,11 @@ impl App {
     fn sync_radial_history(&mut self) {
         let can_undo = self.engine.can_undo();
         let can_redo = self.engine.can_redo();
+        let can_clear = self.engine.can_clear_layer(self.engine.active_layer_id());
         let layers = self.radial_layer_entries();
         let active_layer_id = self.engine.active_layer_id().to_owned();
         let changed = self.radial_menu.as_mut().is_some_and(|menu| {
-            let commands = menu.set_command_availability(can_undo, can_redo);
+            let commands = menu.set_command_availability(can_undo, can_redo, can_clear);
             let layers = menu.set_layers(layers, active_layer_id);
             commands || layers
         });

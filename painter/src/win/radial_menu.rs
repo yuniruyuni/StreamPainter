@@ -122,6 +122,7 @@ pub struct RadialMenu {
     stamp_mode: bool,
     can_undo: bool,
     can_redo: bool,
+    can_clear: bool,
     layers: Vec<RadialLayerEntry>,
     active_layer_id: String,
     panel_on_right: bool,
@@ -145,7 +146,7 @@ impl RadialMenu {
         surface_size: (u32, u32),
         scale: f32,
         stamp_count: usize,
-        command_available: (bool, bool),
+        command_available: (bool, bool, bool),
     ) -> Self {
         Self::new_with_layers(
             pointer_id,
@@ -172,7 +173,7 @@ impl RadialMenu {
         surface_size: (u32, u32),
         scale: f32,
         stamp_count: usize,
-        command_available: (bool, bool),
+        command_available: (bool, bool, bool),
         layers: Vec<RadialLayerEntry>,
         active_layer_id: String,
     ) -> Self {
@@ -218,6 +219,7 @@ impl RadialMenu {
             stamp_mode: false,
             can_undo: command_available.0,
             can_redo: command_available.1,
+            can_clear: command_available.2,
             layers,
             active_layer_id,
             panel_on_right,
@@ -285,6 +287,7 @@ impl RadialMenu {
                         | MenuAction::Redo
                         | MenuAction::SelectLayer(_)
                         | MenuAction::AddLayer
+                        | MenuAction::ClearLayer(_)
                         | MenuAction::DeleteLayer(_)
                 );
             return RadialRelease::Action { action, keep_open };
@@ -297,6 +300,7 @@ impl RadialMenu {
                         | RadialSelection::Command(_)
                         | RadialSelection::Layer(_)
                         | RadialSelection::LayerAdd
+                        | RadialSelection::LayerClear
                         | RadialSelection::LayerDelete
                 )
             )
@@ -413,6 +417,24 @@ impl RadialMenu {
             .collect()
     }
 
+    pub fn layer_clear_button(&self) -> RadialRect {
+        let add = self.layer_add_button();
+        let gap = 5.0 * self.scale;
+        RadialRect {
+            left: add.left - gap - add.width(),
+            top: add.top,
+            right: add.left - gap,
+            bottom: add.bottom,
+        }
+    }
+
+    pub fn layer_clear_enabled(&self) -> bool {
+        self.layers
+            .iter()
+            .find(|layer| layer.layer_id == self.active_layer_id)
+            .is_some_and(|layer| layer.item_count > 0)
+    }
+
     pub fn layer_delete_button(&self) -> Option<RadialRect> {
         let (_, row) = self
             .layer_rows()
@@ -504,12 +526,12 @@ impl RadialMenu {
     }
 
     /// 色リング表示中にだけ出す、円から独立した履歴・全消去ドック。
-    pub fn command_buttons(&self) -> [(RadialCommand, RadialRect); 2] {
+    pub fn command_buttons(&self) -> [(RadialCommand, RadialRect); 3] {
         let width = COMMAND_WIDTH * self.scale;
         let height = COMMAND_HEIGHT * self.scale;
         let gap = COMMAND_GAP * self.scale;
         let margin = VIEWPORT_MARGIN * self.scale;
-        let total_width = width * 2.0 + gap;
+        let total_width = COMMAND_TOTAL_WIDTH * self.scale;
         let half_total = total_width / 2.0;
         let dock_center_x =
             clamp_center(self.center_local.0, half_total, self.surface_size.0, margin);
@@ -526,10 +548,16 @@ impl RadialMenu {
         let top = desired_top.clamp(margin, max_top);
         let left = dock_center_x - half_total;
 
-        [RadialCommand::Undo, RadialCommand::Redo].map(|command| {
+        [
+            RadialCommand::Undo,
+            RadialCommand::Redo,
+            RadialCommand::ClearLayer,
+        ]
+        .map(|command| {
             let index = match command {
                 RadialCommand::Undo => 0,
                 RadialCommand::Redo => 1,
+                RadialCommand::ClearLayer => 2,
             };
             let item_left = left + index as f32 * (width + gap);
             (
@@ -548,15 +576,22 @@ impl RadialMenu {
         match command {
             RadialCommand::Undo => self.can_undo,
             RadialCommand::Redo => self.can_redo,
+            RadialCommand::ClearLayer => self.can_clear,
         }
     }
 
-    pub fn set_command_availability(&mut self, can_undo: bool, can_redo: bool) -> bool {
-        if self.can_undo == can_undo && self.can_redo == can_redo {
+    pub fn set_command_availability(
+        &mut self,
+        can_undo: bool,
+        can_redo: bool,
+        can_clear: bool,
+    ) -> bool {
+        if self.can_undo == can_undo && self.can_redo == can_redo && self.can_clear == can_clear {
             return false;
         }
         self.can_undo = can_undo;
         self.can_redo = can_redo;
+        self.can_clear = can_clear;
         true
     }
 
@@ -577,6 +612,9 @@ impl RadialMenu {
         let add_button = self.layer_add_button();
         if add_button.contains(local) {
             return Some(RadialSelection::LayerAdd);
+        }
+        if self.layer_clear_button().contains(local) {
+            return Some(RadialSelection::LayerClear);
         }
         if self.layers.len() > 1
             && self
@@ -659,6 +697,9 @@ impl RadialMenu {
                 Some(match command {
                     RadialCommand::Undo => MenuAction::Undo,
                     RadialCommand::Redo => MenuAction::Redo,
+                    RadialCommand::ClearLayer => {
+                        MenuAction::ClearLayer(self.active_layer_id.clone())
+                    }
                 })
             }
             RadialSelection::Layer(index) => self
@@ -668,6 +709,9 @@ impl RadialMenu {
             RadialSelection::LayerAdd if self.layers.len() < MAX_LAYERS => {
                 Some(MenuAction::AddLayer)
             }
+            RadialSelection::LayerClear if self.layer_clear_enabled() => {
+                Some(MenuAction::ClearLayer(self.active_layer_id.clone()))
+            }
             RadialSelection::LayerDelete if self.layers.len() > 1 => {
                 Some(MenuAction::DeleteLayer(self.active_layer_id.clone()))
             }
@@ -676,6 +720,7 @@ impl RadialMenu {
             | RadialSelection::Stamp(_)
             | RadialSelection::Command(_)
             | RadialSelection::LayerAdd
+            | RadialSelection::LayerClear
             | RadialSelection::LayerDelete => None,
         }
     }
@@ -737,6 +782,7 @@ pub fn command_label(command: RadialCommand) -> &'static str {
     match command {
         RadialCommand::Undo => "↶  元に戻す",
         RadialCommand::Redo => "↷  やり直す",
+        RadialCommand::ClearLayer => "🗑  レイヤー消去",
     }
 }
 
@@ -824,7 +870,7 @@ mod tests {
             (1000, 1000),
             1.0,
             stamp_count,
-            (can_undo, can_redo),
+            (can_undo, can_redo, false),
         )
     }
 
@@ -854,7 +900,7 @@ mod tests {
             (1000, 800),
             1.0,
             0,
-            (true, true),
+            (true, true, true),
             layer_entries(count),
             format!("layer-{active}"),
         )
@@ -1028,7 +1074,7 @@ mod tests {
             (1000, 1000),
             1.0,
             0,
-            (true, true),
+            (true, true, true),
         );
         for (_, rect) in menu.command_buttons() {
             assert!(rect.bottom < menu.center_local().1 - menu.color_outer_radius());
