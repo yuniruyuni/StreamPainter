@@ -551,11 +551,7 @@ impl RadialMenu {
         }
     }
 
-    pub fn set_command_availability(
-        &mut self,
-        can_undo: bool,
-        can_redo: bool,
-    ) -> bool {
+    pub fn set_command_availability(&mut self, can_undo: bool, can_redo: bool) -> bool {
         if self.can_undo == can_undo && self.can_redo == can_redo {
             return false;
         }
@@ -820,11 +816,7 @@ mod tests {
         (radius * angle.cos(), radius * angle.sin())
     }
 
-    fn menu_with_history(
-        stamp_count: usize,
-        can_undo: bool,
-        can_redo: bool,
-    ) -> RadialMenu {
+    fn menu_with_history(stamp_count: usize, can_undo: bool, can_redo: bool) -> RadialMenu {
         RadialMenu::new(
             1,
             (0.0, 0.0),
@@ -1006,7 +998,10 @@ mod tests {
             menu.update(target);
             assert_eq!(
                 menu.release(target),
-                RadialRelease::Action { action, keep_open: true }
+                RadialRelease::Action {
+                    action,
+                    keep_open: true
+                }
             );
         }
     }
@@ -1023,7 +1018,6 @@ mod tests {
         );
         assert_eq!(menu.release(target), RadialRelease::StayOpen);
     }
-
 
     #[test]
     fn command_dock_moves_above_the_ring_near_the_bottom_edge() {

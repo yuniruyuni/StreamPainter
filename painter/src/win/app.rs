@@ -1495,10 +1495,7 @@ impl App {
             (self.monitor.width as u32, self.monitor.height as u32),
             scale,
             self.stamps.len(),
-            (
-                self.engine.can_undo(),
-                self.engine.can_redo(),
-            ),
+            (self.engine.can_undo(), self.engine.can_redo()),
             layers,
             self.engine.active_layer_id().to_owned(),
         ));
