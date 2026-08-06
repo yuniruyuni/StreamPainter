@@ -1773,7 +1773,7 @@ impl Renderer {
             Some(RadialSelection::Color(index)) => COLORS.get(index).map_or("", |(name, _)| name),
             Some(RadialSelection::Command(RadialCommand::Undo)) => "元に\n戻す",
             Some(RadialSelection::Command(RadialCommand::Redo)) => "やり\n直す",
-            Some(RadialSelection::Command(RadialCommand::Clear)) => "全消去",
+            Some(RadialSelection::Command(RadialCommand::ClearLayer)) => "レイヤー\n消去",
             Some(RadialSelection::Layer(index)) => menu
                 .layers()
                 .get(index)
@@ -2146,13 +2146,13 @@ impl Renderer {
                     b: 0.4,
                     a: 0.98,
                 },
-                (RadialCommand::Clear, true, _) => D2D1_COLOR_F {
+                (RadialCommand::ClearLayer, true, _) => D2D1_COLOR_F {
                     r: 0.72,
                     g: 0.12,
                     b: 0.17,
                     a: 0.98,
                 },
-                (RadialCommand::Clear, false, true) => D2D1_COLOR_F {
+                (RadialCommand::ClearLayer, false, true) => D2D1_COLOR_F {
                     r: 0.2,
                     g: 0.055,
                     b: 0.075,
@@ -2190,7 +2190,7 @@ impl Renderer {
                     b: 0.62,
                     a: 1.0,
                 },
-                (RadialCommand::Clear, true) => D2D1_COLOR_F {
+                (RadialCommand::ClearLayer, true) => D2D1_COLOR_F {
                     r: 1.0,
                     g: 0.3,
                     b: 0.38,
