@@ -6,12 +6,19 @@
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-08-07
+
 ### Added
 
 - 設定画面の「アップデートを確認」ボタンによる手動の自己アップデート。GitHub Releaseの最新版を
   確認し、確認したバージョンをダウンロード・検証（GitHub公開digestとの照合）した上で実行ファイルを
   置き換える。確認・適用ともユーザーがボタンを押した時だけ通信し、バックグラウンドでの自動確認や
   無確認での自動適用は行わない。適用後の再起動は既存の正常終了経路を経由する
+
+## [0.8.2] - 2026-08-06
+
+### Added
+
 - 現在レイヤーの内容だけを、レイヤーカタログを残して消去する操作。ラジアルパネル、従来メニュー、
   描画モード中の`Delete`キーから確認なしで実行でき、Undo／Redoで内容を復元・再消去可能
 
@@ -245,7 +252,9 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.0...v0.8.2
 [0.8.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.1...v0.7.2
