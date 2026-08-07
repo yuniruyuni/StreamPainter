@@ -12,6 +12,7 @@ pub mod render;
 pub mod settings;
 pub mod single_instance;
 pub mod tray;
+pub mod update;
 
 use anyhow::{bail, Result};
 use std::path::Path;

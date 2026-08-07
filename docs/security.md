@@ -33,6 +33,21 @@
 loopback構成ではBearer tokenは秘密になりにくく、配布・更新も複雑にするため採用しません。
 ブラウザ経由の攻撃はOrigin検証、LAN経由の攻撃はbind先とHost検証で遮断します。
 
+## Self-update
+
+設定画面の「アップデートを確認」は、上記のloopback threat modelとは別の唯一のoutbound接続です。
+
+- 通信は利用者がボタンを押した時だけ発生する。バックグラウンドでの定期確認や無確認の自動適用はない
+- 確認はGitHub Releases API (`api.github.com`)、適用は同じrepositoryのrelease assetだけを対象にする
+- 適用前にGitHubが記録するasset digestとの照合を行う（`self_update`の既定動作）。SignPathでの
+  Authenticode署名が有効化された後は、その署名も適用前に検証する対象へ加える
+- 適用はrepository ownerが確認したexact versionへ`release_tag`で固定し、任意の"newer"releaseへ
+  暗黙に追従しない
+- ダウンロード・検証・適用に失敗しても通常動作へ影響しない (fail-open)。適用後の再起動は既存の
+  正常終了経路 (ローカルサーバーのfuture cancel・接続close・スレッドjoin) を経由する
+- 現状のReleaseはunsigned (`docs/code-signing.md`) であり、ダウンロードしたexeの発行元検証は
+  digest照合のみに限られる
+
 ## Operational notes
 
 Windows Firewallで外部受信規則を作る必要はありません。もし実行時に公開ネットワーク向けの

@@ -52,6 +52,7 @@ use crate::win::radial_menu::{self, RadialLayerEntry, RadialMenu, RadialRelease}
 use crate::win::render::Renderer;
 use crate::win::settings;
 use crate::win::tray::{self, TrayCommand, WM_TRAY};
+use crate::win::update;
 
 /// 動画フレームに合わせた約60fpsのバッチ送信。
 const FLUSH_TIMER_ID: usize = 1;
@@ -2109,6 +2110,15 @@ unsafe extern "system" fn window_proc(
         }
         WM_OBS_RESULT => {
             unsafe { &mut *app_ptr }.on_obs_results(hwnd);
+            LRESULT(0)
+        }
+        update::WM_REQUEST_RESTART => {
+            // 設定画面がアップデート適用後の再起動を要求した。新しいexeを起動してから、
+            // 通常の終了経路(DestroyWindow -> WM_DESTROY)でローカルサーバー等を後始末する。
+            if let Err(error) = update::relaunch() {
+                warn!("could not relaunch StreamPainter after update: {error:#}");
+            }
+            let _ = unsafe { DestroyWindow(hwnd) };
             LRESULT(0)
         }
         WM_PAINT => {

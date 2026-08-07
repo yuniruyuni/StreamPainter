@@ -56,6 +56,7 @@ use crate::net::local_server::{
 use crate::win::autostart::{PreparedAutostartChange, RegistrationStatus, SystemAutostart};
 use crate::win::hotkey::{self, ChangeCommand, ProbeRegistration};
 use crate::win::monitor::{self, Monitor};
+use crate::win::update::{self, AvailableUpdate};
 
 const CLASS_NAME: PCWSTR = w!("stream-painter-settings");
 
@@ -89,8 +90,13 @@ const ID_HOTKEY_DEFAULT: i32 = 124;
 const ID_AUTOSTART: i32 = 125;
 const ID_AUTOSTART_STATUS: i32 = 126;
 const ID_CONFIRM_BEFORE_CLEAR: i32 = 127;
+const ID_CHECK_UPDATE: i32 = 128;
+const ID_UPDATE_STATUS: i32 = 129;
 
 const WM_DIAGNOSTICS_CHANGED: u32 = WM_APP + 1;
+/// アップデート確認・適用workerの完了通知。同時に1件しか実行しないため
+/// generationは持たず、`SettingsState::update_pending`のReceiverが現在の要求を表す。
+const WM_UPDATE_RESULT: u32 = WM_APP + 2;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -158,6 +164,15 @@ impl AutostartUi {
     }
 }
 
+/// アップデート確認・適用workerの結果。専用スレッドからchannel経由で届く。
+enum UpdateOutcome {
+    Checked(Result<Option<AvailableUpdate>, String>),
+    Applied {
+        target_version: String,
+        result: Result<(), String>,
+    },
+}
+
 struct SettingsState {
     /// Someなら起動中overlayへhotkey変更をtransactionalに反映する。
     live_owner: Option<HWND>,
@@ -173,6 +188,8 @@ struct SettingsState {
     saved: bool,
     diagnostics: Option<LocalServerDiagnostics>,
     _diagnostics_subscription: Option<LocalServerDiagnosticsSubscription>,
+    /// Someの間はチェック・適用のいずれかが実行中で、ボタンは無効化されている。
+    update_pending: Option<std::sync::mpsc::Receiver<UpdateOutcome>>,
     /// 設定画面を overlay より前に保つ。WM_NCDESTROY で state と一緒に解放する。
     _foreground_ui: crate::win::projector::ForegroundUiGuard,
 }
@@ -385,7 +402,7 @@ fn open_internal(
 
         let dpi = GetDpiForWindow(owner).max(96);
         let window_width = scale(680, dpi);
-        let window_height = scale(900, dpi);
+        let window_height = scale(940, dpi);
         let mut owner_rect = RECT::default();
         let (x, y) = if GetWindowRect(owner, &mut owner_rect).is_ok() {
             (
@@ -426,6 +443,7 @@ fn open_internal(
             saved: false,
             diagnostics,
             _diagnostics_subscription: None,
+            update_pending: None,
             _foreground_ui: crate::win::projector::ForegroundUiGuard::new(),
         });
         let state_ptr = Box::into_raw(state);
@@ -982,13 +1000,44 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             s(62),
         )?;
 
+        create_label(
+            hwnd,
+            font,
+            &format!("現在のバージョン: v{}", env!("CARGO_PKG_VERSION")),
+            label_x,
+            s(824),
+            s(300),
+            row_height,
+        )?;
+        create_button(
+            hwnd,
+            font,
+            ID_CHECK_UPDATE,
+            "アップデートを確認",
+            s(330),
+            s(821),
+            s(160),
+            s(28),
+            false,
+        )?;
+        create_label_with_id(
+            hwnd,
+            font,
+            ID_UPDATE_STATUS,
+            "",
+            label_x,
+            s(854),
+            s(620),
+            s(30),
+        )?;
+
         create_button(
             hwnd,
             font,
             ID_SAVE,
             "保存",
             s(430),
-            s(820),
+            s(892),
             s(100),
             s(32),
             true,
@@ -999,7 +1048,7 @@ unsafe fn initialize_controls(hwnd: HWND, config: &Config, dpi: u32) -> Result<(
             ID_CANCEL,
             "キャンセル",
             s(540),
-            s(820),
+            s(892),
             s(100),
             s(32),
             false,
@@ -1789,6 +1838,168 @@ fn show_operation_error(hwnd: HWND, summary: &str, error: &anyhow::Error) {
     }
 }
 
+fn set_control_enabled(hwnd: HWND, id: i32, enabled: bool) -> Result<()> {
+    let control = control(hwnd, id)?;
+    unsafe {
+        let _ = EnableWindow(control, enabled);
+    }
+    Ok(())
+}
+
+/// workerスレッドから呼ぶ。設定画面が既に閉じている/入れ替わっている場合はpostしない。
+fn post_update_result(hwnd_raw: isize) {
+    if SETTINGS_HWND.load(Ordering::SeqCst) != hwnd_raw {
+        return;
+    }
+    unsafe {
+        let _ = PostMessageW(
+            Some(hwnd_from_raw(hwnd_raw)),
+            WM_UPDATE_RESULT,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// GitHubへ最新リリースを問い合わせる。ダウンロードは行わない。UIスレッドをブロック
+/// しないよう専用スレッドで実行し、結果はWM_UPDATE_RESULT経由で受け取る。
+fn spawn_update_check(hwnd: HWND, state: &mut SettingsState) -> Result<()> {
+    if state.update_pending.is_some() {
+        return Ok(());
+    }
+    set_control_enabled(hwnd, ID_CHECK_UPDATE, false)?;
+    set_control_text(hwnd, ID_UPDATE_STATUS, "確認中...")?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.update_pending = Some(rx);
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let result = update::check(env!("CARGO_PKG_VERSION")).map_err(|error| format!("{error:#}"));
+        let _ = tx.send(UpdateOutcome::Checked(result));
+        post_update_result(hwnd_raw);
+    });
+    Ok(())
+}
+
+/// 指定バージョンをダウンロードして実行ファイルを置き換える。専用スレッドで実行し、
+/// 結果はWM_UPDATE_RESULT経由で受け取る。
+fn spawn_update_apply(hwnd: HWND, state: &mut SettingsState, target_version: String) -> Result<()> {
+    if state.update_pending.is_some() {
+        return Ok(());
+    }
+    set_control_enabled(hwnd, ID_CHECK_UPDATE, false)?;
+    set_control_text(
+        hwnd,
+        ID_UPDATE_STATUS,
+        &format!("v{target_version} をダウンロード中..."),
+    )?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    state.update_pending = Some(rx);
+    let hwnd_raw = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let result = update::apply(env!("CARGO_PKG_VERSION"), &target_version)
+            .map_err(|error| format!("{error:#}"));
+        let _ = tx.send(UpdateOutcome::Applied {
+            target_version,
+            result,
+        });
+        post_update_result(hwnd_raw);
+    });
+    Ok(())
+}
+
+/// 適用後の再起動。ライブ起動中の本体があればそちらへ後始末込みの再起動を依頼し、
+/// `--settings`単体モードでは自分で新しいexeを起動してからこの画面を閉じる。
+fn restart_after_update(hwnd: HWND, state: &SettingsState) {
+    if let Some(owner) = state.live_owner {
+        unsafe {
+            let _ = PostMessageW(
+                Some(owner),
+                update::WM_REQUEST_RESTART,
+                WPARAM(0),
+                LPARAM(0),
+            );
+            let _ = DestroyWindow(hwnd);
+        }
+        return;
+    }
+    match update::relaunch() {
+        Ok(()) => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
+        Err(error) => show_operation_error(hwnd, "StreamPainterを再起動できません", &error),
+    }
+}
+
+fn on_update_result(hwnd: HWND, state: &mut SettingsState) {
+    let Some(receiver) = state.update_pending.as_ref() else {
+        return;
+    };
+    let outcome = match receiver.try_recv() {
+        Ok(outcome) => outcome,
+        Err(_) => return,
+    };
+    state.update_pending = None;
+    let _ = set_control_enabled(hwnd, ID_CHECK_UPDATE, true);
+
+    match outcome {
+        UpdateOutcome::Checked(Ok(Some(available))) => {
+            let _ = set_control_text(
+                hwnd,
+                ID_UPDATE_STATUS,
+                &format!("新しいバージョン v{} が利用可能です", available.version),
+            );
+            let notes = if available.notes.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n{}", available.notes)
+            };
+            let prompt = format!(
+                "StreamPainter v{} が利用可能です。{notes}\n\n今すぐダウンロードして適用しますか？\n(unsigned配布のため、Windowsの警告が出る場合があります)",
+                available.version
+            );
+            if crate::win::confirm(hwnd, &prompt) {
+                if let Err(error) = spawn_update_apply(hwnd, state, available.version) {
+                    show_operation_error(hwnd, "アップデートを開始できません", &error);
+                }
+            }
+        }
+        UpdateOutcome::Checked(Ok(None)) => {
+            let _ = set_control_text(
+                hwnd,
+                ID_UPDATE_STATUS,
+                &format!("最新版です (v{})", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        UpdateOutcome::Checked(Err(message)) => {
+            let _ = set_control_text(hwnd, ID_UPDATE_STATUS, "確認に失敗しました");
+            show_operation_error(hwnd, "アップデートを確認できません", &anyhow!(message));
+        }
+        UpdateOutcome::Applied {
+            target_version,
+            result: Ok(()),
+        } => {
+            let _ = set_control_text(
+                hwnd,
+                ID_UPDATE_STATUS,
+                &format!("v{target_version} を適用しました。再起動すると反映されます。"),
+            );
+            if crate::win::confirm(hwnd, "更新が完了しました。今すぐ再起動しますか？")
+            {
+                restart_after_update(hwnd, state);
+            }
+        }
+        UpdateOutcome::Applied {
+            target_version: _,
+            result: Err(message),
+        } => {
+            let _ = set_control_text(hwnd, ID_UPDATE_STATUS, "適用に失敗しました");
+            show_operation_error(hwnd, "アップデートを適用できません", &anyhow!(message));
+        }
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -1908,6 +2119,20 @@ unsafe extern "system" fn window_proc(
                 }
                 return LRESULT(0);
             }
+            if id == ID_CHECK_UPDATE {
+                let state_ptr =
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+                let result = unsafe {
+                    state_ptr
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("設定画面の状態がありません"))
+                        .and_then(|state| spawn_update_check(hwnd, state))
+                };
+                if let Err(error) = result {
+                    show_operation_error(hwnd, "アップデートを確認できません", &error);
+                }
+                return LRESULT(0);
+            }
             if id == ID_CANCEL {
                 unsafe {
                     let _ = DestroyWindow(hwnd);
@@ -1922,6 +2147,13 @@ unsafe extern "system" fn window_proc(
                 if let Err(error) = update_connection_status(hwnd, state) {
                     show_error(hwnd, &error);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_UPDATE_RESULT => {
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SettingsState;
+            if let Some(state) = unsafe { state_ptr.as_mut() } {
+                on_update_result(hwnd, state);
             }
             LRESULT(0)
         }

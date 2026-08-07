@@ -92,9 +92,11 @@ collaboratorが参加するまで`code-signing` environmentを有効化しませ
 > This program will not transfer any information to other networked systems unless specifically
 > requested by the user or the person installing or operating it.
 
-StreamPainterはloopbackのBrowser Sourceと、利用者が設定したOBS WebSocketへだけ接続します。telemetryや
-自動更新通信はありません。コード署名時にGitHub Actionsがrelease binaryをSignPathへ渡す処理は
-maintainerのbuild pipelineであり、利用者の実行データを送信するものではありません。
+StreamPainterはloopbackのBrowser Sourceと、利用者が設定したOBS WebSocketへだけ接続します。telemetryは
+ありません。唯一の例外は設定画面の「アップデートを確認」ボタンで、押した時だけGitHub Releases APIへ
+問い合わせ、適用を選んだ場合だけ最新exeをダウンロードします。バックグラウンドでの自動確認や無確認での
+自動適用はありません（詳細は[security.md](security.md)）。コード署名時にGitHub Actionsがrelease binaryを
+SignPathへ渡す処理はmaintainerのbuild pipelineであり、利用者の実行データを送信するものではありません。
 
 portable版を削除する場合はアプリを終了してexeを削除します。設定・stampも消す場合は
 `%APPDATA%\StreamPainter`、logも消す場合は`%LOCALAPPDATA%\StreamPainter`を削除し、Windows資格情報
