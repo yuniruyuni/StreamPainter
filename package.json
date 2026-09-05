@@ -1,7 +1,7 @@
 {
   "name": "stream-painter",
   "private": true,
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.2",
   "license": "MIT",
   "repository": "https://github.com/yuniruyuni/StreamPainter",
   "workspaces": ["client"],
@@ -17,7 +17,7 @@
     "prepare:painter": "bun run build && cargo fetch --locked --manifest-path painter/Cargo.toml && bun run generate:licenses"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.7"
+    "@biomejs/biome": "2.5.12"
   },
   "trustedDependencies": [
     "@biomejs/biome"
