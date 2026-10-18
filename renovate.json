@@ -23,6 +23,12 @@
       "groupName": "github-actions",
       "commitMessagePrefix": "ci(deps):",
       "addLabels": ["github-actions"]
+    },
+    {
+      "description": "windows-numerics must stay on the version the windows crate depends on (windows 0.62 uses 0.3); a mismatch breaks the Windows build with type errors. Bump it by hand together with windows.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["windows-numerics"],
+      "enabled": false
     }
   ]
 }
