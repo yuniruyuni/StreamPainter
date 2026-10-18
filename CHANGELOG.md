@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-18
+
+### Security
+
+- RustSecで報告された依存crateの脆弱性・yankを解消: quinn-proto 0.11.19、rustls 0.23.46、
+  h2 0.4.20、chacha20 0.10.2
+
+### Changed
+
+- 自己アップデートに使う`self_update`を1.0.0-rc.6から正式版1.3.1へ更新し、その他のRust依存関係を
+  互換範囲の最新版へ更新
+- ビルドに使うRustを1.99.1、Bunを1.4.3へ更新し、GitHub Actionsのpin先を更新
+
 ## [0.8.3] - 2026-08-07
 
 ### Added
@@ -252,7 +265,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.0...v0.8.2
 [0.8.0]: https://github.com/yuniruyuni/StreamPainter/compare/v0.7.3...v0.8.0
