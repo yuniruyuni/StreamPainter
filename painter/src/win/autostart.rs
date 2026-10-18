@@ -240,8 +240,10 @@ fn decode_registry_string(value: &RegistryValue) -> Result<OsString> {
     }
     let mut units = value
         .data
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|bytes| u16::from_le_bytes(*bytes))
         .collect::<Vec<_>>();
     while units.last() == Some(&0) {
         units.pop();

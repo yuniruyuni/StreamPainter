@@ -2435,7 +2435,7 @@ fn load_stamp_bitmap(dc: &ID2D1DeviceContext, stamp: &StampConfig) -> Result<ID2
 
     // D2D の BGRA premultiplied 形式へ変換する。
     let mut pixels = decoded.into_raw();
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let red = pixel[0];
         let green = pixel[1];
         let blue = pixel[2];
