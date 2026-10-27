@@ -17,7 +17,7 @@
     "prepare:painter": "bun run build && cargo fetch --locked --manifest-path painter/Cargo.toml && bun run generate:licenses"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15"
+    "@biomejs/biome": "2.6.3"
   },
   "trustedDependencies": [
     "@biomejs/biome"
