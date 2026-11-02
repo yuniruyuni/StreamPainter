@@ -6,6 +6,13 @@
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-11-02
+
+### Changed
+
+- lock file maintenanceで、Rust（`painter/Cargo.lock`）とフロントエンド（`bun.lock`）の依存関係を
+  互換範囲の最新版へ更新
+
 ## [0.8.5] - 2026-11-02
 
 ### Security
@@ -278,7 +285,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.2...v0.8.3
