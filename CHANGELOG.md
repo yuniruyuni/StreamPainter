@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-11-02
+
+### Security
+
+- RustSecで報告された証明書チェーン検証の脆弱性を解消: rustls-webpki 0.103.16、
+  webpki-root-certs／webpki-roots 1.0.10（RUSTSEC-2026-0381／0382／0383）
+- ビルドに使うBunを、Brotliの脆弱性修正を含む1.4.4へ更新
+
+### Changed
+
+- 自己アップデートに使う`self_update`を1.3.3へ、tokioを1.54.1、uuidを1.29.0へ更新
+- 開発用のBiomeを2.6.4へ更新し、GitHub Actionsのpin先を更新
+
 ## [0.8.4] - 2026-10-18
 
 ### Security
@@ -265,7 +278,8 @@
 - Windows透明オーバーレイ、ローカルOBS Browser Source、描画ツール、PNGスタンプ、
   OBSプロジェクター連携、設定画面、第三者ライセンス表示を収録
 
-[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/yuniruyuni/StreamPainter/compare/v0.8.0...v0.8.2
