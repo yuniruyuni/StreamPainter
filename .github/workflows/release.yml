@@ -59,7 +59,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.4
+          bun-version: 1.4.5
 
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
@@ -166,7 +166,7 @@ jobs:
         run: ./scripts/windows/assert-signpath-configuration.ps1
 
       - name: Submit trusted SignPath signing request
-        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        uses: signpath/github-action-submit-signing-request@a2c5b60d9c75f073142b653c354b632eedce097b # v3.2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
